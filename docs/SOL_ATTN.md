@@ -234,14 +234,34 @@ NVIDIA quote ~1% cost for the prefix sink; kijai's node quotes ~3% for
 larger than advertised — 27% less error on exactly the rows carrying text,
 audio and lip-sync — but it is not close to free.
 
-### The middle of the stack is harder than the ends
+### The middle of the stack is hardest to approximate
 
-Block 24 is roughly **twice** as hard to approximate as block 0 (rel_rms 0.245
-against 0.132). Both the paper's first-layer warm-up and kijai's `dense_blocks`
-default assume the *first and last* blocks are the sensitive ones. On H3 that
-looks wrong. Two samples, so it is a lead rather than a finding — but if it
-holds, `dense_blocks` should be excluding different layers than everyone
-assumes.
+All three blocks, beta = 1.2 with `exact_kv`:
+
+| block | rel_rms | conditioning rows | speedup |
+|---|---|---|---|
+| 0 | 0.132 | 0.153 | 2.37x |
+| **24** | **0.245** | 0.337 | 2.69x |
+| 49 | 0.142 | 0.330 | 2.91x |
+
+Sensitivity peaks in the middle: block 24 is ~1.8x harder to approximate than
+either end.
+
+**This does not straightforwardly contradict the `dense_blocks` convention, and
+it is worth being precise about why.** What is measured here is how well
+Sol-Attn approximates *that block's own attention output*. The convention —
+the paper's first-layer warm-up, kijai's "first and last" default — is about
+*propagation*: error in the last block reaches the output undamped, while error
+in block 0 has 49 blocks of processing after it. Those are different
+quantities, and both claims can hold at once.
+
+The right `dense_blocks` choice is approximation-difficulty weighted by
+propagation, and only the first factor is measured here. What the numbers do
+say is that excluding only the ends leaves the hardest block sparsified.
+
+Also worth noting: the **conditioning rows degrade much more deeper in the
+stack** — 0.153 at block 0 against 0.330-0.337 at blocks 24 and 49. The sink
+does most of its work early.
 
 ### Beta means on H3 what it means elsewhere
 
