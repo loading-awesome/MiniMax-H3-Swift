@@ -79,10 +79,12 @@ let package = Package(
         .testTarget(name: "H3CatalogTests", dependencies: ["H3Catalog"]),
         .testTarget(name: "H3HardwareTests", dependencies: ["H3Hardware"]),
         .testTarget(name: "H3RecipesTests", dependencies: ["H3Recipes"]),
+        // No `resources:` until Fixtures actually holds something. Declaring a
+        // copy of an empty directory produces a malformed test bundle, and the
+        // symptom is unrelated and baffling: MLX fails to find its metallib.
         .testTarget(
             name: "H3ConformanceTests",
-            dependencies: ["H3Conformance", "H3Foundation"],
-            resources: [.copy("Fixtures")]
+            dependencies: ["H3Conformance", "H3Foundation"]
         ),
     ]
 )

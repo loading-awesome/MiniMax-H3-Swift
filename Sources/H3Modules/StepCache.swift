@@ -163,12 +163,23 @@ public final class H3StepCache {
         observedChange.append(change)
         observedAudioChange.append(audioChange)
 
-        let inWarmup = step < warmupSteps
-        let inCooldown = step >= totalSteps - cooldownSteps
-        let capped = consecutiveSkips >= maxConsecutiveSkips
+        // Every rule lives in H3Foundation.StepCachePolicy, which has no MLX
+        // dependency and is therefore tested in microseconds without a GPU.
+        // This method's job is the measurement; the policy's job is the choice.
+        let policy = StepCachePolicy(threshold: threshold,
+                                     maxConsecutiveSkips: maxConsecutiveSkips,
+                                     warmupSteps: warmupSteps,
+                                     cooldownSteps: cooldownSteps,
+                                     perStream: perStreamProbe)
+        let cached = cachedTotalResidual
+        let decision = policy.decide(
+            wholeSequenceChange: perStreamProbe ? (observedVideoChange.last ?? change) : change,
+            audioChange: perStreamProbe ? audioChange : nil,
+            step: step, totalSteps: totalSteps,
+            consecutiveSkips: consecutiveSkips,
+            haveCachedResidual: cached != nil && cached?.shape == probe.shape)
 
-        if !inWarmup, !inCooldown, !capped, change < threshold,
-           let cached = cachedTotalResidual, cached.shape == probe.shape {
+        if decision == .reuse, let cached {
             consecutiveSkips += 1
             stepsSkipped += 1
             return .reuse(cached)

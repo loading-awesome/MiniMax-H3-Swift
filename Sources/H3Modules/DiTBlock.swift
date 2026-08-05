@@ -129,6 +129,86 @@ public struct H3Attention {
         self.fp32Attention = fp32Attention
     }
 
+    /// Collects the shape of the proxy-score distribution while a render runs.
+    ///
+    /// Sol-Attn's single knob works because standardized proxy logits are
+    /// "consistently near-Gaussian within each model", which is what makes
+    /// `density = 1 - Phi(beta)` true. **H3 is not one of the models the paper
+    /// measured that on.** If H3's distribution is skewed or heavy-tailed, beta
+    /// does not mean what the published settings assume, and every tau value in
+    /// circulation is calibrated against a different distribution.
+    ///
+    /// This is three floats per call against 226 MB of tensors, so it answers
+    /// the question locally rather than shipping q/k/v to a rented GPU.
+    public final class ProxyProbe: @unchecked Sendable {
+        public var enabled = false
+        public var samples: [(skew: Double, kurt: Double, tail1: Double, tail2: Double)] = []
+        public init() {}
+    }
+    public static let proxyProbe = ProxyProbe()
+
+    /// Writes real attention inputs to disk, for characterising a sparse kernel
+    /// against the distribution it will actually meet.
+    ///
+    /// **Random tensors are not a substitute, and the difference is not
+    /// subtle.** Run against Gaussian q/k/v at this model's shape, Sol-Attn
+    /// lands at rel_rms 0.17 even at beta = 0 — because unstructured attention
+    /// has no dominant blocks to keep, so there is nothing for a sparse method
+    /// to exploit. Any equivalence class measured that way describes the worst
+    /// possible input rather than this model.
+    ///
+    /// Captured by global call ordinal, `step * numLayers + block`, because
+    /// `sdpa` is static and does not know which block invoked it.
+    public final class QKVCapture: @unchecked Sendable {
+        public var directory: String?
+        public var wantedOrdinals: Set<Int> = []
+        public var ordinal = 0
+        public var written: [String] = []
+        public init() {}
+    }
+    public static let qkvCapture = QKVCapture()
+
+    static func maybeCapture(_ qh: MLXArray, _ kh: MLXArray, _ vh: MLXArray) {
+        let n = qkvCapture.ordinal
+        qkvCapture.ordinal += 1
+        guard let dir = qkvCapture.directory, qkvCapture.wantedOrdinals.contains(n) else { return }
+        // [1, heads, S, d] -> [S, heads, d], the layout the Triton kernel takes
+        // as BTHD with the batch axis added back on the other side.
+        func pack(_ x: MLXArray) -> MLXArray { x[0].transposed(1, 0, 2) }
+        let path = "\(dir)/qkv_call\(String(format: "%04d", n)).safetensors"
+        do {
+            try MLX.save(arrays: ["q": pack(qh), "k": pack(kh), "v": pack(vh)], url: URL(fileURLWithPath: path))
+            qkvCapture.written.append(path)
+            FileHandle.standardError.write(Data("  captured call \(n) -> \(path)\n".utf8))
+        } catch {
+            FileHandle.standardError.write(Data("  capture failed at \(n): \(error)\n".utf8))
+        }
+    }
+
+    /// Per-query-block skewness, excess kurtosis, and the *measured* densities
+    /// a threshold of `mu + beta*sigma` would keep at beta = 1 and 2 — against
+    /// the Gaussian predictions of 15.87% and 2.28%.
+    static func recordProxy(_ qh: MLXArray, _ kh: MLXArray) {
+        let block = 64
+        let s = qh.dim(2)
+        let n = s / block
+        guard n >= 8 else { return }
+        let q = qh[0][0..., 0 ..< (n * block), 0...]
+            .reshaped([qh.dim(1), n, block, qh.dim(3)]).mean(axis: 2).asType(.float32)
+        let k = kh[0][0..., 0 ..< (n * block), 0...]
+            .reshaped([kh.dim(1), n, block, kh.dim(3)]).mean(axis: 2).asType(.float32)
+        let scores = matmul(q, k.transposed(0, 2, 1))
+        let mu = scores.mean(axis: -1, keepDims: true)
+        let d = scores - mu
+        let sd = MLX.sqrt((d * d).mean(axis: -1, keepDims: true) + 1e-12)
+        let z = d / sd
+        let skew = Double((z * z * z).mean().item(Float.self))
+        let kurt = Double((z * z * z * z).mean().item(Float.self)) - 3.0
+        let t1 = Double((z .> MLXArray(Float(1.0))).asType(.float32).mean().item(Float.self))
+        let t2 = Double((z .> MLXArray(Float(2.0))).asType(.float32).mean().item(Float.self))
+        proxyProbe.samples.append((skew, kurt, t1, t2))
+    }
+
     /// Scaled dot-product attention over `[S, heads, headDim]` or `[B, S, heads, headDim]` inputs, exposed
     /// so the op-level oracle can tap it on its own.
     public static func sdpa(q: MLXArray, k: MLXArray, v: MLXArray,
@@ -139,6 +219,9 @@ public struct H3Attention {
         let kh = hasBatch ? k.transposed(0, 2, 1, 3).asType(at) : k.transposed(1, 0, 2).expandedDimensions(axis: 0).asType(at)
         let vh = hasBatch ? v.transposed(0, 2, 1, 3).asType(at) : v.transposed(1, 0, 2).expandedDimensions(axis: 0).asType(at)
         
+        if proxyProbe.enabled { Self.recordProxy(qh, kh) }
+        if qkvCapture.directory != nil { Self.maybeCapture(qh, kh, vh) }
+
         let o = MLXFast.scaledDotProductAttention(
             queries: qh, keys: kh, values: vh,
             scale: 1.0 / Float(headDim).squareRoot(), mask: nil)
