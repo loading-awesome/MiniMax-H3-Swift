@@ -2,6 +2,7 @@ import Foundation
 import MLX
 import MLXNN
 import H3Foundation
+import H3Attention
 
 /// Packing helpers. These decide the ROW ORDER of the packed sequence, so an
 /// error here misaligns every downstream tap while keeping all the shapes
@@ -282,6 +283,13 @@ public struct H3Transformer {
     ///   - videoLatent:    ///   - audioLatent: `[1,32,2,audioT]`
     ///   - context: `[1, textLen, textDim]` — the conditioning the contract feeds you
     ///   - layout: carries the segment table and `[S,3]` position ids
+    ///   - stepIndex: where in the sampling schedule this call sits. Two things
+    ///     need it — the cross-step cache, which will not reuse a residual
+    ///     during warm-up or on the final step, and a sparse attention backend,
+    ///     which has a dense warm-up of its own. One pair of arguments serves
+    ///     both; two pairs would eventually disagree. (These were `cacheStep`
+    ///     and `cacheTotalSteps`, named for their first consumer.) Omitted, the
+    ///     cache is inactive and attention runs dense.
     public func packedForward(videoLatent: MLXArray, audioLatent: MLXArray,
                               context: MLXArray, layout: PackedLayout,
                               plan: TimestepPlan, index: ModulationIndex,
@@ -290,8 +298,8 @@ public struct H3Transformer {
                               condVideo: MLXArray? = nil,
                               condAudio: MLXArray? = nil,
                               stepCache: H3StepCache? = nil,
-                              cacheStep: Int? = nil,
-                              cacheTotalSteps: Int? = nil)
+                              stepIndex: Int? = nil,
+                              stepCount: Int? = nil)
         -> (video: MLXArray, audio: MLXArray) {
 
         // text path — the context sets the compute dtype in the reference, so
@@ -396,6 +404,24 @@ public struct H3Transformer {
                 angles: H3RoPE.angles(positionIds: pos, invFreq: ropeInvFreq)).asType(dtype)
         }
 
+        // Where each attention call sits in the render. Built here because this
+        // is the only place that knows all of it at once: the block index, how
+        // far through the schedule we are, and — from the layout — which rows
+        // are the generated video and which are conditioning a sparse backend
+        // must keep exact.
+        //
+        // Nil when the caller did not say what step this is, which is the
+        // oracles and any single forward pass. A backend that cannot tell
+        // whether it is in its own dense warm-up should not be guessing, so nil
+        // means dense.
+        func attentionContext(block: Int) -> AttentionContext? {
+            guard let step = stepIndex, let total = stepCount, total > 0 else { return nil }
+            return AttentionContext(blockIndex: block, blockCount: blocks.count,
+                                    scheduleProgress: Double(step) / Double(total),
+                                    sequenceLength: layout.totalTokens,
+                                    videoSpan: layout.videoRange)
+        }
+
         // Cross-step residual reuse. Block 0 always runs and doubles as the
         // probe; if its residual barely moved since the previous step, the
         // other 49 blocks are skipped and last step's total residual is
@@ -403,9 +429,21 @@ public struct H3Transformer {
         // gets cached rather than the output.
         //
         // With no cache this is the plain loop, unchanged and bit-identical.
-        if let cache = stepCache, let step = cacheStep, let total = cacheTotalSteps {
+        if let cache = stepCache, let step = stepIndex, let total = stepCount {
             let hIn = h
-            h = blocks[0](h, tEmb: tEmb, index: index, ropeTable: table)
+            // **Block 0 runs dense whenever the cache is on, and this is not a
+            // conservatism — it is measured.** Block 0's residual is the cache's
+            // probe. Sol-Attn's error at block 0 is rel_rms 0.132 at beta 1.2,
+            // and the probe signal the cache thresholds on is 0.077: the
+            // approximation is 1.7x the quantity being measured. Sparsify here
+            // and the cache stops thresholding on how much the step moved and
+            // starts thresholding on backend noise — reusing when it should not
+            // and refusing when it should, with every shape still correct.
+            //
+            // The cost is 1/50th of the stack. Passing nil, rather than asking
+            // the backend to exclude block 0 itself, keeps the rule where its
+            // reason lives instead of in each backend's policy.
+            h = blocks[0](h, tEmb: tEmb, index: index, ropeTable: table, context: nil)
             if Self.tappedBlocks.contains(0) { tapsOut.blocks[0] = h }
 
             switch cache.decide(probe: h - hIn, audioRange: layout.audioRange,
@@ -414,14 +452,16 @@ public struct H3Transformer {
                 h = hIn + residual
             case .runFull:
                 for i in 1 ..< blocks.count {
-                    h = blocks[i](h, tEmb: tEmb, index: index, ropeTable: table)
+                    h = blocks[i](h, tEmb: tEmb, index: index, ropeTable: table,
+                                  context: attentionContext(block: i))
                     if Self.tappedBlocks.contains(i) { tapsOut.blocks[i] = h }
                 }
                 cache.record(totalResidual: h - hIn)
             }
         } else {
             for (i, block) in blocks.enumerated() {
-                h = block(h, tEmb: tEmb, index: index, ropeTable: table)
+                h = block(h, tEmb: tEmb, index: index, ropeTable: table,
+                          context: attentionContext(block: i))
                 if Self.tappedBlocks.contains(i) { tapsOut.blocks[i] = h }
             }
         }
@@ -454,8 +494,8 @@ public struct H3Transformer {
                           condAudio: MLXArray? = nil,
                           renderState: RenderState? = nil,
                           stepCache: H3StepCache? = nil,
-                          cacheStep: Int? = nil,
-                          cacheTotalSteps: Int? = nil,
+                          stepIndex: Int? = nil,
+                          stepCount: Int? = nil,
                           taps: inout Taps) -> (video: MLXArray, audio: MLXArray) {
         let layout = renderState?.layout ?? PackedLayout(textTokens: context.dim(1), geometry: geometry,
                                                          keyframes: keyframes, refs: refs)
@@ -467,8 +507,8 @@ public struct H3Transformer {
                                    renderState: renderState,
                                    condVideo: condVideo, condAudio: condAudio,
                                    stepCache: stepCache,
-                                   cacheStep: cacheStep,
-                                   cacheTotalSteps: cacheTotalSteps)
+                                   stepIndex: stepIndex,
+                                   stepCount: stepCount)
         let video = H3Packing.unpatchifyVideo(v, t: geometry.latentT,
                                               h: geometry.latentH / config.patchSize[1],
                                               w: geometry.latentW / config.patchSize[2],
@@ -513,8 +553,8 @@ public struct H3Transformer {
                                negativeRenderState: RenderState? = nil,
                                stepCache: H3StepCache? = nil,
                                negativeStepCache: H3StepCache? = nil,
-                               cacheStep: Int? = nil,
-                               cacheTotalSteps: Int? = nil,
+                               stepIndex: Int? = nil,
+                               stepCount: Int? = nil,
                                taps: inout Taps) -> (video: MLXArray, audio: MLXArray) {
         let cond = velocity(videoLatent: videoLatent, audioLatent: audioLatent,
                             context: context, sigmaVideo: sigmaVideo,
@@ -522,8 +562,8 @@ public struct H3Transformer {
                             keyframes: keyframes, refs: refs,
                             condVideo: condVideo, condAudio: condAudio,
                             renderState: renderState,
-                            stepCache: stepCache, cacheStep: cacheStep,
-                            cacheTotalSteps: cacheTotalSteps,
+                            stepCache: stepCache, stepIndex: stepIndex,
+                            stepCount: stepCount,
                             taps: &taps)
         // scale 1.0 is the identity; skip the second pass rather than paying
         // 61 s to multiply by one.
@@ -539,8 +579,8 @@ public struct H3Transformer {
                               keyframes: keyframes, refs: refs,
                               condVideo: condVideo, condAudio: condAudio,
                               renderState: negativeRenderState,
-                              stepCache: negativeStepCache, cacheStep: cacheStep,
-                              cacheTotalSteps: cacheTotalSteps,
+                              stepCache: negativeStepCache, stepIndex: stepIndex,
+                              stepCount: stepCount,
                               taps: &negTaps)
 
         let s = MLXArray(scale)
@@ -555,9 +595,9 @@ public struct TokenRefiner {
     public struct Block {
         public let norm1: H3RMSNorm
         public let norm2: H3RMSNorm
-        public let attn: H3Attention
+        public let attn: AttentionLayer
         public let mlp: H3MLP
-        public init(norm1: H3RMSNorm, norm2: H3RMSNorm, attn: H3Attention, mlp: H3MLP) {
+        public init(norm1: H3RMSNorm, norm2: H3RMSNorm, attn: AttentionLayer, mlp: H3MLP) {
             self.norm1 = norm1
             self.norm2 = norm2
             self.attn = attn

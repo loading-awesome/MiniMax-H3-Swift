@@ -87,6 +87,9 @@ let package = Package(
         // builds MLX's Metal kernels at all.
         .testTarget(name: "H3AttentionTests",
                     dependencies: ["H3Attention", .product(name: "MLX", package: "mlx-swift")]),
+        .testTarget(name: "H3ModulesTests",
+                    dependencies: ["H3Modules", "H3Attention", "H3Hardware",
+                                   .product(name: "MLX", package: "mlx-swift")]),
         .testTarget(
             name: "H3ConformanceTests",
             dependencies: ["H3Conformance", "H3Foundation"]

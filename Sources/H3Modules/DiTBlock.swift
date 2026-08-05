@@ -3,6 +3,7 @@ import MLX
 import MLXNN
 import MLXFast
 import H3Foundation
+import H3Attention
 
 /// AdaLN projection: `chunk(linear(silu(t_emb)), expand)`.
 ///
@@ -105,7 +106,11 @@ public enum SplitHalfRoPE {
 /// the oracle measured a hand-written unfused path as **bit-identical**
 /// (cos 1.000000000000, rel 0.0 at blocks 0/24/49). So this is the readable
 /// form deliberately: match the math, not the fusion.
-public struct H3Attention {
+///
+/// Named `AttentionLayer` rather than `H3Attention` because `H3Attention` is the
+/// module that owns the backend protocol, and a type that shadows its own
+/// module's name reads as a mistake even when it compiles.
+public struct AttentionLayer {
     public let qkvWeight: MLXArray     // [3 * inner, hidden], no bias
     public let outWeight: MLXArray     // [hidden, inner], no bias
     public let qNorm: H3RMSNorm
@@ -116,10 +121,17 @@ public struct H3Attention {
     /// bf16. Diagnostic: it isolates whether a deviation comes from the
     /// attention kernel's accumulation or from everything else.
     public let fp32Attention: Bool
+    /// Resolved once at model build and held, rather than looked up per call.
+    ///
+    /// Defaults to dense, so every existing caller — the oracles, the refiner,
+    /// anything that does not supply an `AttentionContext` — keeps the numerics
+    /// the 225 parity taps were measured on.
+    public let backend: any H3AttentionBackend
 
     public init(qkvWeight: MLXArray, outWeight: MLXArray,
                 qNormWeight: MLXArray, kNormWeight: MLXArray,
-                heads: Int, headDim: Int, eps: Float, fp32Attention: Bool = false) {
+                heads: Int, headDim: Int, eps: Float, fp32Attention: Bool = false,
+                backend: any H3AttentionBackend = SDPABackend()) {
         self.qkvWeight = qkvWeight
         self.outWeight = outWeight
         self.qNorm = H3RMSNorm(weight: qNormWeight, eps: eps)
@@ -127,6 +139,7 @@ public struct H3Attention {
         self.heads = heads
         self.headDim = headDim
         self.fp32Attention = fp32Attention
+        self.backend = backend
     }
 
     /// Collects the shape of the proxy-score distribution while a render runs.
@@ -211,8 +224,21 @@ public struct H3Attention {
 
     /// Scaled dot-product attention over `[S, heads, headDim]` or `[B, S, heads, headDim]` inputs, exposed
     /// so the op-level oracle can tap it on its own.
+    ///
+    /// **The backend dispatch lives here, inside the function the oracle taps,
+    /// and not in the caller.** Putting it a level up would mean the oracle
+    /// measures dense attention while production runs something else — the
+    /// harness validating code production does not execute, which is the exact
+    /// failure this arrangement exists to prevent. A backend that returns nil
+    /// declines the call and the dense path below runs unchanged, so schedule
+    /// windows and dense-block exclusions cost nothing to express.
+    ///
+    /// With `backend` and `context` omitted this is bit-for-bit what it was
+    /// before the seam existed.
     public static func sdpa(q: MLXArray, k: MLXArray, v: MLXArray,
-                            headDim: Int, fp32: Bool = false) -> MLXArray {
+                            headDim: Int, fp32: Bool = false,
+                            backend: (any H3AttentionBackend)? = nil,
+                            context: AttentionContext? = nil) -> MLXArray {
         let at: DType = fp32 ? .float32 : q.dtype
         let hasBatch = q.ndim == 4
         let qh = hasBatch ? q.transposed(0, 2, 1, 3).asType(at) : q.transposed(1, 0, 2).expandedDimensions(axis: 0).asType(at)
@@ -222,19 +248,38 @@ public struct H3Attention {
         if proxyProbe.enabled { Self.recordProxy(qh, kh) }
         if qkvCapture.directory != nil { Self.maybeCapture(qh, kh, vh) }
 
-        let o = MLXFast.scaledDotProductAttention(
-            queries: qh, keys: kh, values: vh,
-            scale: 1.0 / Float(headDim).squareRoot(), mask: nil)
-            
+        let scale = 1.0 / Float(headDim).squareRoot()
+
+        // The backend protocol has no batch axis because H3 has no batch axis;
+        // the refiner's batched text path is therefore always dense, which costs
+        // nothing worth measuring — it is a few hundred rows against 15,749.
+        var o: MLXArray?
+        if let backend, let context, !hasBatch {
+            o = backend.attend(queries: qh[0], keys: kh[0], values: vh[0],
+                               scale: scale, mask: nil, context: context)?
+                .expandedDimensions(axis: 0)
+        }
+        if o == nil {
+            o = MLXFast.scaledDotProductAttention(
+                queries: qh, keys: kh, values: vh, scale: scale, mask: nil)
+        }
+        let out = o!
+
         if hasBatch {
-            return o.transposed(0, 2, 1, 3).asType(q.dtype).reshaped([q.dim(0), q.dim(1), q.dim(2) * headDim])
+            return out.transposed(0, 2, 1, 3).asType(q.dtype).reshaped([q.dim(0), q.dim(1), q.dim(2) * headDim])
         } else {
-            return o.squeezed(axis: 0).transposed(1, 0, 2).asType(q.dtype).reshaped([q.dim(0), q.dim(1) * headDim])
+            return out.squeezed(axis: 0).transposed(1, 0, 2).asType(q.dtype).reshaped([q.dim(0), q.dim(1) * headDim])
         }
     }
 
     /// `x` is `[S, hidden]` or `[B, S, hidden]`.
-    public func callAsFunction(_ x: MLXArray, ropeTable: MLXArray?) -> MLXArray {
+    ///
+    /// - Parameter context: where in the render this call sits. Nil means dense:
+    ///   a sparse backend that does not know which block it is in, or how far
+    ///   through the schedule, cannot honour its own dense warm-up or its
+    ///   first/last-block exclusions, and guessing is worse than declining.
+    public func callAsFunction(_ x: MLXArray, ropeTable: MLXArray?,
+                               context: AttentionContext? = nil) -> MLXArray {
         let qkv = matmul(x, qkvWeight.T)
         let qkvParts = qkv.split(parts: 3, axis: -1)
         
@@ -254,7 +299,8 @@ public struct H3Attention {
         // Same call the oracle taps. Inlining a second copy here would mean the
         // oracle validates code production does not run, which is the exact
         // failure this harness exists to prevent.
-        let merged = Self.sdpa(q: q, k: k, v: v, headDim: headDim, fp32: fp32Attention)
+        let merged = Self.sdpa(q: q, k: k, v: v, headDim: headDim, fp32: fp32Attention,
+                               backend: backend, context: context)
         return matmul(merged, outWeight.T)
     }
 }
@@ -295,11 +341,11 @@ public struct H3MLP {
 public struct DiTBlock {
     public let norm1: H3RMSNorm
     public let norm2: H3RMSNorm
-    public let attn: H3Attention
+    public let attn: AttentionLayer
     public let mlp: H3MLP
     public let adaln: AdalnProj
 
-    public init(norm1: H3RMSNorm, norm2: H3RMSNorm, attn: H3Attention,
+    public init(norm1: H3RMSNorm, norm2: H3RMSNorm, attn: AttentionLayer,
                 mlp: H3MLP, adaln: AdalnProj) {
         self.norm1 = norm1
         self.norm2 = norm2
@@ -309,11 +355,13 @@ public struct DiTBlock {
     }
 
     public func callAsFunction(_ x: MLXArray, tEmb: MLXArray, index: ModulationIndex,
-                               ropeTable: MLXArray?) -> MLXArray {
+                               ropeTable: MLXArray?,
+                               context: AttentionContext? = nil) -> MLXArray {
         let m = adaln(tEmb)
         precondition(m.count == 6, "DiTBlock AdaLN must expand to 6, got \(m.count)")
         let h1 = modScaleShift(norm1(x), shift: m[0], scale: m[1], index: index)
-        let x1 = modGate(x, gate: m[2], other: attn(h1, ropeTable: ropeTable), index: index)
+        let x1 = modGate(x, gate: m[2],
+                         other: attn(h1, ropeTable: ropeTable, context: context), index: index)
         let h2 = modScaleShift(norm2(x1), shift: m[3], scale: m[4], index: index)
         return modGate(x1, gate: m[5], other: mlp(h2), index: index)
     }

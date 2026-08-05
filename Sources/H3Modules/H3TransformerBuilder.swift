@@ -1,6 +1,7 @@
 import Foundation
 import MLX
 import H3Foundation
+import H3Attention
 
 /// Constructs the transformer from a validated checkpoint.
 ///
@@ -14,19 +15,23 @@ extension H3Transformer {
     ///   model's native precision and what the reference uses (it takes the
     ///   dtype from the incoming context); fp32 exists to isolate whether a
     ///   discrepancy is precision or logic, and costs 2x residency.
+    /// - Parameter backend: resolved once here rather than per call. Every block
+    ///   holds the same instance, and the selection is logged at build time, so
+    ///   a render cannot be half one backend and half another.
     public init(weights: H3Weights, computeDType: DType = .bfloat16,
                 fp32Attention: Bool = false,
-                keepAdaLNFP32Resident: Bool = false) throws {
+                keepAdaLNFP32Resident: Bool = false,
+                backend: any H3AttentionBackend = SDPABackend()) throws {
         let c = weights.config
         func w(_ n: String) throws -> MLXArray { try weights.tensor(n) }
 
-        func attention(_ prefix: String) throws -> H3Attention {
-            H3Attention(qkvWeight: try w(prefix + "attn.qkv_proj.weight"),
-                        outWeight: try w(prefix + "attn.out_proj.weight"),
-                        qNormWeight: try w(prefix + "attn.q_norm.weight"),
-                        kNormWeight: try w(prefix + "attn.k_norm.weight"),
-                        heads: c.numHeads, headDim: c.headDim, eps: c.qkNormEps,
-                        fp32Attention: fp32Attention)
+        func attention(_ prefix: String) throws -> AttentionLayer {
+            AttentionLayer(qkvWeight: try w(prefix + "attn.qkv_proj.weight"),
+                           outWeight: try w(prefix + "attn.out_proj.weight"),
+                           qNormWeight: try w(prefix + "attn.q_norm.weight"),
+                           kNormWeight: try w(prefix + "attn.k_norm.weight"),
+                           heads: c.numHeads, headDim: c.headDim, eps: c.qkNormEps,
+                           fp32Attention: fp32Attention, backend: backend)
         }
         func mlp(_ prefix: String) throws -> H3MLP {
             H3MLP(fc1: try w(prefix + "mlp.fc1.weight"), fc2: try w(prefix + "mlp.fc2.weight"))
