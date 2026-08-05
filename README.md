@@ -82,6 +82,49 @@ h3 doctor               # the whole startup decision, printed
 
 Precedence is defaults, then the config file, then environment, then CLI flags.
 
+## Rendering
+
+```bash
+h3 render --prompt "..." --width 864 --height 480 --seconds 5 --out out.mp4
+```
+
+One mp4 carrying both streams. H3 generates video and audio jointly, so handing
+back a silent video and a loose wav would throw away the thing that makes the
+model interesting. `--out-audio` adds the wav as a side-car, and it is also
+what survives if muxing fails at the end of a thirty-minute render.
+
+The partition follows from what you asked for: references select Ref2VA,
+anchors and plain prompts select FL2VA, and a checkpoint filed under the wrong
+key is refused rather than used.
+
+**The cross-step cache is on by default at 0.10, and it is an approximation.**
+Every run says so. Swept at 864x480x124x20 against an uncached control of the
+same prompt and seed:
+
+| threshold | steps skipped | speedup | high-frequency detail |
+|---|---|---|---|
+| 0 | 0/20 | — | baseline |
+| **0.10** | 10/20 | **1.93x** | **−16%** |
+| 0.15 | 13/20 | 2.60x | −28% |
+| 0.25 | 14/20 | 2.93x | −44% |
+
+0.15 to 0.25 buys 13% more speed and costs another 16% of detail. 0.10 is the
+knee. Pass `--cache-threshold 0` for a faithful render.
+
+As a library, with progress and cancellation:
+
+```swift
+let result = try H3Pipeline.render(
+    request: RenderRequest(prompt: "...", videoOutput: url),
+    checkpoints: checkpoints,
+    progress: { print($0.phase.rawValue, $0.detail) },
+    cancellation: token)
+```
+
+Cancellation is observed between sampler steps. A step is minutes at production
+shape, so it cannot be instant, and abandoning a half-finished forward would
+gain nothing.
+
 ## Architecture
 
 Dependencies point downward only. The two lowest layers do not link MLX, which
@@ -110,12 +153,22 @@ breaking release.
 
 Ported and gated: the DiT stack, both VAEs, the vision tower, the tokenizer
 (bit-identical), the packed layout for every conditioning kind, and the
-conditioning presentations for keyframes and references. Rendered end to end:
-text-to-video, first/last-frame anchors, and every reference kind.
+conditioning presentations for keyframes and references.
+
+**Rendered end to end through this package**, 864x480x124 at 20 steps, bf16
+FL2VA, cache at the 0.10 default — 782 s wall clock, 9 of 20 steps skipped,
+MLX peak 87.2 GB. Checked with the two oracles that need no golden: speech
+transcribed at **WER 0.00** against the prompt's dialogue, and a face detected
+with landmarks in **124/124 frames** with no flash events.
+
+The other conditioning modes — anchors, image, video and audio references —
+were rendered end to end in the experimental tree this was ported from, and
+have not yet been re-run through this package.
 
 Not implemented: in-context 2K upscaling (the upscaler is unreleased), and
 resident quantised matmul — which is the item that decides whether 64 GB
-machines are supportable.
+machines are supportable. `H3Conformance` has no fixtures yet, so the 36
+contracts are documented rather than enforced.
 
 ## Licence
 

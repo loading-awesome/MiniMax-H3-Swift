@@ -79,13 +79,13 @@ struct Doctor: ParsableCommand {
         for (role, path, result) in rows {
             switch result {
             case .success(let id):
-                print("  \(role.padding(toLength: 22, withPad: " ", startingAt: 0))\(id.summary)")
+                print("  \(role.padding(toLength: 24, withPad: " ", startingAt: 0))\(id.summary)")
                 // Only a DiT with no identifiable vendor is a problem; the
                 // fused-attention layout is a DiT property and nothing else's.
                 if id.kind == .dit && id.vendor == nil { problems += 1 }
             case .failure(let e):
                 problems += 1
-                print("  \(role.padding(toLength: 22, withPad: " ", startingAt: 0))MISSING  \(path)")
+                print("  \(role.padding(toLength: 24, withPad: " ", startingAt: 0))MISSING  \(path)")
                 _ = e
             }
         }
