@@ -1,0 +1,15 @@
+name: CI
+on: [push, pull_request]
+
+jobs:
+  test:
+    # The MLX-free targets are the point of this job: geometry, the frame
+    # lattice, checkpoint identification and the memory planner all test
+    # without a GPU and without a 66 GB download, so CI can actually run them.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: swift build
+      - name: Test
+        run: swift test

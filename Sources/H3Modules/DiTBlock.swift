@@ -1,0 +1,237 @@
+import Foundation
+import MLX
+import MLXNN
+import MLXFast
+import H3Foundation
+
+/// AdaLN projection: `chunk(linear(silu(t_emb)), expand)`.
+///
+/// `t_emb` is `[M, tDim]` for M distinct timesteps; the output is `expand`
+/// tensors of `[M * modalities, hidden]`. The reshape interleaves modalities
+/// **within** each timestep, which is what makes the row index
+/// `timestepRow * modalities + modalityTag`.
+public struct AdalnProj {
+    public let weight: MLXArray      // [expand * hidden * modalities, tDim]
+    public let bias: MLXArray?
+    public let expand: Int
+    public let modalities: Int
+    public let hidden: Int
+    public let applySiLU: Bool
+    /// Compute the projection in fp32 and round the result back to the weight's
+    /// dtype.
+    ///
+    /// This op is ill-conditioned: `silu(t_emb)` is tiny (t_emb std ~9e-03) and
+    /// the K=2688 reduction cancels heavily, so the reference's OWN bf16-vs-fp32
+    /// spread here is 1.7e-03 — three orders of magnitude looser than any other
+    /// matmul in the block. Any difference in accumulation order lands at that
+    /// level, and in bf16 MLX sits 1.55x outside it. In fp32 we land on the
+    /// reference's fp32 result to 4 significant figures.
+    ///
+    /// The cost is real but small: AdaLN weights are 26 of the checkpoint's
+    /// 66 GB, so upcasting per call adds roughly 50 GB of transient traffic per
+    /// forward — about 0.2% of a 61 s production pass. Measured, not assumed.
+    public let computeFP32: Bool
+    /// Optional persistent fp32 copy for a render that has enough unified
+    /// memory to trade ~48 GiB of stable residency for avoiding the repeated
+    /// bf16-to-fp32 conversion of the 50 block AdaLN matrices.
+    ///
+    /// This is opt-in: capacity is workload-dependent, and the bf16 source
+    /// remains the canonical checkpoint representation.
+    public let residentFP32Weight: MLXArray?
+
+    public init(weight: MLXArray, bias: MLXArray?, expand: Int, modalities: Int,
+                hidden: Int, applySiLU: Bool = true, computeFP32: Bool = true,
+                keepFP32Resident: Bool = false) {
+        self.weight = weight
+        self.bias = bias
+        self.expand = expand
+        self.modalities = modalities
+        self.hidden = hidden
+        self.applySiLU = applySiLU
+        self.computeFP32 = computeFP32
+        self.residentFP32Weight = keepFP32Resident && computeFP32 ? weight.asType(.float32) : nil
+    }
+
+    /// Returns `expand` tensors of `[M * modalities, hidden]`, in the weight's
+    /// dtype whatever the internal precision.
+    public func callAsFunction(_ tEmb: MLXArray) -> [MLXArray] {
+        let out = weight.dtype
+        let dt: DType = computeFP32 ? .float32 : out
+        let input = applySiLU ? silu(tEmb.asType(dt)) : tEmb.asType(dt)
+        let projectionWeight = dt == .float32 ? (residentFP32Weight ?? weight.asType(dt)) : weight
+        var x = matmul(input, projectionWeight.T)
+        if let bias { x = x + bias.asType(dt) }
+        x = x.reshaped([x.dim(0) * modalities, expand * hidden]).asType(out)
+        return (0 ..< expand).map { x[0..., ($0 * hidden) ..< (($0 + 1) * hidden)] }
+    }
+}
+
+/// Split-half rotary embedding.
+///
+/// The rotation table is `[1, S, 1, rot/2, 2, 2]` holding `[[c, -s], [s, c]]`,
+/// and pairs are `(i, i + rot/2)` — **split-half, not interleaved**. Choosing
+/// interleaved is the single most common RoPE porting error and produces output
+/// that looks structured but is wrong.
+///
+/// Only the first `rot` channels rotate; the tail passes through untouched.
+public enum SplitHalfRoPE {
+    /// `x` is `[S, heads, headDim]` or `[B, S, heads, headDim]`; `table` is the reference's rotation table.
+    public static func apply(_ x: MLXArray, table: MLXArray) -> MLXArray {
+        let half = table.dim(-3)
+        let rot = half * 2
+        let headDim = x.dim(-1)
+        precondition(rot <= headDim, "rot \(rot) exceeds headDim \(headDim)")
+
+        // [1,S,1,half,2,2] -> [S,1,half] so it broadcasts over heads.
+        let t = table.reshaped([table.dim(1), half, 2, 2])
+        let c = t[0..., 0..., 0, 0].expandedDimensions(axis: 1)
+        let negS = t[0..., 0..., 0, 1].expandedDimensions(axis: 1)
+        let s = t[0..., 0..., 1, 0].expandedDimensions(axis: 1)
+        let c2 = t[0..., 0..., 1, 1].expandedDimensions(axis: 1)
+
+        let parts = x.split(indices: [half, rot], axis: -1)
+        let a = parts[0]
+        let b = parts[1]
+        let ra = c * a + negS * b
+        let rb = s * a + c2 * b
+        if rot == headDim { return concatenated([ra, rb], axis: -1) }
+        return concatenated([ra, rb, parts[2]], axis: -1)
+    }
+}
+
+/// Attention over the packed sequence.
+///
+/// The reference runs a fused in-place kernel (`ck.rms_rope_split_half_`), but
+/// the oracle measured a hand-written unfused path as **bit-identical**
+/// (cos 1.000000000000, rel 0.0 at blocks 0/24/49). So this is the readable
+/// form deliberately: match the math, not the fusion.
+public struct H3Attention {
+    public let qkvWeight: MLXArray     // [3 * inner, hidden], no bias
+    public let outWeight: MLXArray     // [hidden, inner], no bias
+    public let qNorm: H3RMSNorm
+    public let kNorm: H3RMSNorm
+    public let heads: Int
+    public let headDim: Int
+    /// Run the attention op itself in fp32 while the rest of the block stays
+    /// bf16. Diagnostic: it isolates whether a deviation comes from the
+    /// attention kernel's accumulation or from everything else.
+    public let fp32Attention: Bool
+
+    public init(qkvWeight: MLXArray, outWeight: MLXArray,
+                qNormWeight: MLXArray, kNormWeight: MLXArray,
+                heads: Int, headDim: Int, eps: Float, fp32Attention: Bool = false) {
+        self.qkvWeight = qkvWeight
+        self.outWeight = outWeight
+        self.qNorm = H3RMSNorm(weight: qNormWeight, eps: eps)
+        self.kNorm = H3RMSNorm(weight: kNormWeight, eps: eps)
+        self.heads = heads
+        self.headDim = headDim
+        self.fp32Attention = fp32Attention
+    }
+
+    /// Scaled dot-product attention over `[S, heads, headDim]` or `[B, S, heads, headDim]` inputs, exposed
+    /// so the op-level oracle can tap it on its own.
+    public static func sdpa(q: MLXArray, k: MLXArray, v: MLXArray,
+                            headDim: Int, fp32: Bool = false) -> MLXArray {
+        let at: DType = fp32 ? .float32 : q.dtype
+        let hasBatch = q.ndim == 4
+        let qh = hasBatch ? q.transposed(0, 2, 1, 3).asType(at) : q.transposed(1, 0, 2).expandedDimensions(axis: 0).asType(at)
+        let kh = hasBatch ? k.transposed(0, 2, 1, 3).asType(at) : k.transposed(1, 0, 2).expandedDimensions(axis: 0).asType(at)
+        let vh = hasBatch ? v.transposed(0, 2, 1, 3).asType(at) : v.transposed(1, 0, 2).expandedDimensions(axis: 0).asType(at)
+        
+        let o = MLXFast.scaledDotProductAttention(
+            queries: qh, keys: kh, values: vh,
+            scale: 1.0 / Float(headDim).squareRoot(), mask: nil)
+            
+        if hasBatch {
+            return o.transposed(0, 2, 1, 3).asType(q.dtype).reshaped([q.dim(0), q.dim(1), q.dim(2) * headDim])
+        } else {
+            return o.squeezed(axis: 0).transposed(1, 0, 2).asType(q.dtype).reshaped([q.dim(0), q.dim(1) * headDim])
+        }
+    }
+
+    /// `x` is `[S, hidden]` or `[B, S, hidden]`.
+    public func callAsFunction(_ x: MLXArray, ropeTable: MLXArray?) -> MLXArray {
+        let qkv = matmul(x, qkvWeight.T)
+        let qkvParts = qkv.split(parts: 3, axis: -1)
+        
+        let targetShape = qkvParts[0].shape.dropLast() + [heads, headDim]
+        var q = qkvParts[0].reshaped(targetShape)
+        var k = qkvParts[1].reshaped(targetShape)
+        let v = qkvParts[2].reshaped(targetShape)
+
+        // RMSNorm is applied per head BEFORE rope, as the fused kernel does.
+        q = qNorm(q)
+        k = kNorm(k)
+        if let ropeTable {
+            q = SplitHalfRoPE.apply(q, table: ropeTable)
+            k = SplitHalfRoPE.apply(k, table: ropeTable)
+        }
+
+        // Same call the oracle taps. Inlining a second copy here would mean the
+        // oracle validates code production does not run, which is the exact
+        // failure this harness exists to prevent.
+        let merged = Self.sdpa(q: q, k: k, v: v, headDim: headDim, fp32: fp32Attention)
+        return matmul(merged, outWeight.T)
+    }
+}
+
+/// `fc2(silu(gate) * up)` where `fc1` emits `2 * ffn` and
+/// `gate, up = chunk(2, dim: -1)` — **gate is the FIRST half**
+/// (`_swiglu_eager` in `comfy/ops.py`). Swapping them is a coin flip a port
+/// loses half the time, and the output stays plausible.
+public struct H3MLP {
+    public let fc1: MLXArray   // [2 * ffn, hidden]
+    public let fc2: MLXArray   // [hidden, ffn]
+
+    public init(fc1: MLXArray, fc2: MLXArray) {
+        self.fc1 = fc1
+        self.fc2 = fc2
+    }
+
+    public func callAsFunction(_ x: MLXArray) -> MLXArray {
+        let h = matmul(x, fc1.T)
+        let parts = h.split(parts: 2, axis: -1)
+        let gate = parts[0]
+        let up = parts[1]
+        return matmul(silu(gate) * up, fc2.T)
+    }
+}
+
+/// One transformer block.
+///
+///     shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = adaln(t_emb)
+///     h = modScaleShift(norm1(x), shift_msa, scale_msa)
+///     x = modGate(x, gate_msa, attn(h))
+///     h = modScaleShift(norm2(x), shift_mlp, scale_mlp)
+///     x = modGate(x, gate_mlp, mlp(h))
+///
+/// The reference mutates `x` in place and returns the same object. We return a
+/// new array — functionally identical, and MLX has no in-place residual to
+/// preserve.
+public struct DiTBlock {
+    public let norm1: H3RMSNorm
+    public let norm2: H3RMSNorm
+    public let attn: H3Attention
+    public let mlp: H3MLP
+    public let adaln: AdalnProj
+
+    public init(norm1: H3RMSNorm, norm2: H3RMSNorm, attn: H3Attention,
+                mlp: H3MLP, adaln: AdalnProj) {
+        self.norm1 = norm1
+        self.norm2 = norm2
+        self.attn = attn
+        self.mlp = mlp
+        self.adaln = adaln
+    }
+
+    public func callAsFunction(_ x: MLXArray, tEmb: MLXArray, index: ModulationIndex,
+                               ropeTable: MLXArray?) -> MLXArray {
+        let m = adaln(tEmb)
+        precondition(m.count == 6, "DiTBlock AdaLN must expand to 6, got \(m.count)")
+        let h1 = modScaleShift(norm1(x), shift: m[0], scale: m[1], index: index)
+        let x1 = modGate(x, gate: m[2], other: attn(h1, ropeTable: ropeTable), index: index)
+        let h2 = modScaleShift(norm2(x1), shift: m[3], scale: m[4], index: index)
+        return modGate(x1, gate: m[5], other: mlp(h2), index: index)
+    }
+}

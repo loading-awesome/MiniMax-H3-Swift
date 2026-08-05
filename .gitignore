@@ -1,0 +1,18 @@
+# weights and captures — never in git
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.mp4
+*.wav
+
+# build / env
+.build/
+.swiftpm/
+.venv/
+.DS_Store
+
+# secrets — belt and braces
+.env
+*.token
+**/hf_token*
