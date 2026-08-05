@@ -12,9 +12,11 @@ import H3Hardware
 /// method worth having. Sol-Attn alone needs four things that signature cannot
 /// express:
 ///
-///  * **where in the schedule we are.** It runs dense before 20% and after 90%
-///    of the sigma schedule, because the early steps set global structure and
-///    the late ones set fine detail, and approximating either shows.
+///  * **where in the schedule we are.** The paper specifies a dense *warm-up* —
+///    the first 20% of steps and the first layer — attributed to prior work and
+///    never ablated. It specifies no late-schedule dense phase; the ComfyUI
+///    port's `end_percent` is the implementer's addition. Either way the
+///    backend has to know where in the schedule it is.
 ///  * **which block this is.** The first and last transformer blocks are the
 ///    most approximation-sensitive: their error reaches the output with no
 ///    later block to absorb it, so they are commonly excluded.
@@ -94,6 +96,13 @@ public protocol H3AttentionBackend: Sendable {
     static var materialisesScores: Bool { get }
 
     /// Whether this backend benefits from Morton-ordered video tokens.
+    ///
+    /// **False for H3 as far as NVIDIA is concerned**: their official H3
+    /// integration states the packed video tail "is already a contiguous
+    /// grid-ordered block, and the routing works on it directly". Morton is
+    /// absent from the paper and from the official backend; it is a ComfyUI-port
+    /// addition aimed at Wan. Kept as a seam because it is free to keep and the
+    /// claim is worth testing, but it defaults off.
     ///
     /// Reordering is a *pipeline* transform, not an attention one — it permutes
     /// hidden states and position ids around the whole block stack — so the
@@ -178,18 +187,24 @@ public enum AttentionRegistry {
     /// `MLXFast.metalKernel`, not a binding. What ports directly is the
     /// structure, and it is all H3-shaped already:
     ///
-    ///  * on-the-fly block thresholding with proxy-score reuse, `tau` the
-    ///    threshold — reported as ~16% of blocks kept exact at 1.0, ~7% at 1.5,
-    ///    ~2.7% at 2.0;
-    ///  * an exact-KV sink over the packed conditioning rows;
-    ///  * Morton reordering of the video span;
-    ///  * dense first and last blocks;
+    ///  * per-query-block thresholding, `tau_i = mu_i + beta*sigma_i`, where
+    ///    beta is a Gaussian tail cutoff: density is `1 - Phi(beta)`, so ~16% of
+    ///    blocks stay exact at 1.0, ~7% at 1.5, ~2.7% at 2.0;
+    ///  * a rank-1 correction for rejected blocks — pooled key times summed
+    ///    value, into both the numerator and the denominator — which is what
+    ///    makes it an approximation rather than a mask;
+    ///  * an exact-KV sink over the packed conditioning rows, which for H3 is
+    ///    not optional: NVIDIA's own notes record a text-only sink where "the
+    ///    picture scored best of its set while its dialogue fell apart";
     ///  * bf16 with head_dim 128, which is exactly this model.
     ///
-    /// It reports ~2.1x end-to-end on video generation. Against the roofline
-    /// measured here — the model already at ~90% of achievable matmul
-    /// throughput, attention quadratic in a 15-20k sequence — that is the one
-    /// available lever that is not a smaller model.
+    /// **It is not the biggest lever available, and an earlier version of this
+    /// comment said it was.** NVIDIA's H3 breakdown puts cross-step caching
+    /// first (1.534x -> 3.95x of a 3.95x total), fused RMS-AdaLN second, and
+    /// Sol-Attn at 1.25x additional. Amdahl agrees: attention is 37% of DiT
+    /// FLOPs at our verified shape, so sparsification alone caps near 1.5x
+    /// there — rising with sequence length, which is where it earns its place.
+    /// See docs/SOL_ATTN.md.
     static let available: [any H3AttentionBackend.Type] = [SDPABackend.self]
 
     public static func resolve(requested: String, machine: Machine,
