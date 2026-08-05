@@ -19,6 +19,7 @@
 # secrets — belt and braces
 .env
 *.token
+*.p8
 **/hf_token*
 
 # release archives
