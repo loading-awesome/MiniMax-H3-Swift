@@ -1,13 +1,37 @@
 #!/bin/bash
-# Build the release archive that gets attached to a GitHub release.
+# Build the artifacts a GitHub release attaches, and optionally sign, notarise
+# and staple them.
 #
-# The archive has to contain `mlx.metallib` next to `h3`. This is not optional
-# packaging tidiness: SwiftPM does not build MLX's Metal kernels, and MLX looks
-# for them beside the running binary. Ship `h3` alone and every download fails
-# on its first render with an untyped C++ error naming no file. See
-# `H3Hardware.MetalLibrary`.
+# Unsigned (default) — anyone who downloads this must clear the quarantine flag
+# by hand before macOS will run it:
 #
-#   ./Scripts/package-release.sh            -> dist/h3-<version>-macos-arm64.tar.gz
+#     ./Scripts/package-release.sh
+#
+# Signed and notarised — no quarantine step for the user at all:
+#
+#     H3_SIGN_APP="Developer ID Application: Your Name (TEAMID)" \
+#     H3_SIGN_PKG="Developer ID Installer: Your Name (TEAMID)" \
+#     H3_NOTARY_PROFILE=h3-notary \
+#     ./Scripts/package-release.sh
+#
+# **This script never sees a secret.** `H3_NOTARY_PROFILE` names a keychain
+# profile you create once, yourself:
+#
+#     xcrun notarytool store-credentials h3-notary \
+#         --apple-id you@example.com --team-id TEAMID --password <app-specific>
+#
+# The app-specific password goes into your keychain at that moment and never
+# appears here, in the repository, or in a process listing.
+#
+# Two certificates, not one. "Developer ID Application" signs the binary;
+# "Developer ID Installer" signs the .pkg. Both are free with a paid developer
+# account and both are created from Xcode: Settings -> Accounts -> Manage
+# Certificates -> +.
+#
+# The hardened runtime is required for notarisation and is free here: measured
+# against an unsigned build, 190 s to reach sampling step 3 either way, 60.5
+# against 60.4 s/step. MLX compiles its Metal kernels out of process, so no JIT
+# entitlement is needed.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -19,26 +43,41 @@ version="$(grep -o 'version = "[^"]*"' Sources/MiniMaxH3/MiniMaxH3.swift | head 
 arch="$(uname -m)"
 name="h3-${version}-macos-${arch}"
 stage="dist/${name}"
+sign_app="${H3_SIGN_APP:-}"
+sign_pkg="${H3_SIGN_PKG:-}"
+notary="${H3_NOTARY_PROFILE:-}"
 
 echo "building ${name}"
 swift build -c release --disable-sandbox
 
-rm -rf "$stage"
+rm -rf "$stage" "dist/pkgroot"
 mkdir -p "$stage"
 cp ".build/release/h3" "$stage/h3"
 cp "Resources/mlx.metallib" "$stage/mlx.metallib"
 cp LICENSE NOTICE THIRD_PARTY_NOTICES.md "$stage/"
 
-cat > "$stage/README.txt" <<'TXT'
-h3 — MiniMax-H3 for Apple silicon
+# ---------------------------------------------------------------- sign
 
-Keep `h3` and `mlx.metallib` in the same folder. h3 looks for the Metal kernels
-beside itself and will not run without them.
+if [ -n "$sign_app" ]; then
+    echo "signing with: ${sign_app}"
+    # --options runtime is the hardened runtime, which notarisation requires.
+    # --timestamp contacts Apple's timestamp server, so the signature stays
+    # valid after the certificate expires.
+    codesign --force --options runtime --timestamp \
+             --sign "$sign_app" "$stage/h3"
+    codesign --verify --strict --verbose=2 "$stage/h3"
+else
+    echo "NOT signing (set H3_SIGN_APP to sign)"
+fi
 
-macOS will refuse to open a downloaded binary until you clear the quarantine
-flag. From this folder, once:
+cat > "$stage/README.txt" <<TXT
+h3 — MiniMax-H3 for Apple silicon, ${version}
 
-    xattr -dr com.apple.quarantine h3
+Keep 'h3' and 'mlx.metallib' in the same folder. h3 looks for the Metal kernels
+beside itself and will not start without them.
+$( [ -n "$sign_app" ] || printf '\n%s\n' "This build is not signed, so macOS will refuse to open it until you run:
+
+    xattr -dr com.apple.quarantine h3" )
     chmod +x h3
 
 Then:
@@ -55,12 +94,71 @@ To run it from anywhere, move both files together:
 The symlink is fine — h3 resolves symlinks before looking for the metallib.
 TXT
 
-tar -czf "dist/${name}.tar.gz" -C dist "$name"
-rm -rf "$stage"
+# ---------------------------------------------------------------- zip
+
+# ditto, not zip(1): it preserves the extended attributes a code signature
+# lives in. A plain zip can strip the signature and the download then fails
+# Gatekeeper for a reason nobody can see.
+ditto -c -k --keepParent "$stage" "dist/${name}.zip"
+echo "dist/${name}.zip  ($(du -h "dist/${name}.zip" | cut -f1))"
+
+# ---------------------------------------------------------------- pkg
+
+# The installer exists because it is the only artifact that can be *stapled*.
+# A stapled ticket means the first run works with no network; a notarised zip
+# still has to phone Apple, which fails on a plane or behind a strict firewall.
+# It also spares a non-technical user the Terminal entirely.
+if [ -n "$sign_pkg" ]; then
+    mkdir -p "dist/pkgroot/usr/local/lib/h3"
+    cp "$stage/h3" "$stage/mlx.metallib" "dist/pkgroot/usr/local/lib/h3/"
+
+    mkdir -p "dist/scripts"
+    cat > "dist/scripts/postinstall" <<'POST'
+#!/bin/bash
+set -e
+mkdir -p /usr/local/bin
+ln -sf /usr/local/lib/h3/h3 /usr/local/bin/h3
+exit 0
+POST
+    chmod +x "dist/scripts/postinstall"
+
+    pkgbuild --root "dist/pkgroot" \
+             --scripts "dist/scripts" \
+             --identifier "com.loading-awesome.h3" \
+             --version "$version" \
+             --install-location "/" \
+             --sign "$sign_pkg" \
+             "dist/${name}.pkg"
+    echo "dist/${name}.pkg  ($(du -h "dist/${name}.pkg" | cut -f1))"
+else
+    echo "NOT building a .pkg (set H3_SIGN_PKG to build and sign one)"
+fi
+
+# ---------------------------------------------------------------- notarise
+
+if [ -n "$notary" ]; then
+    for artifact in "dist/${name}.zip" "dist/${name}.pkg"; do
+        [ -f "$artifact" ] || continue
+        echo ""
+        echo "notarising $(basename "$artifact") — this uploads it to Apple and waits"
+        xcrun notarytool submit "$artifact" --keychain-profile "$notary" --wait
+        # Only a .pkg can carry a stapled ticket. Stapling a zip is not a thing
+        # that exists, so the zip relies on Gatekeeper's online check.
+        case "$artifact" in
+            *.pkg) xcrun stapler staple "$artifact"
+                   xcrun stapler validate "$artifact" ;;
+            *)     echo "  (zip notarised; tickets cannot be stapled to a zip)" ;;
+        esac
+    done
+else
+    echo ""
+    echo "NOT notarising (set H3_NOTARY_PROFILE to notarise)"
+fi
+
+rm -rf "$stage" "dist/pkgroot" "dist/scripts"
 
 echo ""
-echo "dist/${name}.tar.gz  ($(du -h "dist/${name}.tar.gz" | cut -f1))"
-echo ""
-echo "This binary is unsigned and unnotarised, so every downloader must clear"
-echo "the quarantine flag by hand. Signing it with a Developer ID and running"
-echo "notarytool would remove that step; the README.txt above documents it."
+if [ -z "$sign_app" ]; then
+    echo "This build is unsigned, so every downloader must clear the quarantine"
+    echo "flag by hand. See the header of this script to sign and notarise."
+fi

@@ -97,3 +97,38 @@ If you add a file that came from somewhere else — a vendored binary, a kernel,
 a table — it goes in `THIRD_PARTY_NOTICES.md` with its own licence and copyright
 holder in the same commit. A dependency is a link; a redistributed artifact is
 an obligation.
+
+## Cutting a release
+
+```bash
+H3_SIGN_APP="Developer ID Application: NAME (TEAMID)" \
+H3_SIGN_PKG="Developer ID Installer: NAME (TEAMID)" \
+H3_NOTARY_PROFILE=h3-notary \
+./Scripts/package-release.sh
+```
+
+Three things have to be true first, and each is a one-time setup:
+
+1. **Two certificates**, not one. `Developer ID Application` signs the binary;
+   `Developer ID Installer` signs the `.pkg`. Both come from Xcode: Settings →
+   Accounts → Manage Certificates → **+**. An `Apple Development` certificate
+   is *not* one of these and cannot be notarised.
+2. **A stored notary profile.** Run this yourself; the script never handles a
+   secret and there is nothing to paste into the repository:
+   ```bash
+   xcrun notarytool store-credentials h3-notary \
+       --apple-id you@example.com --team-id TEAMID --password <app-specific-password>
+   ```
+   Generate the app-specific password at appleid.apple.com. It goes straight
+   into your keychain.
+3. **Attach both artifacts** to the GitHub release. The `.pkg` is the one the
+   README points people at.
+
+Why both: only a `.pkg` can carry a **stapled** notarisation ticket, so it works
+on a machine with no network. A notarised `.zip` still has to reach Apple to be
+checked on first run.
+
+The hardened runtime that notarisation requires costs nothing here — measured
+against an unsigned build, 190 s to reach sampling step 3 either way, 60.5
+against 60.4 s/step. MLX compiles Metal kernels out of process, so no JIT
+entitlement is needed.

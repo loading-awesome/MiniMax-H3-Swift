@@ -89,27 +89,46 @@ no problems found
 
 ## 1. Get `h3`
 
-**Download the binary.** No compiler, no Xcode:
+**Download the installer.** No compiler, no Xcode, no Terminal:
 
 ### [⬇ Download the latest release](https://github.com/loading-awesome/MiniMax-H3-Swift/releases/latest)
 
-Unpack it, then **clear the quarantine flag**. macOS blocks any downloaded
-program not signed by a paid Apple developer account, and this one is not
-signed. In the folder you unpacked into, once:
+Take the **`.pkg`** and double-click it. It puts `h3` on your path, and you can
+then open Terminal and type:
 
 ```bash
-xattr -dr com.apple.quarantine h3
+h3 doctor
+```
+
+<details>
+<summary>Or take the <code>.zip</code>, if you would rather not run an installer</summary>
+
+Unpack it and keep `h3` and `mlx.metallib` **in the same folder** — `h3` looks
+for its GPU kernels beside itself and will not start without them.
+
+```bash
 chmod +x h3
 ./h3 doctor
 ```
 
-Keep `h3` and `mlx.metallib` **in the same folder**. `h3` looks for its GPU
-kernels beside itself and will not start without them. To run it from anywhere:
+To put it on your path, move **both** files together:
 
 ```bash
 sudo mkdir -p /usr/local/lib/h3 && sudo cp h3 mlx.metallib /usr/local/lib/h3/
 sudo ln -sf /usr/local/lib/h3/h3 /usr/local/bin/h3
 ```
+
+The symlink is fine; `h3` resolves symlinks before looking for the kernels.
+</details>
+
+> **If macOS says the file is damaged or from an unidentified developer**, you
+> have an unsigned build — a build made from source, or from a release cut
+> before signing was set up. Clear the quarantine flag once, in the folder you
+> unpacked into:
+>
+> ```bash
+> xattr -dr com.apple.quarantine h3
+> ```
 
 <details>
 <summary><b>Or build it from source</b></summary>
