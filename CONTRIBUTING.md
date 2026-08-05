@@ -86,3 +86,14 @@ Test through the public path. A test that builds its own `JSONDecoder` is
 testing its own decoder — that is exactly how the `video_vae` key bug survived
 a green suite, with `h3 doctor` cheerfully listing eight checkpoints and neither
 VAE.
+
+## Licensing of contributions
+
+Contributions are accepted under the Apache License 2.0, the licence this
+project ships under. Section 5 makes that the default for anything you
+deliberately submit, so there is no separate CLA to sign.
+
+If you add a file that came from somewhere else — a vendored binary, a kernel,
+a table — it goes in `THIRD_PARTY_NOTICES.md` with its own licence and copyright
+holder in the same commit. A dependency is a link; a redistributed artifact is
+an obligation.

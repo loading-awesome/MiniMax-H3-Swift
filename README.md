@@ -172,4 +172,19 @@ contracts are documented rather than enforced.
 
 ## Licence
 
-See [LICENSE](LICENSE). The model weights are licensed separately by MiniMax.
+**Apache License 2.0** — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+Use it for anything, including commercially and in closed-source products.
+Modify it, fork it, ship it. Two things travel with it: keep the copyright and
+the `NOTICE` file in what you distribute, and state that you changed the files
+you changed. That is the attribution.
+
+Apache-2.0 rather than MIT for one reason beyond attribution: it grants patent
+rights explicitly, from every contributor. For an inference implementation of a
+model this is worth having stated rather than assumed, and it is what most of
+the ML ecosystem — including `swift-argument-parser` — already uses.
+
+`Resources/mlx.metallib` is MLX's compiled Metal kernel library, redistributed
+here under its own MIT licence; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+The model weights are not in this repository and are licensed separately by
+MiniMax.
