@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Sean Kammerich
 # Put MLX's Metal kernels where MLX will find them.
 #
 # `swift build` does not produce mlx-swift's default.metallib: the Metal kernels

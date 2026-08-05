@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Sean Kammerich
+
 import Foundation
 
 /// What this Mac is, measured at startup rather than assumed.

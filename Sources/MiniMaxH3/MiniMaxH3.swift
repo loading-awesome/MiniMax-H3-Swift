@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Sean Kammerich
+
 // The public surface. Everything a caller needs, and nothing that would make
 // an internal change a breaking one.
 //

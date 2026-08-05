@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Sean Kammerich
+
 import Foundation
 
 /// Every way this library can refuse, as a value the caller can switch on.

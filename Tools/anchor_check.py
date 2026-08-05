@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Sean Kammerich
 """Did the keyframe anchor actually land on the frame it was aimed at?
 
 The third oracle that needs no golden. `face-check` asks whether a face is

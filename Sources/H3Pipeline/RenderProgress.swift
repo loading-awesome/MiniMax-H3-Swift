@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Sean Kammerich
+
 import Foundation
 
 /// Where a render has got to, and the way to stop it.

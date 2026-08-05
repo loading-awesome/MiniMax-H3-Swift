@@ -1,4 +1,6 @@
 // swift-tools-version: 6.0
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Sean Kammerich
 import PackageDescription
 
 // The target graph is the architecture, so it is worth reading as one.

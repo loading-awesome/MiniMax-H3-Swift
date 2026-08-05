@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Sean Kammerich
 """Did the render's audio come from the reference clip, or from the prompt?
 
 `speech_check.py` asks whether the words are right, and for a2v that is not

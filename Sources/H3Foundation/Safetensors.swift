@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Sean Kammerich
+
 import Foundation
 
 /// Minimal safetensors reader/writer — enough to consume the goldens and emit a

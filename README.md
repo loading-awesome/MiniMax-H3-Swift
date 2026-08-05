@@ -423,3 +423,10 @@ you changed. That is the attribution.
 here under its own MIT licence — see
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). The model weights are not in
 this repository and are licensed separately by MiniMax.
+
+> **If you verify the signature on a download**, `codesign -dv` reports
+> `Developer ID Application: Tesserapps, LLC`, which is not the name on the
+> copyright above. That is expected: the copyright is personal and Tesserapps is
+> the Apple developer account whose certificates sign the binaries. Same author,
+> two hats — checking the signature is the right instinct and this is the
+> explanation.

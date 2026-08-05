@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Sean Kammerich
+
 import Foundation
 
 /// Qwen2 byte-level BPE — the tokenizer H3's conditioning encoder expects.

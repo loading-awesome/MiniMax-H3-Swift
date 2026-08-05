@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Sean Kammerich
 # Build the artifacts a GitHub release attaches, and optionally sign, notarise
 # and staple them.
 #
@@ -92,6 +94,10 @@ To run it from anywhere, move both files together:
     sudo ln -sf /usr/local/lib/h3/h3 /usr/local/bin/h3
 
 The symlink is fine — h3 resolves symlinks before looking for the metallib.
+
+Signature: the binary is signed by "Developer ID Application: Tesserapps, LLC",
+which is the Apple developer account. The copyright is personal to Sean
+Kammerich. Same author, two hats.
 TXT
 
 # ---------------------------------------------------------------- zip

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Sean Kammerich
 """Transcribe a rendered waveform and score it against the prompt's dialogue.
 
 The second half of an oracle that needs no golden. `h3-parity face-check` asks

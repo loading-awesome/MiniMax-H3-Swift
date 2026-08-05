@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Sean Kammerich
+
 import Foundation
 
 /// The modality tag an AdaLN row carries. Fixed by the reference's `seg_tag`

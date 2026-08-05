@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Sean Kammerich
+
 import Foundation
 
 /// Auditable ownership for every numbered entry in `FRAGILE_CONTRACTS.md`.
