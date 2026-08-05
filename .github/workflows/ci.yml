@@ -11,5 +11,12 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build
         run: swift build
+      # SwiftPM does not build MLX's Metal kernels — mlx-swift compiles them in
+      # its Xcode project — so the MLX-linked test targets die on their first
+      # GPU operation without this step. See CONTRIBUTING.md.
+      - name: Build tests
+        run: swift build --build-tests
+      - name: Bootstrap Metal kernels
+        run: ./Scripts/bootstrap-metal.sh
       - name: Test
         run: swift test

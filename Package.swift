@@ -79,9 +79,14 @@ let package = Package(
         .testTarget(name: "H3CatalogTests", dependencies: ["H3Catalog"]),
         .testTarget(name: "H3HardwareTests", dependencies: ["H3Hardware"]),
         .testTarget(name: "H3RecipesTests", dependencies: ["H3Recipes"]),
-        // No `resources:` until Fixtures actually holds something. Declaring a
-        // copy of an empty directory produces a malformed test bundle, and the
-        // symptom is unrelated and baffling: MLX fails to find its metallib.
+        // MLX-linked test targets need `Scripts/bootstrap-metal.sh` to have run;
+        // see `H3Hardware.MetalLibrary` for why, and for what the failure looks
+        // like when it has not. An earlier version of this comment blamed an
+        // empty `resources: [.copy("Fixtures")]` declaration. That was wrong —
+        // removing it changed nothing, and the real cause is that SwiftPM never
+        // builds MLX's Metal kernels at all.
+        .testTarget(name: "H3AttentionTests",
+                    dependencies: ["H3Attention", .product(name: "MLX", package: "mlx-swift")]),
         .testTarget(
             name: "H3ConformanceTests",
             dependencies: ["H3Conformance", "H3Foundation"]

@@ -1,5 +1,32 @@
 # Contributing
 
+## Setup: `swift build` is not enough
+
+```bash
+swift build && ./Scripts/bootstrap-metal.sh
+```
+
+SwiftPM does not build MLX's Metal kernels. mlx-swift excludes them from its
+`Cmlx` target and compiles them in its Xcode project instead, so a command-line
+build links cleanly and then dies on its first GPU operation with an untyped
+C++ error that names no path:
+
+```
+MLX error: Failed to load the default metallib. library not found library not found …
+```
+
+MLX's last-resort fallback is `default.metallib` **relative to the current
+working directory**, which is why the experimental tree appeared to work for
+months: a metallib had been committed at its repo root and everything was run
+from there. `Scripts/bootstrap-metal.sh` instead puts `mlx.metallib` beside each
+built binary, where MLX looks first and where the answer does not depend on
+where the user is standing. `h3 doctor` reports which copy is in play, and
+`H3Hardware.MetalLibrary.preflight()` turns a missing one into an error with a
+remedy. Re-run the script after any build that relinks the test bundle.
+
+`Resources/mlx.metallib` is version-coupled to the mlx-swift revision pinned in
+`Package.resolved`. Bumping one means replacing the other.
+
 ## The house style for comments
 
 Explain **why**, with the measurement. This codebase's failure mode is silent —

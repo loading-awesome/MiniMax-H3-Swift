@@ -26,6 +26,20 @@ public struct Machine: Sendable, Equatable {
 
     public var memoryGB: Double { Double(memoryBytes) / 1e9 }
 
+    /// Public because `detect()` is not the only way a caller legitimately gets
+    /// here: planning for a machine you are not sitting at — "would this fit a
+    /// 48 GB MacBook Pro?" — is a question the planner should answer without
+    /// owning one, and it is how the memory plan is tested across configurations
+    /// that no single CI box can provide.
+    public init(model: String, chip: String, memoryBytes: UInt64,
+                cores: Int, isPortable: Bool) {
+        self.model = model
+        self.chip = chip
+        self.memoryBytes = memoryBytes
+        self.cores = cores
+        self.isPortable = isPortable
+    }
+
     // MARK: measurement
 
     public static func detect() -> Machine {

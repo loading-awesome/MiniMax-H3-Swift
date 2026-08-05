@@ -77,6 +77,13 @@ public struct AttentionContext: Sendable {
 /// pipeline having to know any backend's policy.
 public protocol H3AttentionBackend: Sendable {
 
+    /// Required so the registry can instantiate the backend it selected.
+    ///
+    /// Without it `resolve` can only return a concrete type it names itself,
+    /// which is how the first version came to report one identifier while
+    /// handing back another instance.
+    init()
+
     /// Stable identifier, as it appears in config files and logs.
     static var identifier: String { get }
 
@@ -131,8 +138,16 @@ public struct SDPABackend: H3AttentionBackend {
     public func attend(queries: MLXArray, keys: MLXArray, values: MLXArray,
                        scale: Float, mask: MLXArray?,
                        context: AttentionContext) -> MLXArray? {
-        MLXFast.scaledDotProductAttention(queries: queries, keys: keys,
-                                          values: values, scale: scale, mask: mask)
+        // MLX's fused kernel takes `[B, heads, S, headDim]` and traps on rank 3,
+        // so the batch axis this protocol deliberately does not have is added
+        // here and removed again. Putting it in the protocol instead would put a
+        // dimension H3 can never use into every future backend's signature.
+        let o = MLXFast.scaledDotProductAttention(
+            queries: queries.expandedDimensions(axis: 0),
+            keys: keys.expandedDimensions(axis: 0),
+            values: values.expandedDimensions(axis: 0),
+            scale: scale, mask: mask)
+        return o.squeezed(axis: 0)
     }
 }
 
@@ -208,12 +223,31 @@ public enum AttentionRegistry {
     static let available: [any H3AttentionBackend.Type] = [SDPABackend.self]
 
     public static func resolve(requested: String, machine: Machine,
-                              ordering: TokenOrdering? = nil) throws -> Selection {
+                               ordering: TokenOrdering? = nil) throws -> Selection {
+        try resolve(requested: requested, machine: machine, ordering: ordering,
+                    backends: available)
+    }
+
+    /// The registry above is a `let`, so the tests supply their own list here
+    /// rather than mutating shared state. With one backend compiled in there is
+    /// no way to catch a resolver that returns the wrong *instance*; a second,
+    /// fake backend is what makes that observable.
+    static func resolve(requested: String, machine: Machine,
+                        ordering: TokenOrdering?,
+                        backends available: [any H3AttentionBackend.Type]) throws -> Selection {
+        // `t.init()`, not a named type. An earlier version wrote `SDPABackend()`
+        // here while reporting `t.identifier` and `t.equivalenceClass` — correct
+        // only for as long as SDPA was the sole registered backend, and silently
+        // wrong the moment a second one existed: a Selection labelled `sol`,
+        // carrying sol's equivalence class, running dense attention. That is the
+        // same failure shape as loading a checkpoint under the wrong vendor —
+        // every field plausible, the answer from a different implementation than
+        // the one named. `backendIsWhatWasNamed` in the tests pins it.
         func make(_ t: any H3AttentionBackend.Type, _ reason: String) -> Selection {
             Selection(identifier: t.identifier, equivalenceClass: t.equivalenceClass,
                       materialisesScores: t.materialisesScores,
                       ordering: ordering ?? (t.prefersMortonOrder ? .mortonPerFrame : .none),
-                      backend: SDPABackend(), reason: reason)
+                      backend: t.init(), reason: reason)
         }
         if requested == "auto" {
             for t in available where t.isAvailable(on: machine) {

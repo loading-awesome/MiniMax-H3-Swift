@@ -37,6 +37,28 @@ struct Doctor: ParsableCommand {
             print("        sustained load; a twenty-minute render will throttle and finish late.")
         }
 
+        // ---- Metal kernels
+        //
+        // First, because it is the first thing that fails and the least
+        // self-explanatory when it does: without them every checkpoint below
+        // resolves perfectly and the render dies on its opening GPU op.
+        var problems = 0
+        print("\nMetal kernels")
+        if let lib = MetalLibrary.locate() {
+            print("  \(lib.path)")
+            if MetalLibrary.locatedOnlyViaWorkingDirectory() {
+                problems += 1
+                print("  WARNING: found only relative to the current directory, so this binary")
+                print("           works from here and nowhere else. Run Scripts/bootstrap-metal.sh")
+                print("           to place mlx.metallib beside the executable instead.")
+            }
+        } else {
+            problems += 1
+            print("  MISSING — the first GPU operation will fail. Looked in:")
+            for p in MetalLibrary.searchPaths { print("    \(p.path)") }
+            print("  remedy: run Scripts/bootstrap-metal.sh from the package root.")
+        }
+
         // ---- configuration
         let (cfg, url) = try H3Configuration.load(from: config.map(URL.init(fileURLWithPath:)))
         print("\nconfiguration")
@@ -54,7 +76,6 @@ struct Doctor: ParsableCommand {
         if rows.isEmpty {
             print("  none configured")
         }
-        var problems = 0
         for (role, path, result) in rows {
             switch result {
             case .success(let id):
@@ -94,8 +115,10 @@ struct Doctor: ParsableCommand {
             let caveat = (!precision.isResidentQuantised
                           && (precision == .int8 || precision == .prunedInt8))
                 ? "   [dequantised at load — saves disk, not memory]" : ""
-            print(String(format: "  %-12@ peak %6.1f GB   %@%@",
-                         precision.rawValue as NSString, plan.peakGB, verdict, caveat))
+            // `%-12@` does not pad on Darwin's Foundation — width flags are
+            // ignored for `%@` — so the columns have to be padded in Swift.
+            let name = precision.rawValue.padding(toLength: 12, withPad: " ", startingAt: 0)
+            print(String(format: "  %@ peak %6.1f GB   %@%@", name, plan.peakGB, verdict, caveat))
         }
 
         if let best = MemoryPlan.best(packedTokens: tokens, availableBytes: available,
