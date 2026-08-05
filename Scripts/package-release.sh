@@ -96,9 +96,11 @@ TXT
 
 # ---------------------------------------------------------------- zip
 
-# ditto, not zip(1): it preserves the extended attributes a code signature
-# lives in. A plain zip can strip the signature and the download then fails
-# Gatekeeper for a reason nobody can see.
+# ditto, not zip(1). A bare Mach-O carries its signature embedded in __LINKEDIT,
+# so this particular binary would survive either — but ditto is what Apple's
+# notarisation documentation specifies, it preserves extended attributes, and it
+# is correct for the bundles this will eventually also have to archive. Using
+# the tool that is right in general beats using one that happens to work here.
 ditto -c -k --keepParent "$stage" "dist/${name}.zip"
 echo "dist/${name}.zip  ($(du -h "dist/${name}.zip" | cut -f1))"
 
