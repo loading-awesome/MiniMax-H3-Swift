@@ -39,11 +39,11 @@ import H3Foundation
 // port by comparing renders — a 1e-4 difference saturates the final latent by
 // 4 steps, so correct implementations produce different-looking output.
 
-public enum H3Model {
-    public static let contractNotesVersion = 1
+package enum H3Model {
+    package static let contractNotesVersion = 1
 
     /// Placeholder so the target compiles and the MLX dependency is exercised.
-    public static func selfCheck() -> Bool {
+    package static func selfCheck() -> Bool {
         let a = MLXArray([1.0, 2.0, 3.0] as [Float])
         return a.sum().item(Float.self) == 6.0
     }

@@ -19,17 +19,17 @@ import H3Foundation
 ///  * **The waveform is right-padded with zeros to a multiple of 800 samples**
 ///    (the hop length) before anything else touches it. Skipping that silently
 ///    truncates the tail of the clip.
-public struct Snake1d {
+package struct Snake1d {
     /// Stored **raw**, not in log scale — that is `SnakeBeta`, which is the
     /// decoder's activation. `Snake1d` uses alpha directly and passes it as
     /// beta as well, so the two are the same tensor.
-    public let alpha: MLXArray
+    package let alpha: MLXArray
 
-    public init(alpha: MLXArray) {
+    package init(alpha: MLXArray) {
         self.alpha = alpha
     }
 
-    public func callAsFunction(_ x: MLXArray) -> MLXArray {
+    package func callAsFunction(_ x: MLXArray) -> MLXArray {
         // the checkpoint stores [1, C, 1]; NLC wants [1, 1, C]
         let a = alpha.reshaped([1, 1, alpha.size])
         return snake(x, alpha: a, beta: a)
@@ -221,11 +221,11 @@ struct AudioAttnProjection {
     }
 }
 
-public final class AudioVAEEncoder {
+package final class AudioVAEEncoder {
     /// 2 * 4 * 4 * 5 * 5 — audio samples per latent frame.
-    public static let hopLength = 800
-    public static let strides = [2, 4, 4, 5, 5]
-    public static let latentChannels = 32
+    package static let hopLength = 800
+    package static let strides = [2, 4, 4, 5, 5]
+    package static let latentChannels = 32
 
     let convIn: VaeConv1d
     let blocks: [AudioEncoderBlock]
@@ -237,7 +237,7 @@ public final class AudioVAEEncoder {
     let latentsMean: MLXArray
     let latentsStd: MLXArray
 
-    public init(weights: [String: MLXArray]) throws {
+    package init(weights: [String: MLXArray]) throws {
         func get(_ n: String) throws -> MLXArray {
             guard let a = weights[n] else { throw H3Weights.Error.missing(n) }
             return a
@@ -270,23 +270,23 @@ public final class AudioVAEEncoder {
     /// Named after the reference's module paths. `encoder.block.N` is recorded
     /// in the reference's NCL layout, not this port's NLC, so a comparison has
     /// to transpose — which is exactly the kind of thing worth pinning.
-    public struct Taps {
+    package struct Taps {
         /// `encoder.block.N` output, in NLC.
-        public var encoderBlocks: [Int: MLXArray] = [:]
-        public var preBlockAttn: MLXArray?
-        public var preBlockMlp: MLXArray?
-        public var preBlock: MLXArray?
-        public var meanProj: MLXArray?
-        public init() {}
+        package var encoderBlocks: [Int: MLXArray] = [:]
+        package var preBlockAttn: MLXArray?
+        package var preBlockMlp: MLXArray?
+        package var preBlock: MLXArray?
+        package var meanProj: MLXArray?
+        package init() {}
     }
 
     /// Stereo waveform `[B, 2, L]` in [-1, 1] -> normalized latents `[B, 32, 2, T]`.
-    public func encode(_ waveform: MLXArray) -> MLXArray {
+    package func encode(_ waveform: MLXArray) -> MLXArray {
         var t = Taps()
         return encode(waveform, taps: &t)
     }
 
-    public func encode(_ waveform: MLXArray, taps: inout Taps) -> MLXArray {
+    package func encode(_ waveform: MLXArray, taps: inout Taps) -> MLXArray {
         let b = waveform.dim(0), s = waveform.dim(1), l = waveform.dim(2)
         let padded = (l + Self.hopLength - 1) / Self.hopLength * Self.hopLength
         var w = waveform

@@ -33,8 +33,8 @@ enum ConditionEncoder {
     /// pads the tail by repeating the last frame, so an off-lattice count would
     /// silently encode manufactured frames as if they were footage.
     static func loadReferenceVideo(at url: URL, frameCount: Int,
-                                   log: (String) -> Void = { _ in }) throws -> MLXArray {
-        let (all, fps) = try MediaLoad.videoHWC(at: url.path, maxFrames: frameCount)
+                                   log: (String) -> Void = { _ in }) async throws -> MLXArray {
+        let (all, fps) = try await MediaLoad.videoHWC(at: url.path, maxFrames: frameCount)
         if abs(fps - Double(H3Video.fps)) > 0.5 {
             log(String(format: "warning: %@ is %.2f fps, not %d. Qwen samples reference video "
                        + "by INDEX (every %d frames) and stamps the result in seconds, so the "

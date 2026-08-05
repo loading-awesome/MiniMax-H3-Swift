@@ -22,6 +22,24 @@ import Foundation
 /// the source. A message with only the first sends them to the source.
 public enum H3Error: Error, CustomStringConvertible, Sendable {
 
+    /// Stable machine-readable identifiers. Messages may improve between
+    /// releases; these values are the compatibility contract for callers,
+    /// receipts, and operational tooling.
+    public enum Code: String, Codable, Sendable {
+        case invalidGeometry = "H3-1001"
+        case invalidRequest = "H3-1002"
+        case conflictingConditioning = "H3-1003"
+        case checkpointIdentity = "H3-2001"
+        case checkpointMissing = "H3-2002"
+        case checkpointPolicy = "H3-2003"
+        case unreadableInput = "H3-3001"
+        case outputConflict = "H3-3002"
+        case insufficientCapacity = "H3-4001"
+        case engineBusy = "H3-4002"
+        case unavailableFeature = "H3-5001"
+        case renderPolicy = "H3-5002"
+    }
+
     // MARK: geometry and request shape
 
     /// A frame count that does not lie on the 17k+5 lattice, or lies outside
@@ -77,10 +95,16 @@ public enum H3Error: Error, CustomStringConvertible, Sendable {
     /// Media handed in at a size that would need the unported LANCZOS resize.
     case mediaOffCanvas(path: String, size: String, remedy: String)
 
+    /// A final output already exists and overwrite was not explicitly allowed.
+    case outputExists(path: String)
+
     // MARK: capacity
 
     /// The machine cannot hold this configuration.
     case insufficientMemory(needGB: Double, availableGB: Double, detail: String)
+
+    /// The actor-owned engine already has a render admitted.
+    case engineBusy(activeJob: String)
 
     /// A feature that exists in the reference and is not implemented here.
     case notImplemented(feature: String, detail: String)
@@ -88,6 +112,35 @@ public enum H3Error: Error, CustomStringConvertible, Sendable {
     /// A render the policy rejects, carrying every reason at once so the caller
     /// fixes all of them rather than discovering them one run at a time.
     case policyViolations([PolicyViolation])
+
+    public var code: Code {
+        switch self {
+        case .frameCount, .keyframeIndex, .dimensionOffGrid:
+            .invalidGeometry
+        case .invalidRequest, .tooManyReferences:
+            .invalidRequest
+        case .conflictingConditioning:
+            .conflictingConditioning
+        case .unidentifiedCheckpoint, .wrongPartition:
+            .checkpointIdentity
+        case .checkpointMissing:
+            .checkpointMissing
+        case .approximateWeightsNotPermitted:
+            .checkpointPolicy
+        case .unreadable, .noTrack, .mediaOffCanvas:
+            .unreadableInput
+        case .outputExists:
+            .outputConflict
+        case .insufficientMemory:
+            .insufficientCapacity
+        case .engineBusy:
+            .engineBusy
+        case .notImplemented:
+            .unavailableFeature
+        case .policyViolations:
+            .renderPolicy
+        }
+    }
 
     public var description: String {
         switch self {
@@ -133,9 +186,15 @@ public enum H3Error: Error, CustomStringConvertible, Sendable {
             return "\(path) has no \(kind) track"
         case let .mediaOffCanvas(path, size, remedy):
             return "\(path) is \(size), which is off the canvas grid. \(remedy)"
+        case let .outputExists(path):
+            return "output already exists at \(path). Choose another path or explicitly allow "
+                 + "replacement; a render never overwrites an artifact by accident."
         case let .insufficientMemory(need, available, detail):
             return String(format: "needs about %.0f GB, this machine has %.0f GB available. %@",
                           need, available, detail)
+        case let .engineBusy(activeJob):
+            return "render engine is busy with job \(activeJob). This runtime admits one "
+                 + "render at a time because model memory is not safely oversubscribed."
         case let .notImplemented(feature, detail):
             return "\(feature) is not implemented: \(detail)"
         case let .policyViolations(vs):
@@ -144,6 +203,10 @@ public enum H3Error: Error, CustomStringConvertible, Sendable {
                      .joined(separator: "\n")
         }
     }
+}
+
+extension H3Error: LocalizedError {
+    public var errorDescription: String? { "[\(code.rawValue)] \(description)" }
 }
 
 /// One reason a configuration is worse than what has been verified.

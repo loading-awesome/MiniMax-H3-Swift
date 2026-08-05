@@ -18,8 +18,8 @@ import PackageDescription
 //   H3Attention    the attention backend seam                   (MLX)
 //   H3Modules      DiT, VAEs, vision tower, text encoder        (MLX)
 //   H3Pipeline     conditioning, layout, sampler, decode, mux   (MLX)
-//   H3Conformance  the retained numerical checks                (MLX)
-//   MiniMaxH3      the public API, and nothing else
+//   H3Conformance  contract ownership + tier ledger             (no MLX)
+//   MiniMaxH3      the public API and actor-owned runtime facade
 //   h3             a thin CLI over the public API
 let package = Package(
     name: "MiniMaxH3",
@@ -62,16 +62,19 @@ let package = Package(
                 .product(name: "MLXRandom", package: "mlx-swift"),
             ]
         ),
-        .target(name: "MiniMaxH3", dependencies: ["H3Pipeline"]),
+        .target(
+            name: "MiniMaxH3",
+            dependencies: ["H3Foundation", "H3Hardware", "H3Catalog", "H3Recipes", "H3Pipeline"]
+        ),
         .target(
             name: "H3Conformance",
-            dependencies: ["H3Foundation", "H3Modules",
-                           .product(name: "MLX", package: "mlx-swift")]
+            dependencies: ["H3Foundation"]
         ),
         .executableTarget(
             name: "h3",
             dependencies: [
                 "MiniMaxH3",
+                "H3Foundation", "H3Hardware", "H3Catalog", "H3Recipes",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ]
         ),
@@ -93,8 +96,7 @@ let package = Package(
         .testTarget(name: "H3PipelineTests",
                     dependencies: ["H3Pipeline", "H3Foundation", "H3Catalog",
                                    .product(name: "MLX", package: "mlx-swift")]),
-        // H3ConformanceTests is absent until H3Conformance has a fixture to
-        // check: a declared test target with no source files only produces a
-        // build warning and an empty runner.
+        .testTarget(name: "H3ConformanceTests", dependencies: ["H3Conformance"]),
+        .testTarget(name: "MiniMaxH3Tests", dependencies: ["MiniMaxH3"]),
     ]
 )

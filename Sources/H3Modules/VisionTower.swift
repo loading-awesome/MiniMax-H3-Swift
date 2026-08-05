@@ -15,40 +15,40 @@ import H3Foundation
 /// It is reachable only through **image prompts**. It has nothing to do with
 /// I2V keyframes, which go through the video VAE; confusing the two is easy
 /// because both take an image and both feed the DiT.
-public struct VisionTowerConfig: Sendable, Equatable {
-    public var hiddenSize = 1152
-    public var intermediateSize = 4304
-    public var depth = 27
-    public var numHeads = 16
-    public var patchSize = 16
-    public var temporalPatchSize = 2
-    public var inChannels = 3
-    public var spatialMergeSize = 2
+package struct VisionTowerConfig: Sendable, Equatable {
+    package var hiddenSize = 1152
+    package var intermediateSize = 4304
+    package var depth = 27
+    package var numHeads = 16
+    package var patchSize = 16
+    package var temporalPatchSize = 2
+    package var inChannels = 3
+    package var spatialMergeSize = 2
     /// 2304 = 48x48. The grid is bilinearly resampled to each image's shape.
-    public var numPositionEmbeddings = 2304
+    package var numPositionEmbeddings = 2304
     /// H3's language hidden size — what the merger projects into.
-    public var outHiddenSize = 5120
+    package var outHiddenSize = 5120
     /// Layers whose output is tapped for deepstack injection.
-    public var deepstackIndexes = [8, 16, 24]
-    public init() {}
+    package var deepstackIndexes = [8, 16, 24]
+    package init() {}
 
-    public var headDim: Int { hiddenSize / numHeads }
+    package var headDim: Int { hiddenSize / numHeads }
     /// RoPE is applied over half the head dim, split again between row and col.
-    public var rotaryDim: Int { headDim / 2 }
-    public var gridPerSide: Int { Int(Double(numPositionEmbeddings).squareRoot()) }
-    public var mergeUnit: Int { spatialMergeSize * spatialMergeSize }
-    public var mergeDim: Int { hiddenSize * mergeUnit }
+    package var rotaryDim: Int { headDim / 2 }
+    package var gridPerSide: Int { Int(Double(numPositionEmbeddings).squareRoot()) }
+    package var mergeUnit: Int { spatialMergeSize * spatialMergeSize }
+    package var mergeDim: Int { hiddenSize * mergeUnit }
 }
 
 /// `[T, H, W]` patch counts for one image. H3 only ever sends `t = 1`.
-public struct VisionGrid: Sendable, Equatable {
-    public let t: Int, h: Int, w: Int
-    public init(t: Int = 1, h: Int, w: Int) { self.t = t; self.h = h; self.w = w }
-    public var tokens: Int { t * h * w }
+package struct VisionGrid: Sendable, Equatable {
+    package let t: Int, h: Int, w: Int
+    package init(t: Int = 1, h: Int, w: Int) { self.t = t; self.h = h; self.w = w }
+    package var tokens: Int { t * h * w }
 }
 
-public final class VisionTower {
-    public let config: VisionTowerConfig
+package final class VisionTower {
+    package let config: VisionTowerConfig
 
     struct Block {
         let norm1: VaeLayerNorm, norm2: VaeLayerNorm
@@ -76,14 +76,14 @@ public final class VisionTower {
     let merger: Merger
     let deepstackMergers: [Merger]
 
-    public enum Error: Swift.Error, CustomStringConvertible {
+    package enum Error: Swift.Error, CustomStringConvertible {
         case missing(String)
-        public var description: String {
+        package var description: String {
             switch self { case .missing(let n): "vision tower has no tensor named \(n)" }
         }
     }
 
-    public init(weights: [String: MLXArray], config: VisionTowerConfig = VisionTowerConfig(),
+    package init(weights: [String: MLXArray], config: VisionTowerConfig = VisionTowerConfig(),
                 prefix: String? = nil) throws {
         self.config = config
         let resolvedPrefix: String
@@ -243,24 +243,24 @@ public final class VisionTower {
 
     // MARK: - forward
 
-    public struct Taps {
-        public var patchEmbed: MLXArray?
-        public var blocks: [Int: MLXArray] = [:]
-        public var mergerNorm: MLXArray?
-        public init() {}
+    package struct Taps {
+        package var patchEmbed: MLXArray?
+        package var blocks: [Int: MLXArray] = [:]
+        package var mergerNorm: MLXArray?
+        package init() {}
     }
 
-    public struct Output {
+    package struct Output {
         /// `[mergedTokens, outHiddenSize]` — what splices into the prompt.
-        public let merged: MLXArray
+        package let merged: MLXArray
         /// One per deepstack index, same shape as `merged`.
-        public let deepstack: [MLXArray]
+        package let deepstack: [MLXArray]
     }
 
     /// - Parameter patches: `[tokens, inChannels * temporalPatch * patch * patch]`,
     ///   the `flatten_patches` layout — already resized, normalized and
     ///   permuted. See ``VisionPreprocess``.
-    public func callAsFunction(patches: MLXArray, grid: VisionGrid,
+    package func callAsFunction(patches: MLXArray, grid: VisionGrid,
                                taps: inout Taps) -> Output {
         precondition(patches.dim(0) == grid.tokens,
                      "grid \(grid) wants \(grid.tokens) patches, got \(patches.dim(0))")
@@ -312,7 +312,7 @@ public final class VisionTower {
         return Output(merged: apply(merger, x), deepstack: deepstack)
     }
 
-    public func callAsFunction(patches: MLXArray, grid: VisionGrid) -> Output {
+    package func callAsFunction(patches: MLXArray, grid: VisionGrid) -> Output {
         var t = Taps()
         return callAsFunction(patches: patches, grid: grid, taps: &t)
     }

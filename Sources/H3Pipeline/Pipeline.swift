@@ -23,20 +23,20 @@ import H3Modules
 /// deliberate: MLX pools freed buffers rather than returning them to the OS, so
 /// clearing at a boundary the sampler is about to allocate across would only
 /// make it allocate again.
-public enum H3Pipeline {
+package enum PipelineRuntime {
 
     /// Where the checkpoints are.
     ///
     /// Resolved by the caller — usually from `H3Configuration` and `Catalog` —
     /// so this type does no discovery of its own and can be pointed anywhere.
-    public struct Checkpoints: Sendable {
-        public let dit: URL
-        public let textEncoder: URL
-        public let tokenizer: URL
-        public let videoVAE: URL
-        public let audioVAE: URL
+    package struct Checkpoints: Sendable {
+        package let dit: URL
+        package let textEncoder: URL
+        package let tokenizer: URL
+        package let videoVAE: URL
+        package let audioVAE: URL
 
-        public init(dit: URL, textEncoder: URL, tokenizer: URL,
+        package init(dit: URL, textEncoder: URL, tokenizer: URL,
                     videoVAE: URL, audioVAE: URL) {
             self.dit = dit
             self.textEncoder = textEncoder
@@ -46,7 +46,7 @@ public enum H3Pipeline {
         }
     }
 
-    public static let phaseOrder = RenderProgress.Phase.allCases
+    package static let phaseOrder = RenderProgress.Phase.allCases
 
     /// - Parameters:
     ///   - progress: called on the calling thread at each phase boundary and
@@ -56,14 +56,16 @@ public enum H3Pipeline {
     ///     would mean abandoning a half-finished forward for nothing.
     ///   - log: diagnostics. The CLI prints these; a library caller can ignore
     ///     them without losing anything a thrown error would have carried.
-    public static func render(request: RenderRequest,
+    package static func render(request: RenderRequest,
                               checkpoints: Checkpoints,
                               conditioningLatents: (video: URL?, audio: URL?) = (nil, nil),
                               progress: (RenderProgress) -> Void = { _ in },
                               cancellation: RenderCancellation? = nil,
-                              log: (String) -> Void = { _ in }) throws -> RenderResult {
+                              log: (String) -> Void = { _ in }) async throws -> RenderResult {
 
         try request.validate()
+        try checkCancellation(cancellation, phase: .textConditioning,
+                              detail: "before checkpoint preflight")
         // Before anything expensive: MLX cannot run at all without its Metal
         // kernels, and the error it raises on its own is an untyped C++ throw
         // with no path in it.
@@ -106,9 +108,11 @@ public enum H3Pipeline {
         // subsample of these exact frames, the video VAE encodes all of them —
         // so decoding per consumer would let the two halves drift apart while
         // every shape stayed valid.
-        let referenceVideoFrames = try request.referenceVideos.map {
-            try ConditionEncoder.loadReferenceVideo(at: $0, frameCount: geometry.frameCount,
-                                                    log: log)
+        var referenceVideoFrames: [MLXArray] = []
+        for url in request.referenceVideos {
+            referenceVideoFrames.append(
+                try await ConditionEncoder.loadReferenceVideo(
+                    at: url, frameCount: geometry.frameCount, log: log))
         }
 
         // ---- 1. text conditioning
@@ -123,8 +127,10 @@ public enum H3Pipeline {
         // not: MLX pools freed allocations, so without this the 51.5 GB
         // checkpoint — held twice, once by each — is still resident when the DiT
         // loads.
-        MLX.GPU.clearCache()
+        Memory.clearCache()
         reportMemory("after text conditioning", log: log)
+        try checkCancellation(cancellation, phase: .textConditioning,
+                              detail: "after text conditioning")
 
         // ---- 2. conditions through the VAEs
         mark(.conditionEncoding, "encoding conditions")
@@ -143,12 +149,11 @@ public enum H3Pipeline {
             visualLatents: visualLatents, audioLatents: audioLatents,
             recordedNoise: try ConditionEncoder.loadLatents(request.conditioningNoise), log: log)
         timings.conditionEncoding = Date().timeIntervalSince(phase)
-        MLX.GPU.clearCache()
+        Memory.clearCache()
         reportMemory("after conditioning and VAE encodes", log: log)
 
-        if cancellation?.isCancelled == true {
-            throw RenderCancelled(phase: .conditionEncoding, detail: "before the DiT was loaded")
-        }
+        try checkCancellation(cancellation, phase: .conditionEncoding,
+                              detail: "before the DiT was loaded")
 
         // ---- 3. sampling
         mark(.sampling, "loading the DiT", completed: 0, total: request.steps)
@@ -167,6 +172,8 @@ public enum H3Pipeline {
             },
             log: log)
         timings.sampling = Date().timeIntervalSince(phase)
+        try checkCancellation(cancellation, phase: .sampling,
+                              detail: "before decoder checkpoints were loaded")
 
         // ---- 4. decode
         mark(.decoding, "decoding audio")
@@ -175,6 +182,8 @@ public enum H3Pipeline {
         let waveform = audioVAE.decode(sampled.audio)              // [1, 2, L]
         eval(waveform)
         timings.audioDecode = Date().timeIntervalSince(phase)
+        try checkCancellation(cancellation, phase: .decoding,
+                              detail: "after audio decode")
 
         mark(.decoding, "decoding video")
         phase = Date()
@@ -182,6 +191,8 @@ public enum H3Pipeline {
         let frames = videoVAE.decode(sampled.video)                // [1, 3, T, H, W]
         eval(frames)
         timings.videoDecode = Date().timeIntervalSince(phase)
+        try checkCancellation(cancellation, phase: .decoding,
+                              detail: "before output packing")
 
         // ---- 5. write
         mark(.writing, "packing pixels")
@@ -204,18 +215,22 @@ public enum H3Pipeline {
 
         mark(.writing, "muxing")
         phase = Date()
+        var muxedAudio = true
         do {
-            try MovieWriter.writeMovie(argb: argb, waveform: samples, to: request.videoOutput,
-                                       fps: Double(H3Video.fps), sampleRate: H3Audio.sampleRate)
+            try await MovieWriter.writeMovie(
+                argb: argb, waveform: samples, to: request.videoOutput,
+                fps: Double(H3Video.fps), sampleRate: H3Audio.sampleRate)
         } catch {
             // A mux failure must not cost a thirty-minute render. Fall back to
             // video-only; when a wav was requested it still carries the audio.
             log("warning: muxing audio failed (\(error)); retrying video-only."
                 + (request.audioOutput.map { " The audio is still in \($0.lastPathComponent)." }
                    ?? ""))
-            try MovieWriter.writeMovie(argb: argb, waveform: samples, to: request.videoOutput,
-                                       fps: Double(H3Video.fps), sampleRate: H3Audio.sampleRate,
-                                       withAudio: false)
+            muxedAudio = false
+            try await MovieWriter.writeMovie(
+                argb: argb, waveform: samples, to: request.videoOutput,
+                fps: Double(H3Video.fps), sampleRate: H3Audio.sampleRate,
+                withAudio: false)
         }
         timings.mux = Date().timeIntervalSince(phase)
 
@@ -225,7 +240,8 @@ public enum H3Pipeline {
         return RenderResult(video: request.videoOutput, audio: request.audioOutput,
                             frameCount: t, width: fw, height: fh,
                             seconds: Double(t) / Double(H3Video.fps),
-                            timings: timings, cacheSummary: sampled.cacheSummary)
+                            timings: timings, cacheSummary: sampled.cacheSummary,
+                            muxedAudio: muxedAudio)
     }
 
     /// `[1, 2, L]` to two channel arrays.
@@ -234,6 +250,14 @@ public enum H3Pipeline {
         let flat = waveform.reshaped([waveform.dim(0) * waveform.dim(1), length])
             .asType(.float32).asArray(Float.self)
         return (0 ..< 2).map { Array(flat[($0 * length) ..< (($0 + 1) * length)]) }
+    }
+
+    private static func checkCancellation(_ cancellation: RenderCancellation?,
+                                          phase: RenderProgress.Phase,
+                                          detail: String) throws {
+        if Task.isCancelled || cancellation?.isCancelled == true {
+            throw RenderCancelled(phase: phase, detail: detail)
+        }
     }
 
     /// **Read the two numbers this prints as different things, because they
@@ -250,7 +274,7 @@ public enum H3Pipeline {
     private static func reportMemory(_ stage: String, log: (String) -> Void) {
         let g = 1e9
         log(String(format: "  memory: %@ — active %.1f GB, cache %.1f GB, peak %.1f GB",
-                   stage, Double(MLX.GPU.activeMemory) / g,
-                   Double(MLX.GPU.cacheMemory) / g, Double(MLX.GPU.peakMemory) / g))
+                   stage, Double(Memory.activeMemory) / g,
+                   Double(Memory.cacheMemory) / g, Double(Memory.peakMemory) / g))
     }
 }

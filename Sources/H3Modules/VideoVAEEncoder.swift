@@ -19,18 +19,18 @@ import H3Foundation
 /// Lifted out of ``VideoVAE`` — which had them as instance methods that never
 /// touched instance state — so the encoder can reuse them rather than grow a
 /// second copy that drifts.
-public enum VaeTiling {
-    public static let tileSize = 256
-    public static let tileOverlapMin = 64
+package enum VaeTiling {
+    package static let tileSize = 256
+    package static let tileOverlapMin = 64
     /// `prod(space_down)` — pixels per latent cell.
-    public static let vaeRatio = 16
+    package static let vaeRatio = 16
 
     /// Tile starts, lengths and overlaps for one axis.
     ///
     /// Overlaps are grown in whole `vaeRatio` units so that every latent-space
     /// overlap is an integer; a fractional one would make the blend seams land
     /// between latent cells.
-    public static func splitTiles(inputLen: Int, tileSize: Int = tileSize,
+    package static func splitTiles(inputLen: Int, tileSize: Int = tileSize,
                                   tileOverlapMin: Int = tileOverlapMin,
                                   vaeRatio: Int = vaeRatio)
         -> (starts: [Int], lengths: [Int], overlaps: [Int]) {
@@ -58,7 +58,7 @@ public enum VaeTiling {
     }
 
     /// Linear cross-fade of `a`'s trailing `blendExtent` into `b`'s leading one.
-    public static func blend(_ a: MLXArray, _ b: MLXArray,
+    package static func blend(_ a: MLXArray, _ b: MLXArray,
                              blendExtent: Int, dim: Int) -> MLXArray {
         let ndim = a.ndim
         // Callers pass -1 and -2. MLXArray.dim() and sliceDim() both accept
@@ -261,24 +261,24 @@ struct VideoEncoderLevel {
     }
 }
 
-public final class VideoVAEEncoder {
+package final class VideoVAEEncoder {
     /// ImageNet statistics. Pixels arrive in [-1, 1], are mapped to [0, 1], then
     /// standardised by these — the encoder never sees the raw range.
-    public static let pixelMean: [Float] = [0.485, 0.456, 0.406]
-    public static let pixelStd: [Float] = [0.229, 0.224, 0.225]
+    package static let pixelMean: [Float] = [0.485, 0.456, 0.406]
+    package static let pixelStd: [Float] = [0.229, 0.224, 0.225]
 
     static let chMult = [1, 2, 2, 4, 4, 8]
     static let spaceDown = [2, 2, 2, 2, 1, 1]
     static let timeDown = [1, 2, 2, 1, 1, 1]
     static let baseCh = 128
     static let numResBlocks = 2
-    public static let zChannels = 24
+    package static let zChannels = 24
     /// 17 frames per temporal clip, and 3 latent tokens dropped per clip.
-    public static let clipLength = 17
+    package static let clipLength = 17
     /// Tokens trimmed from the tail after the clips are concatenated.
-    public static let tokenDrop = 3
+    package static let tokenDrop = 3
     /// Above this on either spatial axis the reference tiles.
-    public static let tileSize = 256
+    package static let tileSize = 256
 
     let convIn: CausalConv3d
     let levels: [VideoEncoderLevel]
@@ -289,7 +289,7 @@ public final class VideoVAEEncoder {
     let latentsMean: MLXArray
     let latentsStd: MLXArray
 
-    public init(weights: [String: MLXArray]) throws {
+    package init(weights: [String: MLXArray]) throws {
         func get(_ n: String) throws -> MLXArray {
             guard let a = weights[n] else { throw H3Weights.Error.missing(n) }
             return a
@@ -321,17 +321,17 @@ public final class VideoVAEEncoder {
 
     /// Named after the reference's own module paths, so a failing tap points at
     /// a line in `comfy/ldm/minimax/vae.py` rather than at "the encoder".
-    public struct Taps {
-        public var convIn: MLXArray?
-        public var levelBlocks: [String: MLXArray] = [:]
-        public var normOut: MLXArray?
-        public var convOut: MLXArray?
-        public var quantConv: MLXArray?
-        public init() {}
+    package struct Taps {
+        package var convIn: MLXArray?
+        package var levelBlocks: [String: MLXArray] = [:]
+        package var normOut: MLXArray?
+        package var convOut: MLXArray?
+        package var quantConv: MLXArray?
+        package init() {}
     }
 
     /// The conv stack, returning `[B, 48, T_lat, H/16, W/16]` moments.
-    public func moments(_ x: MLXArray, taps: inout Taps) -> MLXArray {
+    package func moments(_ x: MLXArray, taps: inout Taps) -> MLXArray {
         var h = convIn(x)
         taps.convIn = h
         for (i, l) in levels.enumerated() {
@@ -375,7 +375,7 @@ public final class VideoVAEEncoder {
         return ((pixels.asType(.float32) + 1.0) * 0.5 - mean3) / std3
     }
 
-    public func encodeSingleShot(_ pixels: MLXArray, taps: inout Taps) -> MLXArray {
+    package func encodeSingleShot(_ pixels: MLXArray, taps: inout Taps) -> MLXArray {
         let m = moments(normalizePixels(pixels), taps: &taps)
         let mean = m[0..., 0 ..< Self.zChannels, 0..., 0..., 0...]
         let zm = latentsMean.reshaped([1, Self.zChannels, 1, 1, 1])
@@ -388,7 +388,7 @@ public final class VideoVAEEncoder {
     ///
     /// The reference truncates to the last latent frame here because the causal
     /// front padding manufactures leading frames that carry no information.
-    public func encodeImage(_ pixels: MLXArray, taps: inout Taps) -> MLXArray {
+    package func encodeImage(_ pixels: MLXArray, taps: inout Taps) -> MLXArray {
         precondition(pixels.dim(2) == 1,
                      "encodeImage wants one frame, got \(pixels.dim(2)); "
                      + "multi-frame clips need the temporal chunking that is not ported")
@@ -396,7 +396,7 @@ public final class VideoVAEEncoder {
         return z[0..., 0..., (z.dim(2) - 1) ..< z.dim(2), 0..., 0...]
     }
 
-    public func encodeImage(_ pixels: MLXArray) -> MLXArray {
+    package func encodeImage(_ pixels: MLXArray) -> MLXArray {
         var t = Taps()
         return encodeImage(pixels, taps: &t)
     }
@@ -409,7 +409,7 @@ public final class VideoVAEEncoder {
     /// seams are blended rather than butted. A single-shot pass over the whole
     /// frame produces different numbers everywhere, not just near the seams,
     /// because the causal and reflect padding land at different places.
-    public func tiledMoments(_ x: MLXArray) -> MLXArray {
+    package func tiledMoments(_ x: MLXArray) -> MLXArray {
         let h = x.dim(3), w = x.dim(4)
         let (yIdx, yLen, yOverlap) = VaeTiling.splitTiles(inputLen: h)
         let (xIdx, xLen, xOverlap) = VaeTiling.splitTiles(inputLen: w)
@@ -472,13 +472,13 @@ public final class VideoVAEEncoder {
     ///
     /// `taps` carries the intermediates a golden can localise against — the
     /// padded input and each clip's moments before the concatenation.
-    public struct TemporalTaps {
-        public var padded: MLXArray?
-        public var clips: [MLXArray] = []
-        public init() {}
+    package struct TemporalTaps {
+        package var padded: MLXArray?
+        package var clips: [MLXArray] = []
+        package init() {}
     }
 
-    public func temporalMoments(_ normalized: MLXArray,
+    package func temporalMoments(_ normalized: MLXArray,
                                 taps: inout TemporalTaps) -> MLXArray {
         let frames = normalized.dim(2)
         var x = normalized
@@ -506,14 +506,14 @@ public final class VideoVAEEncoder {
         return out
     }
 
-    public func temporalMoments(_ normalized: MLXArray) -> MLXArray {
+    package func temporalMoments(_ normalized: MLXArray) -> MLXArray {
         var t = TemporalTaps()
         return temporalMoments(normalized, taps: &t)
     }
 
     /// `[-1, 1]` pixels -> the normalized-pixel tensor the clips actually see.
     /// Public so a parity check can compare the pad without reimplementing it.
-    public func normalized(_ pixels: MLXArray) -> MLXArray { normalizePixels(pixels) }
+    package func normalized(_ pixels: MLXArray) -> MLXArray { normalizePixels(pixels) }
 
     /// Moments -> normalized latents: take the posterior mean, standardise.
     func normalizeMoments(_ m: MLXArray) -> MLXArray {
@@ -528,7 +528,7 @@ public final class VideoVAEEncoder {
     /// leading frames that carry no information); more than one goes through
     /// ``temporalMoments(_:)``. Tiling is the reference's normal path, not a
     /// low-memory fallback, so both branches tile.
-    public func encode(_ pixels: MLXArray) -> MLXArray {
+    package func encode(_ pixels: MLXArray) -> MLXArray {
         let normalized = normalizePixels(pixels)
         if pixels.dim(2) == 1 {
             let z = normalizeMoments(adaptiveMoments(normalized))

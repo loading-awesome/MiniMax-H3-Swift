@@ -254,22 +254,22 @@ struct ViT3DDecoder {
     }
 }
 
-public final class VideoVAE {
-    public let url: URL
+package final class VideoVAE {
+    package let url: URL
     private let postQuantConvWeight: MLXArray
     private let postQuantConvBias: MLXArray
     private let decoder: ViT3DDecoder
     
-    public let latentsMean: MLXArray
-    public let latentsStd: MLXArray
+    package let latentsMean: MLXArray
+    package let latentsStd: MLXArray
     
-    public let pixelMean = MLXArray(IMAGENET_MEAN).reshaped([1, 3, 1, 1, 1])
-    public let pixelStd = MLXArray(IMAGENET_STD).reshaped([1, 3, 1, 1, 1])
+    package let pixelMean = MLXArray(IMAGENET_MEAN).reshaped([1, 3, 1, 1, 1])
+    package let pixelStd = MLXArray(IMAGENET_STD).reshaped([1, 3, 1, 1, 1])
     
     static let IMAGENET_MEAN: [Float] = [0.485, 0.456, 0.406]
     static let IMAGENET_STD: [Float] = [0.229, 0.224, 0.225]
     
-    public init(url: URL) throws {
+    package init(url: URL) throws {
         self.url = url
         let w = try MLX.loadArrays(url: url)
         
@@ -342,19 +342,19 @@ public final class VideoVAE {
         )
     }
     
-    public func postQuantConv(_ z: MLXArray) -> MLXArray {
+    package func postQuantConv(_ z: MLXArray) -> MLXArray {
         let zT = z.transposed(0, 2, 3, 4, 1)
         var out = matmul(zT, postQuantConvWeight.reshaped([24, 24]).T)
         out = out + postQuantConvBias
         return out.transposed(0, 4, 1, 2, 3)
     }
     
-    public func decodePixels(_ z: MLXArray) -> MLXArray {
+    package func decodePixels(_ z: MLXArray) -> MLXArray {
         let pq = postQuantConv(z)
         return decoder(pq)
     }
     
-    public func splitTiles(inputLen: Int, tileSize: Int = 256, tileOverlapMin: Int = 64, vaeRatio: Int = 16) -> (starts: [Int], lengths: [Int], overlaps: [Int]) {
+    package func splitTiles(inputLen: Int, tileSize: Int = 256, tileOverlapMin: Int = 64, vaeRatio: Int = 16) -> (starts: [Int], lengths: [Int], overlaps: [Int]) {
         if tileSize >= inputLen {
             return ([0], [inputLen], [])
         }
@@ -382,7 +382,7 @@ public final class VideoVAE {
         return (tileStartIdx, Array(repeating: tileSize, count: N), overlaps)
     }
     
-    public func blend(_ a: MLXArray, _ b: MLXArray, blendExtent: Int, dim: Int) -> MLXArray {
+    package func blend(_ a: MLXArray, _ b: MLXArray, blendExtent: Int, dim: Int) -> MLXArray {
         let ndim = a.ndim
         // Callers pass -1 and -2. MLXArray.dim() and sliceDim() both accept
         // negative axes; a Swift Array subscript does not, and indexing
@@ -431,7 +431,7 @@ public final class VideoVAE {
         return array[indices]
     }
     
-    public func tiledDecode(_ z: MLXArray) -> MLXArray {
+    package func tiledDecode(_ z: MLXArray) -> MLXArray {
         let vaeRatio = 16
         let height = z.dim(-2) * vaeRatio
         let width = z.dim(-1) * vaeRatio
@@ -496,15 +496,16 @@ public final class VideoVAE {
         return concatenated(rowTensors, axis: -2)
     }
     
-    public func decodeTemporalPadFrames(zLen: Int, padTokens: Int) -> Int {
+    package func decodeTemporalPadFrames(zLen: Int, padTokens: Int) -> Int {
         if padTokens <= 0 { return 0 }
         let clipLength = 17
         let vaeRatioT = 4
         let tokensChunkSize = 5
         let intraTail = clipLength % vaeRatioT
-        if intraTail == 0 {
-            return padTokens * vaeRatioT
-        }
+        // H3's fixed 17-frame clip has a one-frame intra-chunk tail under the
+        // VAE's 4x temporal ratio. Keep the arithmetic named because it is the
+        // reference contract; there is no alternate zero-tail architecture in
+        // this model.
         let zLenBeforePad = zLen - padTokens
         var sum = 0
         for k in 0 ..< padTokens {
@@ -517,7 +518,7 @@ public final class VideoVAE {
         return sum
     }
     
-    public func decodeTemporalFramePlan(zLen: Int, numChunks: Int, padTokens: Int) -> Int {
+    package func decodeTemporalFramePlan(zLen: Int, numChunks: Int, padTokens: Int) -> Int {
         let tokensChunkSize = 5
         let vaeRatioT = 4
         let tokenOverlap = 2
@@ -551,7 +552,7 @@ public final class VideoVAE {
         return totalFrames - decodeTemporalPadFrames(zLen: zLen, padTokens: padTokens)
     }
     
-    public func decodeTemporal(_ z: MLXArray) -> MLXArray {
+    package func decodeTemporal(_ z: MLXArray) -> MLXArray {
         let tokensChunkSize = 5
         let tokenOverlap = 2
         let frameOverlap = 5
@@ -630,7 +631,7 @@ public final class VideoVAE {
         return concatenated(partsToConcat, axis: 2)
     }
     
-    public func decode(_ z: MLXArray) -> MLXArray {
+    package func decode(_ z: MLXArray) -> MLXArray {
         let meanVal = latentsMean.reshaped([1, 24, 1, 1, 1])
         let stdVal = latentsStd.reshaped([1, 24, 1, 1, 1])
         let scaledZ = z * stdVal + meanVal

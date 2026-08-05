@@ -7,17 +7,21 @@ import Foundation
 /// `data_offsets` are relative to the START OF THE BLOB, not the file. That
 /// detail is why renaming keys never invalidates offsets — the same property
 /// that let the reference-side encoder remap be a header-only rewrite.
-public enum Safetensors {
-    public struct TensorInfo: Sendable {
-        public let dtype: String
-        public let shape: [Int]
-        public let begin: Int
-        public let end: Int
-        public var byteCount: Int { end - begin }
-        public var elementCount: Int { shape.reduce(1, *) }
+package enum Safetensors {
+    package struct TensorInfo: Sendable {
+        package let dtype: String
+        package let shape: [Int]
+        package let begin: Int
+        package let end: Int
+        package var byteCount: Int { end - begin }
+        package var elementCount: Int {
+            shape.reduce(1) { partial, dimension in
+                partial.multipliedReportingOverflow(by: dimension).partialValue
+            }
+        }
     }
 
-    public enum Error: Swift.Error, CustomStringConvertible {
+    package enum Error: Swift.Error, CustomStringConvertible {
         case tooSmall
         case badHeader(String)
         case unsupportedDType(String)
@@ -25,7 +29,7 @@ public enum Safetensors {
         case shapeMismatch(String)
         case notWritable(String)
 
-        public var description: String {
+        package var description: String {
             switch self {
             case .tooSmall: "file too small to be safetensors"
             case .badHeader(let m): "bad safetensors header: \(m)"
@@ -41,10 +45,10 @@ public enum Safetensors {
     /// `.mappedIfSafe` silently declines on very large files and falls back to
     /// a full read, which cost 21s per inspect on the 62 GiB DiT — 66 GB of I/O
     /// to parse a 113 KB header. Tensor data is mapped lazily, on first access.
-    public struct Archive {
-        public let tensors: [String: TensorInfo]
-        public let metadata: [String: String]
-        public let url: URL
+    package struct Archive {
+        package let tensors: [String: TensorInfo]
+        package let metadata: [String: String]
+        package let url: URL
         private let blobStart: Int
         private let payloadBox: Payload
 
@@ -80,15 +84,26 @@ public enum Safetensors {
         }
 
         /// `headerOnly` keeps this to two small reads regardless of file size.
-        public init(url: URL, headerOnly: Bool = true) throws {
+        package init(url: URL, headerOnly: Bool = true) throws {
             self.url = url
             let fh = try FileHandle(forReadingFrom: url)
             defer { try? fh.close() }
+            let fileSize = try fh.seekToEnd()
+            try fh.seek(toOffset: 0)
             guard let lenData = try fh.read(upToCount: 8), lenData.count == 8 else {
                 throw Error.tooSmall
             }
             let n = lenData.withUnsafeBytes { $0.loadUnaligned(as: UInt64.self).littleEndian }
-            guard n > 0, n < (1 << 30) else { throw Error.badHeader("implausible length \(n)") }
+            // Real checkpoint headers are around 100 KB. A hard ceiling stops
+            // a hostile eight-byte prefix from asking JSONSerialization for a
+            // gigabyte allocation before any tensor has been validated.
+            let maximumHeaderBytes: UInt64 = 64 * 1024 * 1024
+            guard n > 0, n <= maximumHeaderBytes else {
+                throw Error.badHeader("implausible length \(n)")
+            }
+            guard n <= fileSize - 8 else {
+                throw Error.badHeader("header length \(n) exceeds file size \(fileSize)")
+            }
             guard let headerData = try fh.read(upToCount: Int(n)), headerData.count == Int(n) else {
                 throw Error.tooSmall
             }
@@ -100,6 +115,13 @@ public enum Safetensors {
             }
             var t: [String: TensorInfo] = [:]
             var meta: [String: String] = [:]
+            let payloadBytes = Int(fileSize - 8 - n)
+            let byteWidth: [String: Int] = [
+                "BOOL": 1, "I8": 1, "U8": 1,
+                "I16": 2, "U16": 2, "F16": 2, "BF16": 2,
+                "I32": 4, "U32": 4, "F32": 4,
+                "I64": 8, "U64": 8, "F64": 8,
+            ]
             for (k, v) in obj {
                 if k == "__metadata__" {
                     meta = (v as? [String: String]) ?? [:]
@@ -110,7 +132,34 @@ public enum Safetensors {
                       let shape = d["shape"] as? [Int],
                       let off = d["data_offsets"] as? [Int], off.count == 2
                 else { throw Error.badHeader("entry \(k)") }
+                guard shape.allSatisfy({ $0 >= 0 }) else {
+                    throw Error.badHeader("entry \(k) has a negative dimension")
+                }
+                var elements = 1
+                for dimension in shape {
+                    let next = elements.multipliedReportingOverflow(by: dimension)
+                    guard !next.overflow else {
+                        throw Error.badHeader("entry \(k) shape overflows Int")
+                    }
+                    elements = next.partialValue
+                }
+                let begin = off[0], end = off[1]
+                guard begin >= 0, end >= begin, end <= payloadBytes else {
+                    throw Error.badHeader("entry \(k) offsets \(off) outside payload 0...\(payloadBytes)")
+                }
+                guard let width = byteWidth[dtype] else {
+                    throw Error.badHeader("entry \(k) has unsupported safetensors dtype \(dtype)")
+                }
+                let expected = elements.multipliedReportingOverflow(by: width)
+                guard !expected.overflow, end - begin == expected.partialValue else {
+                    throw Error.badHeader("entry \(k) byte count does not match \(dtype) shape \(shape)")
+                }
                 t[k] = TensorInfo(dtype: dtype, shape: shape, begin: off[0], end: off[1])
+            }
+            let ordered = t.map { (name: $0.key, begin: $0.value.begin, end: $0.value.end) }
+                .sorted { ($0.begin, $0.end, $0.name) < ($1.begin, $1.end, $1.name) }
+            for pair in zip(ordered, ordered.dropFirst()) where pair.1.begin < pair.0.end {
+                throw Error.badHeader("tensor ranges overlap: \(pair.0.name) and \(pair.1.name)")
             }
             self.tensors = t
             self.metadata = meta
@@ -123,21 +172,22 @@ public enum Safetensors {
             try payloadBox.get()
         }
 
-        public var names: [String] { tensors.keys.sorted() }
+        package var names: [String] { tensors.keys.sorted() }
 
-        public func info(_ name: String) throws -> TensorInfo {
+        package func info(_ name: String) throws -> TensorInfo {
             guard let i = tensors[name] else { throw Error.missing(name) }
             return i
         }
 
         /// Goldens are written fp32 precisely so a reader needs no dtype zoo.
-        public func float32(_ name: String) throws -> [Float] {
+        package func float32(_ name: String) throws -> [Float] {
             let i = try info(name)
             guard i.dtype == "F32" else { throw Error.unsupportedDType(i.dtype) }
             let d = try payload()
             let lo = blobStart + i.begin
             let hi = blobStart + i.end
             guard d.count >= hi else { throw Error.tooSmall }
+            guard hi > lo else { return [] }
             // One copy, not two. `subdata` allocates and copies the range, and
             // `Array(...)` then copies again — on a 331 MB production block tap
             // that is 662 MB of churn per read, 226 times per run.
@@ -152,12 +202,13 @@ public enum Safetensors {
 
         /// Index tensors — row selections and modulation rows — are the one
         /// non-float thing a fixture carries.
-        public func int32(_ name: String) throws -> [Int] {
+        package func int32(_ name: String) throws -> [Int] {
             let i = try info(name)
             guard i.dtype == "I32" else { throw Error.unsupportedDType(i.dtype) }
             let d = try payload()
             let lo = blobStart + i.begin, hi = blobStart + i.end
             guard d.count >= hi else { throw Error.tooSmall }
+            guard hi > lo else { return [] }
             return d.withUnsafeBytes { raw in
                 let base = raw.baseAddress!.advanced(by: lo)
                     .assumingMemoryBound(to: Int32.self)
@@ -186,7 +237,7 @@ public enum Safetensors {
     /// Extra memory is now one tensor's worth, not the bundle's.
     ///
     /// The byte layout is unchanged — same sorted-key order, same offsets.
-    public static func write(
+    package static func write(
         _ tensors: [String: (shape: [Int], values: [Float])],
         metadata: [String: String] = [:],
         to url: URL

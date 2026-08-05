@@ -31,21 +31,21 @@ import H3Hardware
 ///
 /// A context object is the difference between a seam a sparse backend can use
 /// and one it has to be bolted around.
-public struct AttentionContext: Sendable {
+package struct AttentionContext: Sendable {
     /// 0-based index of the transformer block making this call.
-    public let blockIndex: Int
-    public let blockCount: Int
+    package let blockIndex: Int
+    package let blockCount: Int
     /// Fraction of the sampling schedule completed, in [0, 1].
-    public let scheduleProgress: Double
+    package let scheduleProgress: Double
     /// Total packed sequence length.
-    public let sequenceLength: Int
+    package let sequenceLength: Int
     /// `[start, stop)` of the target video segment in the packed sequence.
     ///
     /// Everything before `start` is conditioning — text, keyframes, references,
     /// target audio — and is what a sparse backend keeps exact.
-    public let videoSpan: Range<Int>?
+    package let videoSpan: Range<Int>?
 
-    public init(blockIndex: Int, blockCount: Int, scheduleProgress: Double,
+    package init(blockIndex: Int, blockCount: Int, scheduleProgress: Double,
                 sequenceLength: Int, videoSpan: Range<Int>?) {
         self.blockIndex = blockIndex
         self.blockCount = blockCount
@@ -75,7 +75,7 @@ public struct AttentionContext: Sendable {
 /// `attend`, and the caller falls back to dense. That is how schedule windows,
 /// dense-block exclusions and minimum-length gates are expressed without the
 /// pipeline having to know any backend's policy.
-public protocol H3AttentionBackend: Sendable {
+package protocol H3AttentionBackend: Sendable {
 
     /// Required so the registry can instantiate the backend it selected.
     ///
@@ -126,16 +126,16 @@ public protocol H3AttentionBackend: Sendable {
 
 /// MLX's fused scaled dot-product attention. The reference implementation for
 /// this port and the fallback everywhere. Never declines.
-public struct SDPABackend: H3AttentionBackend {
-    public static let identifier = "sdpa"
-    public static let equivalenceClass: Float = 0
-    public static let materialisesScores = true
-    public static let prefersMortonOrder = false
-    public static func isAvailable(on machine: Machine) -> Bool { true }
+package struct SDPABackend: H3AttentionBackend {
+    package static let identifier = "sdpa"
+    package static let equivalenceClass: Float = 0
+    package static let materialisesScores = true
+    package static let prefersMortonOrder = false
+    package static func isAvailable(on machine: Machine) -> Bool { true }
 
-    public init() {}
+    package init() {}
 
-    public func attend(queries: MLXArray, keys: MLXArray, values: MLXArray,
+    package func attend(queries: MLXArray, keys: MLXArray, values: MLXArray,
                        scale: Float, mask: MLXArray?,
                        context: AttentionContext) -> MLXArray? {
         // MLX's fused kernel takes `[B, heads, S, headDim]` and traps on rank 3,
@@ -168,7 +168,7 @@ public struct SDPABackend: H3AttentionBackend {
 /// than Z-ordering within each frame and leaving frame order alone. That is why
 /// the curve is a choice and why the per-frame variant is the safer default
 /// here.
-public enum TokenOrdering: String, Sendable, CaseIterable {
+package enum TokenOrdering: String, Sendable, CaseIterable {
     case none
     /// Interleave t, h and w equally.
     case morton3D = "3d"
@@ -182,15 +182,15 @@ public enum TokenOrdering: String, Sendable, CaseIterable {
 /// whose numerics differ from the one the caller asked for with no record of
 /// why — the same class of failure as loading the wrong checkpoint vendor, and
 /// treated with the same suspicion.
-public enum AttentionRegistry {
+package enum AttentionRegistry {
 
-    public struct Selection: Sendable {
-        public let identifier: String
-        public let equivalenceClass: Float
-        public let materialisesScores: Bool
-        public let ordering: TokenOrdering
-        public let backend: any H3AttentionBackend
-        public let reason: String
+    package struct Selection: Sendable {
+        package let identifier: String
+        package let equivalenceClass: Float
+        package let materialisesScores: Bool
+        package let ordering: TokenOrdering
+        package let backend: any H3AttentionBackend
+        package let reason: String
     }
 
     /// Backends compiled into this build, most preferred first.
@@ -222,7 +222,7 @@ public enum AttentionRegistry {
     /// See docs/SOL_ATTN.md.
     static let available: [any H3AttentionBackend.Type] = [SDPABackend.self]
 
-    public static func resolve(requested: String, machine: Machine,
+    package static func resolve(requested: String, machine: Machine,
                                ordering: TokenOrdering? = nil) throws -> Selection {
         try resolve(requested: requested, machine: machine, ordering: ordering,
                     backends: available)

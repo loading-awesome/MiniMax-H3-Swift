@@ -29,25 +29,25 @@ public enum H3RecipeID: String, Sendable, Codable, CaseIterable {
 /// The upscaler is **not released** and not ported (`--in-context-upscale`
 /// already refuses as unimplemented), so every 2k recipe is currently a target
 /// with no route to it.
-public enum H3RecipeTier: String, Sendable, Codable {
+package enum H3RecipeTier: String, Sendable, Codable {
     /// A size the DiT samples directly.
     case baseRender
     /// A size only reachable by upscaling a base render. Not sampleable.
     case upscaleTarget
 }
 
-public struct H3Recipe: Sendable {
-    public let id: H3RecipeID
-    public let tier: H3RecipeTier
-    public let targetWidth: Int
-    public let targetHeight: Int
-    public let minDuration: Int
-    public let maxDuration: Int
-    public let minSteps: Int
-    public let maxSteps: Int
-    public let requiresAudio: Bool
+package struct H3Recipe: Sendable {
+    package let id: H3RecipeID
+    package let tier: H3RecipeTier
+    package let targetWidth: Int
+    package let targetHeight: Int
+    package let minDuration: Int
+    package let maxDuration: Int
+    package let minSteps: Int
+    package let maxSteps: Int
+    package let requiresAudio: Bool
     
-    public init(
+    package init(
         id: H3RecipeID,
         tier: H3RecipeTier,
         targetWidth: Int,
@@ -73,13 +73,13 @@ public struct H3Recipe: Sendable {
     }
 }
 
-public enum H3RecipeValidationError: Error, CustomStringConvertible {
+package enum H3RecipeValidationError: Error, CustomStringConvertible {
     case resolutionMismatch(expected: String, got: String, recipeID: H3RecipeID)
     case notABaseRender(recipeID: H3RecipeID, size: String)
     case durationOutOfRange(requested: Int, allowed: ClosedRange<Int>, recipeID: H3RecipeID)
     case stepsOutOfRange(requested: Int, allowed: ClosedRange<Int>, recipeID: H3RecipeID)
 
-    public var description: String {
+    package var description: String {
         switch self {
         case .resolutionMismatch(let expected, let got, let id):
             return "Recipe '\(id.rawValue)' requires resolution \(expected); got \(got)."
@@ -99,7 +99,7 @@ public enum H3RecipeValidationError: Error, CustomStringConvertible {
 }
 
 extension H3Recipe {
-    public func validate(
+    package func validate(
         width: Int,
         height: Int,
         duration: Int,
@@ -127,13 +127,13 @@ extension H3Recipe {
     }
 }
 
-public struct H3RecipeRegistry {
+package struct H3RecipeRegistry {
     /// 2K entries are kept, not deleted: they are the real output sizes of the
     /// In-Context Regeneration stage and the names callers will ask for. They
     /// are tagged `.upscaleTarget` so asking for one as a base render fails
     /// with an explanation instead of quietly sampling a shape the model was
     /// never trained to sample.
-    public static let all: [H3RecipeID: H3Recipe] = [
+    package static let all: [H3RecipeID: H3Recipe] = [
         .h3_2k_16_9: H3Recipe(id: .h3_2k_16_9, tier: .upscaleTarget, targetWidth: 2560, targetHeight: 1440),
         .h3_2k_9_16: H3Recipe(id: .h3_2k_9_16, tier: .upscaleTarget, targetWidth: 1440, targetHeight: 2560),
         .h3_2k_21_9: H3Recipe(id: .h3_2k_21_9, tier: .upscaleTarget, targetWidth: 3360, targetHeight: 1440),

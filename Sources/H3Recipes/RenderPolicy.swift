@@ -19,7 +19,7 @@ import H3Foundation
 ///
 /// Every threshold here is measured, and each violation carries the measurement
 /// in its text so the caller can judge rather than obey.
-public enum H3RenderPolicy {
+package enum H3RenderPolicy {
 
     /// The configuration that has been verified end to end on this port:
     /// 864x480, 124 frames, 20 `res_multistep` steps.
@@ -27,31 +27,31 @@ public enum H3RenderPolicy {
     /// It is simultaneously the parity-gated shape (225 gating taps inside the
     /// CUDA-measured class) and the shape proven to render a detectable,
     /// intelligible talking head. Nothing else has both properties.
-    public static let verifiedWidth = 864
-    public static let verifiedHeight = 480
-    public static let verifiedFrames = 124
-    public static let verifiedSteps = 20
-    public static let verifiedSeconds = 1381.0
+    package static let verifiedWidth = 864
+    package static let verifiedHeight = 480
+    package static let verifiedFrames = 124
+    package static let verifiedSteps = 20
+    package static let verifiedSeconds = 1381.0
 
     /// Below this, `res_multistep` has not converged and the output flickers.
     /// Measured: 6 steps gave 52 flash events and a worst per-tile luminance
     /// jump of 0.559 between adjacent frames of a static shot; 20 gave 0 and a
     /// frame-to-frame luminance sd of 0.0009.
-    public static let minSteps = 20
+    package static let minSteps = 20
 
     /// Sustained matmul throughput measured by `h3-parity bench-gemm` at the
     /// model's own shapes. bf16, fp16 and fp32 all land within 6% of this, so
     /// it is not a precision-dependent number.
-    public static let measuredTFLOPS = 15.28
+    package static let measuredTFLOPS = 15.28
 
     /// Wall-clock beyond which a render is refused without an explicit opt-in.
     /// Three hours is roughly eight times the verified configuration.
-    public static let maxEstimatedSeconds = 3 * 3600.0
+    package static let maxEstimatedSeconds = 3 * 3600.0
 
-    public struct Violation: Sendable {
-        public let rule: String
-        public let reason: String
-        public let remedy: String
+    package struct Violation: Sendable {
+        package let rule: String
+        package let reason: String
+        package let remedy: String
     }
 
     /// Estimated sampling seconds, from first principles rather than a fitted
@@ -59,7 +59,7 @@ public enum H3RenderPolicy {
     /// throughput `bench-gemm` measured. Attention is quadratic in sequence
     /// length, which is why doubling the resolution does far worse than double
     /// the time.
-    public static func estimatedSeconds(tokens: Int, steps: Int,
+    package static func estimatedSeconds(tokens: Int, steps: Int,
                                         config: H3Config = H3Config()) -> Double {
         let s = Double(tokens)
         let h = Double(config.hiddenSize)
@@ -75,7 +75,7 @@ public enum H3RenderPolicy {
 
     /// Every reason this configuration is worse than what has been verified.
     /// Empty means it is safe to run.
-    public static func check(width: Int, height: Int, frameCount: Int,
+    package static func check(width: Int, height: Int, frameCount: Int,
                              steps: Int, tokens: Int,
                              config: H3Config = H3Config()) -> [Violation] {
         var out: [Violation] = []
@@ -121,7 +121,7 @@ public enum H3RenderPolicy {
     }
 
     /// A one-line estimate for the run banner, whether or not anything is wrong.
-    public static func estimateLine(tokens: Int, steps: Int,
+    package static func estimateLine(tokens: Int, steps: Int,
                                     config: H3Config = H3Config()) -> String {
         let est = estimatedSeconds(tokens: tokens, steps: steps, config: config)
         let rel = est / verifiedSeconds

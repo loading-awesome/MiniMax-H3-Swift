@@ -14,23 +14,23 @@ import H3Foundation
 /// `comfy/ldm/minimax/model.py`). Video and audio carry *different* timesteps,
 /// which is why there is a timestep row at all — get this wrong and the model
 /// modulates the audio branch with the video schedule.
-public struct ModSegment: Sendable, Equatable {
-    public let start: Int
-    public let stop: Int
-    public let row: Int
-    public init(start: Int, stop: Int, row: Int) {
+package struct ModSegment: Sendable, Equatable {
+    package let start: Int
+    package let stop: Int
+    package let row: Int
+    package init(start: Int, stop: Int, row: Int) {
         self.start = start
         self.stop = stop
         self.row = row
     }
 }
 
-public struct ModulationIndex {
+package struct ModulationIndex {
     /// `[S]` — AdaLN row for each token in the packed sequence.
-    public let rows: MLXArray
-    public let tokenCount: Int
+    package let rows: MLXArray
+    package let tokenCount: Int
 
-    public init(segments: [ModSegment], tokenCount: Int) {
+    package init(segments: [ModSegment], tokenCount: Int) {
         var r = [Int32](repeating: -1, count: tokenCount)
         for s in segments {
             precondition(s.start >= 0 && s.stop <= tokenCount && s.start <= s.stop,
@@ -46,7 +46,7 @@ public struct ModulationIndex {
     /// the row assignment comes out of the reference fixture rather than being
     /// derived — the point there is to isolate one operator, not to re-test the
     /// layout.
-    public init(rows: MLXArray) {
+    package init(rows: MLXArray) {
         self.rows = rows
         self.tokenCount = rows.dim(0)
     }
@@ -58,7 +58,7 @@ public struct ModulationIndex {
     /// inside a single contiguous segment. Both parity presets are pure text
     /// (all tags 1), so omitting it is correct for them and wrong the moment an
     /// image enters the prompt.
-    public init(layout: PackedLayout, plan: TimestepPlan, textTags: [Int]? = nil) {
+    package init(layout: PackedLayout, plan: TimestepPlan, textTags: [Int]? = nil) {
         var segs: [ModSegment] = []
         for s in layout.segments {
             let base = plan.row(for: s.kind) * 3
@@ -80,12 +80,11 @@ public struct ModulationIndex {
     }
 
     /// `[rows, hidden]` -> `[S, hidden]`, one row per token.
-    public func gather(_ table: MLXArray) -> MLXArray { table[rows] }
+    package func gather(_ table: MLXArray) -> MLXArray { table[rows] }
 }
 
 /// `h * (1 + scale) + shift`, per token.
-@inlinable
-public func modScaleShift(_ h: MLXArray, shift: MLXArray, scale: MLXArray,
+package func modScaleShift(_ h: MLXArray, shift: MLXArray, scale: MLXArray,
                           index: ModulationIndex) -> MLXArray {
     h * (1.0 + index.gather(scale)) + index.gather(shift)
 }
@@ -93,8 +92,7 @@ public func modScaleShift(_ h: MLXArray, shift: MLXArray, scale: MLXArray,
 /// `x + other * gate`, per token. The reference fuses this as `addcmul_` in
 /// place; functionally identical, and the oracle showed fusion does not move
 /// the numbers.
-@inlinable
-public func modGate(_ x: MLXArray, gate: MLXArray, other: MLXArray,
+package func modGate(_ x: MLXArray, gate: MLXArray, other: MLXArray,
                     index: ModulationIndex) -> MLXArray {
     x + other * index.gather(gate)
 }
@@ -104,15 +102,15 @@ public func modGate(_ x: MLXArray, gate: MLXArray, other: MLXArray,
 /// Computed in fp32 and cast back, matching the reference. The accumulation
 /// precision here is not optional — doing it in bf16 changes the result well
 /// beyond the measured equivalence class.
-public struct H3RMSNorm {
-    public let weight: MLXArray
-    public let eps: Float
-    public init(weight: MLXArray, eps: Float) {
+package struct H3RMSNorm {
+    package let weight: MLXArray
+    package let eps: Float
+    package init(weight: MLXArray, eps: Float) {
         self.weight = weight
         self.eps = eps
     }
 
-    public func callAsFunction(_ x: MLXArray) -> MLXArray {
+    package func callAsFunction(_ x: MLXArray) -> MLXArray {
         let f = x.asType(.float32)
         let n = f * rsqrt(mean(f * f, axis: -1, keepDims: true) + eps)
         return (n * weight.asType(.float32)).asType(x.dtype)

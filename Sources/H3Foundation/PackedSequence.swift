@@ -2,7 +2,7 @@ import Foundation
 
 /// The modality tag an AdaLN row carries. Fixed by the reference's `seg_tag`
 /// table in `comfy/ldm/minimax/model.py`: **video 0, text 1, audio 2**.
-public enum ModalityTag: Int, Sendable {
+package enum ModalityTag: Int, Sendable {
     case video = 0
     case text = 1
     case audio = 2
@@ -14,7 +14,7 @@ public enum ModalityTag: Int, Sendable {
 /// rows, which modality tag the AdaLN row uses, and which timestep the span
 /// runs on. They do not coincide: `cond` rows are video-tagged but sit at a
 /// near-1.0 timestep of their own.
-public enum SegmentKind: String, Sendable, Equatable {
+package enum SegmentKind: String, Sendable, Equatable {
     case text
     case cond
     case refImage = "ref_img"
@@ -22,7 +22,7 @@ public enum SegmentKind: String, Sendable, Equatable {
     case audio
     case video
 
-    public var modality: ModalityTag {
+    package var modality: ModalityTag {
         switch self {
         case .text: .text
         case .audio, .refAudio: .audio
@@ -31,19 +31,19 @@ public enum SegmentKind: String, Sendable, Equatable {
     }
 
     /// Whether the span's rows come from the video patch projection.
-    public var isVideoStream: Bool { self == .video || self == .cond || self == .refImage }
+    package var isVideoStream: Bool { self == .video || self == .cond || self == .refImage }
 }
 
-public struct PackedSegment: Sendable, Equatable {
-    public let start: Int
-    public let stop: Int
-    public let kind: SegmentKind
-    public init(start: Int, stop: Int, kind: SegmentKind) {
+package struct PackedSegment: Sendable, Equatable {
+    package let start: Int
+    package let stop: Int
+    package let kind: SegmentKind
+    package init(start: Int, stop: Int, kind: SegmentKind) {
         self.start = start
         self.stop = stop
         self.kind = kind
     }
-    public var count: Int { stop - start }
+    package var count: Int { stop - start }
 }
 
 /// RoPE position coordinates.
@@ -54,16 +54,16 @@ public struct PackedSegment: Sendable, Equatable {
 /// rescaled frame spans rather than by one per token. Everything here is
 /// computed in Double because the reference builds `position_ids` in float64
 /// and only narrows to fp32 inside `rope_freqs`.
-public enum PositionGrid {
+package enum PositionGrid {
     /// Frames represented by each video latent token, cycling with period 5.
     /// The first latent frame covers 1 source frame, the rest cover 4.
-    public static let framesPerToken = [1, 4, 4, 4, 4]
+    package static let framesPerToken = [1, 4, 4, 4, 4]
     /// Temporal spans are scaled by 5/3 before being accumulated.
-    public static let frameRescale = 5.0 / 3.0
+    package static let frameRescale = 5.0 / 3.0
 
     /// `linspace((1-ratio)/2, (1+ratio)/2, dim/patch, endpoint=False) * 32`
     /// where `ratio = dim / sqrt(h*w)`.
-    public static func axis(dim: Int, patch: Int, sqrtArea: Double) throws -> [Double] {
+    package static func axis(dim: Int, patch: Int, sqrtArea: Double) throws -> [Double] {
         let ratio = Double(dim) / sqrtArea
         let n = dim / patch
         guard n > 0 else {
@@ -76,7 +76,7 @@ public enum PositionGrid {
 
     /// One latent frame's `(h, w)` coordinates, row-major over the 2x2-patch
     /// grid, plus the w axis on its own (the audio grid pins to its extremes).
-    public static func frameGrid(h: Int, w: Int, patch: Int = 2)
+    package static func frameGrid(h: Int, w: Int, patch: Int = 2)
         throws -> (rows: [(h: Double, w: Double)], wAxis: [Double]) {
         let area = (Double(h) * Double(w)).squareRoot()
         let hAxis = try axis(dim: h, patch: patch, sqrtArea: area)
@@ -88,7 +88,7 @@ public enum PositionGrid {
     }
 
     /// `origin + exclusive_cumsum(spans)`, one t coordinate per latent frame.
-    public static func videoTGrid(_ n: Int, origin: Double) -> [Double] {
+    package static func videoTGrid(_ n: Int, origin: Double) -> [Double] {
         var out = [Double](repeating: 0, count: n)
         var acc = origin
         for k in 0 ..< n {
@@ -100,33 +100,33 @@ public enum PositionGrid {
 
     /// Total temporal extent of `n` video latent frames — what a cursor advances
     /// by when a reference video block precedes the target.
-    public static func videoTSpan(_ n: Int) -> Double {
+    package static func videoTSpan(_ n: Int) -> Double {
         (0 ..< n).reduce(0.0) { $0 + frameRescale * Double(framesPerToken[$1 % framesPerToken.count]) }
     }
 }
 
-public struct KeyframeConfig: Sendable, Equatable {
-    public let resolvedFrameIndex: Int
-    public init(resolvedFrameIndex: Int) {
+package struct KeyframeConfig: Sendable, Equatable {
+    package let resolvedFrameIndex: Int
+    package init(resolvedFrameIndex: Int) {
         self.resolvedFrameIndex = resolvedFrameIndex
     }
 }
 
-public enum ReferenceKind: String, Sendable, Equatable {
+package enum ReferenceKind: String, Sendable, Equatable {
     case image
     case audio
     case video
     case videoAudio = "video_audio"
 }
 
-public struct ReferenceBlock: Sendable, Equatable {
-    public let kind: ReferenceKind
-    public let latentH: Int
-    public let latentW: Int
-    public let latentT: Int
-    public let refAudioT: Int
+package struct ReferenceBlock: Sendable, Equatable {
+    package let kind: ReferenceKind
+    package let latentH: Int
+    package let latentW: Int
+    package let latentT: Int
+    package let refAudioT: Int
     
-    public init(kind: ReferenceKind, latentH: Int = 0, latentW: Int = 0, latentT: Int = 0, refAudioT: Int = 0) {
+    package init(kind: ReferenceKind, latentH: Int = 0, latentW: Int = 0, latentT: Int = 0, refAudioT: Int = 0) {
         self.kind = kind
         self.latentH = latentH
         self.latentW = latentW
@@ -142,19 +142,19 @@ public struct ReferenceBlock: Sendable, Equatable {
 ///
 /// **There is no batch dimension inside the stack.** Blocks operate on
 /// `[S, hidden]`, and slices come from the segment table.
-public struct PackedLayout: Sendable, Equatable {
-    public let textTokens: Int
-    public let audioTokens: Int
-    public let videoTokens: Int
-    public let segments: [PackedSegment]
+package struct PackedLayout: Sendable, Equatable {
+    package let textTokens: Int
+    package let audioTokens: Int
+    package let videoTokens: Int
+    package let segments: [PackedSegment]
     /// Row-major `[S, 3]` of `(t, h, w)`, in float64 as the reference builds it.
-    public let positionIds: [Double]
+    package let positionIds: [Double]
 
     /// - Throws: `H3Error.keyframeIndex` for an anchor the reference defines no
     ///   `cond_t` for. This was a `preconditionFailure`, which in a library
     ///   takes the host application down over a value the caller is entitled to
     ///   get wrong.
-    public init(textTokens: Int, geometry: LatentGeometry,
+    package init(textTokens: Int, geometry: LatentGeometry,
                 keyframes: [KeyframeConfig] = [], refs: [ReferenceBlock] = []) throws {
         self.textTokens = textTokens
         self.audioTokens = geometry.audioTokens
@@ -259,22 +259,22 @@ public struct PackedLayout: Sendable, Equatable {
         self.segments = segments
     }
 
-    public var totalTokens: Int { positionIds.count / 3 }
+    package var totalTokens: Int { positionIds.count / 3 }
 
     /// Half-open ranges into the packed sequence, in packing order.
-    public var textRange: Range<Int> {
+    package var textRange: Range<Int> {
         let seg = segments.first { $0.kind == .text }!
         return seg.start ..< seg.stop
     }
-    public var audioRange: Range<Int> {
+    package var audioRange: Range<Int> {
         let seg = segments.first { $0.kind == .audio }!
         return seg.start ..< seg.stop
     }
-    public var videoRange: Range<Int> {
+    package var videoRange: Range<Int> {
         let seg = segments.first { $0.kind == .video }!
         return seg.start ..< seg.stop
     }
 
     /// [S, hidden] — the shape every block tap is recorded at.
-    public func blockShape(config: H3Config) -> [Int] { [totalTokens, config.hiddenSize] }
+    package func blockShape(config: H3Config) -> [Int] { [totalTokens, config.hiddenSize] }
 }

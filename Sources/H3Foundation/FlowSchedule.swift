@@ -8,16 +8,16 @@ import Foundation
 /// 1.0 -> 0.8, and the last step leaps 0.387 -> 0. **That is correct, not a
 /// bug.** It matches the reference exactly at every step, and "fixing" it to a
 /// linear schedule is a classic and expensive mistake.
-public struct FlowSchedule: Sendable {
-    public let shift: Double
-    public init(shift: Double = H3Shift.video) { self.shift = shift }
+package struct FlowSchedule: Sendable {
+    package let shift: Double
+    package init(shift: Double = H3Shift.video) { self.shift = shift }
 
-    public func sigma(t: Double) -> Double {
+    package func sigma(t: Double) -> Double {
         shift * t / (1.0 + (shift - 1.0) * t)
     }
 
     /// `steps + 1` values, from 1.0 down to exactly 0.0.
-    public func sigmas(steps: Int) -> [Double] {
+    package func sigmas(steps: Int) -> [Double] {
         precondition(steps > 0, "steps must be positive")
         return (0...steps).map { i in
             i == steps ? 0.0 : sigma(t: 1.0 - Double(i) / Double(steps))
@@ -32,9 +32,9 @@ public struct FlowSchedule: Sendable {
 /// to the unshifted grid and re-applies the audio shift in closed form. The two
 /// streams therefore denoise at genuinely different rates inside a single
 /// forward pass — this is the reason there is a timestep row at all.
-public enum SigmaMap {
+package enum SigmaMap {
     /// Invert `sigma = s*b/(1+(s-1)*b)` to the base grid, re-apply `to`.
-    public static func shift(_ sigma: Float, from: Float, to: Float) -> Float {
+    package static func shift(_ sigma: Float, from: Float, to: Float) -> Float {
         let base = sigma / (from + sigma * (1.0 - from))
         return to * base / (1.0 + (to - 1.0) * base)
     }
@@ -45,7 +45,7 @@ public enum SigmaMap {
     /// for both streams. Scaling the audio velocity by this slope is what makes
     /// that shared ODE equal the audio stream's true ODE on its own schedule.
     /// Drop it and audio drifts out of step with video over the sampling run.
-    public static func slope(_ sigma: Float, from: Float, to: Float) -> Float {
+    package static func slope(_ sigma: Float, from: Float, to: Float) -> Float {
         let base = sigma / (from + sigma * (1.0 - from))
         let num = to * pow(1.0 + (from - 1.0) * base, 2)
         let den = from * pow(1.0 + (to - 1.0) * base, 2)
@@ -64,14 +64,14 @@ public enum SigmaMap {
 ///
 /// Arithmetic is float32 on purpose: the reference derives these from an fp32
 /// sigma tensor, and the deduplication is exact equality on those fp32 values.
-public struct TimestepPlan: Sendable, Equatable {
+package struct TimestepPlan: Sendable, Equatable {
     /// Distinct timestep values, ascending — the rows of `t_emb`.
-    public let values: [Float]
+    package let values: [Float]
     private let segRowMap: [SegmentKind: Int]
     /// `d(sigma_a)/d(sigma_v)`, which the audio velocity must be scaled by.
-    public let audioSlope: Float
+    package let audioSlope: Float
 
-    public init(sigmaVideo: Double,
+    package init(sigmaVideo: Double,
                 segments: [PackedSegment] = [],
                 visualCondNoiseAug: Float = 0.999,
                 audioCondNoiseAug: Float = 1.0,
@@ -113,10 +113,10 @@ public struct TimestepPlan: Sendable, Equatable {
         self.audioSlope = SigmaMap.slope(sv, from: fv, to: fa)
     }
 
-    public func row(for kind: SegmentKind) -> Int {
+    package func row(for kind: SegmentKind) -> Int {
         segRowMap[kind]!
     }
 
-    public var videoRow: Int { row(for: .video) }
-    public var audioRow: Int { row(for: .audio) }
+    package var videoRow: Int { row(for: .video) }
+    package var audioRow: Int { row(for: .audio) }
 }

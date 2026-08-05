@@ -10,21 +10,21 @@ import Foundation
 ///
 /// Empty input is the one special case: the reference substitutes a single pad
 /// token (151643) rather than an empty sequence.
-public struct Qwen2Tokenizer {
-    public let vocab: [String: Int]
-    public let ranks: [Pair: Int]
+package struct Qwen2Tokenizer {
+    package let vocab: [String: Int]
+    package let ranks: [Pair: Int]
     /// Added/special tokens, longest first so `<|im_start|>` wins over `<`.
-    public let specials: [(text: String, id: Int)]
-    public static let padToken = 151_643
+    package let specials: [(text: String, id: Int)]
+    package static let padToken = 151_643
 
-    public struct Pair: Hashable {
-        public let a: String, b: String
-        public init(_ a: String, _ b: String) { self.a = a; self.b = b }
+    package struct Pair: Hashable {
+        package let a: String, b: String
+        package init(_ a: String, _ b: String) { self.a = a; self.b = b }
     }
 
-    public enum Error: Swift.Error, CustomStringConvertible {
+    package enum Error: Swift.Error, CustomStringConvertible {
         case missing(String)
-        public var description: String {
+        package var description: String {
             switch self {
             case .missing(let p): "tokenizer file not found: \(p)"
             }
@@ -33,7 +33,7 @@ public struct Qwen2Tokenizer {
 
     /// GPT-2's byte-to-unicode table: every byte becomes a printable code point
     /// so BPE can run over text without ever seeing a control character.
-    public static let byteEncoder: [UInt8: Character] = {
+    package static let byteEncoder: [UInt8: Character] = {
         var bs: [Int] = Array(33...126) + Array(161...172) + Array(174...255)
         var cs = bs
         var n = 0
@@ -45,7 +45,7 @@ public struct Qwen2Tokenizer {
         return map
     }()
 
-    public init(directory: URL) throws {
+    package init(directory: URL) throws {
         let vocabURL = directory.appendingPathComponent("vocab.json")
         let mergesURL = directory.appendingPathComponent("merges.txt")
         guard let vd = try? Data(contentsOf: vocabURL) else {
@@ -143,7 +143,7 @@ public struct Qwen2Tokenizer {
     }
 
     /// `add_special_tokens=False`, exactly as the reference calls it.
-    public func encode(_ text: String) -> [Int] {
+    package func encode(_ text: String) -> [Int] {
         guard !text.isEmpty else { return [] }
         // Split around literal special tokens first; everything between them
         // goes through the byte-level path.
@@ -166,7 +166,7 @@ public struct Qwen2Tokenizer {
 
     /// What the reference feeds the encoder: the prompt's ids, or a single pad
     /// token when the prompt is empty.
-    public func encodePrompt(_ text: String) -> [Int] {
+    package func encodePrompt(_ text: String) -> [Int] {
         let ids = encode(text)
         return ids.isEmpty ? [Self.padToken] : ids
     }
@@ -174,5 +174,5 @@ public struct Qwen2Tokenizer {
     /// Modality tag per token. A pure-text prompt is all 1 (text); vision pads
     /// would carry 0 (video), which is why this is a per-token array and not a
     /// constant.
-    public func textTags(count: Int) -> [Int] { Array(repeating: 1, count: count) }
+    package func textTags(count: Int) -> [Int] { Array(repeating: 1, count: count) }
 }

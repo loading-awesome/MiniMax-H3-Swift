@@ -1,10 +1,14 @@
 import Foundation
 import ArgumentParser
 import MiniMaxH3
+import H3Foundation
+import H3Catalog
+import H3Recipes
 
 extension H3RecipeID: ExpressibleByArgument {}
 extension RenderRequest.AspectRatio: ExpressibleByArgument {}
 extension RenderRequest.ResolutionTier: ExpressibleByArgument {}
+extension RenderRequest.QualityProfile: ExpressibleByArgument {}
 
 /// A render, from the command line.
 ///
@@ -13,7 +17,7 @@ extension RenderRequest.ResolutionTier: ExpressibleByArgument {}
 /// experimental tree the rules lived in the command's `validate()`, which meant
 /// they could only be reached by spawning a process, and could not be tested at
 /// all.
-struct RenderCommand: ParsableCommand {
+struct RenderCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "render",
         abstract: "Render video and audio together from a prompt."
@@ -77,8 +81,11 @@ struct RenderCommand: ParsableCommand {
     @Option(help: "guidance scale; 1.0 turns guidance off")
     var cfgScale: Double = 1.0
 
-    @Option(help: "cross-step cache threshold; 0 is faithful, 0.10 is the measured knee")
-    var cacheThreshold: Double = 0.10
+    @Option(help: "quality profile: faithful, balanced, or fast")
+    var quality: RenderRequest.QualityProfile = .faithful
+
+    @Option(help: "advanced cache override; makes the quality profile custom")
+    var cacheThreshold: Double?
 
     @Option(help: "most consecutive cached steps before a full one is forced")
     var cacheMaxSkips: Int = 3
@@ -101,7 +108,16 @@ struct RenderCommand: ParsableCommand {
     @Flag(help: "render even if the policy rejects this configuration, logging every reason")
     var allowSuboptimal = false
 
-    func run() throws {
+    @Flag(help: "replace an existing final output")
+    var overwrite = false
+
+    @Flag(help: "print the plan and the time estimate, then stop without rendering")
+    var dryRun = false
+
+    @Flag(name: .shortAndLong, help: "show memory figures and backend selection while rendering")
+    var verbose = false
+
+    func run() async throws {
         // Line-buffer stdout. Redirected to a file it is block-buffered by
         // default, and a render that is SIGKILLed — which is how an
         // out-of-memory render ends, with no signal handler and no unwinding —
@@ -129,11 +145,13 @@ struct RenderCommand: ParsableCommand {
             },
             referenceAudio: referenceAudio.map(URL.init(fileURLWithPath:)),
             cfgScale: cfgScale,
+            qualityProfile: quality,
             cacheThreshold: cacheThreshold, cacheMaxSkips: cacheMaxSkips,
             cacheWholeSequenceProbe: cacheWholeSequenceProbe,
             conditioningNoise: conditioningNoise.map(URL.init(fileURLWithPath:)),
             attentionBackend: attention ?? cfg.attention.backend,
-            allowSuboptimal: allowSuboptimal)
+            allowSuboptimal: allowSuboptimal,
+            overwriteOutput: overwrite)
         try request.validate()
 
         // Which partition is needed follows from the mode, so the catalog is
@@ -149,48 +167,68 @@ struct RenderCommand: ParsableCommand {
         }
 
         let (w, h) = try request.dimensions()
-        print("render")
-        print("  mode        \(request.mode.rawValue) — \(request.modeDescription)")
-        print("  shape       \(w)x\(h), \(seconds)s at \(H3Video.fps) fps, \(steps) steps")
-        print("  dit         \(resolution.dit.url.lastPathComponent)")
-        print("  guidance    \(cfgScale > 1 ? String(format: "%.2f", cfgScale) : "off")")
+        let geometry = LatentGeometry(width: w, height: h,
+                                      length: request.seconds * H3Video.fps)
+        let packedTokens = geometry.videoTokens + geometry.audioTokens
+        RenderReporter.plan(
+            request: request, width: w, height: h, frameCount: geometry.frameCount,
+            fps: H3Video.fps, packedTokens: packedTokens, checkpoint: resolution.dit.url.lastPathComponent,
+            estimateSeconds: H3RenderPolicy.estimatedSeconds(tokens: packedTokens,
+                                                             steps: request.steps))
 
-        var lastPhase: RenderProgress.Phase?
-        let result = try H3Pipeline.render(
-            request: request,
-            checkpoints: H3Pipeline.Checkpoints(
-                dit: resolution.dit.url, textEncoder: resolution.textEncoder.url,
-                tokenizer: tokenizer, videoVAE: resolution.videoVAE.url,
-                audioVAE: resolution.audioVAE.url),
-            progress: { p in
-                if p.phase != lastPhase {
-                    print("\(p.phase.rawValue): \(p.detail)")
-                    lastPhase = p.phase
-                } else if p.phase == .sampling, p.total > 0 {
-                    print("  \(p.detail)")
+        // Everything above is header-only — safetensors headers, arithmetic, no
+        // tensor bodies — so `--dry-run` can answer "what would this cost" in
+        // about a second rather than after a checkpoint load.
+        if dryRun {
+            print("dry run: nothing was loaded and nothing was written.")
+            return
+        }
+
+        guard let modelPrecision = ModelSet.Precision(rawValue: precision) else {
+            throw H3Error.invalidRequest(
+                rule: "unknown precision", detail: precision,
+                remedy: "use bf16, int8, pruned_bf16, or pruned_int8.")
+        }
+        let engine = RenderEngine(
+            models: ModelSet(
+                dit: ModelFile(url: resolution.dit.url),
+                textEncoder: ModelFile(url: resolution.textEncoder.url),
+                tokenizer: tokenizer,
+                videoVAE: ModelFile(url: resolution.videoVAE.url),
+                audioVAE: ModelFile(url: resolution.audioVAE.url),
+                precision: modelPrecision),
+            options: .init(
+                allowApproximateWeights: cfg.policy.allowApproximateWeights,
+                memoryMarginFraction: cfg.policy.memoryMarginFraction))
+        let job = try await engine.start(request)
+        let eventPrinter = Task {
+            var reporter = RenderReporter()
+            for await event in job.events {
+                switch event {
+                case .progress(let p):
+                    reporter.observe(p)
+                case .warning(let message):
+                    reporter.finishLine()
+                    FileHandle.standardError.write(Data(("warning: " + message + "\n").utf8))
+                case .diagnostic(let message):
+                    // Memory figures and backend selection: useful when a render
+                    // goes wrong, noise when it does not.
+                    if verbose {
+                        reporter.finishLine()
+                        print("  " + message)
+                    }
+                case .failed(let code, let message):
+                    reporter.finishLine()
+                    FileHandle.standardError.write(Data(("\n\(code): \(message)\n").utf8))
+                case .admitted, .completed:
+                    break
                 }
-            },
-            log: { print($0) })
+            }
+            return reporter
+        }
+        let result = try await job.value()
+        var reporter = await eventPrinter.value
+        reporter.finished(result)
 
-        // Where the wall clock actually went. Sampling and both decodes are GPU,
-        // the pixel pack is GPU, the mux is VideoToolbox plus memcpy. Guessing
-        // at this split is what once made a hung writer look like a slow CPU.
-        let t = result.timings
-        print(String(format: """
-            timings
-              text conditioning %7.1fs
-              condition encode  %7.1fs
-              sampling          %7.1fs   %d step(s)%@
-              audio decode      %7.1fs
-              video decode      %7.1fs
-              pixel pack        %7.1fs
-              mux + encode      %7.1fs
-            """, t.textConditioning, t.conditionEncoding, t.sampling, steps,
-            cfgScale > 1.0 ? ", 2 forwards each" : "",
-            t.audioDecode, t.videoDecode, t.pixelPack, t.mux))
-
-        print(String(format: "wrote %@ — %d frames, %.2fs",
-                     result.video.path, result.frameCount, result.seconds))
-        if let audio = result.audio { print("wrote \(audio.path)") }
     }
 }

@@ -20,41 +20,41 @@ import H3Foundation
 /// **fl2va sends a keyframe through both paths.** The same image is VAE-encoded
 /// into a `cond` segment of the packed sequence *and* presented here as
 /// `<Picture 1>`. They are not alternatives.
-public enum H3Presentation {
-    public static let visionStart = 151_652
-    public static let visionEnd = 151_653
+package enum H3Presentation {
+    package static let visionStart = 151_652
+    package static let visionEnd = 151_653
 
     /// One image already through the vision tower.
-    public struct VisionBlock {
-        public let merged: MLXArray            // [n, 5120]
-        public let deepstack: [MLXArray]       // 3 x [n, 5120]
-        public init(merged: MLXArray, deepstack: [MLXArray]) {
+    package struct VisionBlock {
+        package let merged: MLXArray            // [n, 5120]
+        package let deepstack: [MLXArray]       // 3 x [n, 5120]
+        package init(merged: MLXArray, deepstack: [MLXArray]) {
             self.merged = merged
             self.deepstack = deepstack
         }
-        public var tokens: Int { merged.dim(0) }
+        package var tokens: Int { merged.dim(0) }
     }
 
     /// Where an image's embeddings sit in the assembled sequence.
-    public struct Span: Sendable, Equatable {
-        public let start: Int, size: Int
-        public var end: Int { start + size }
+    package struct Span: Sendable, Equatable {
+        package let start: Int, size: Int
+        package var end: Int { start + size }
     }
 
-    public struct Assembled {
+    package struct Assembled {
         /// `[1, S, hidden]` — token embeddings with vision blocks spliced in.
-        public let embeds: MLXArray
-        public let spans: [Span]
+        package let embeds: MLXArray
+        package let spans: [Span]
         /// `[3, S]` t/h/w rows, or nil when there is no image (plain RoPE then).
-        public let positionIds: MLXArray?
+        package let positionIds: MLXArray?
         /// `[S]` — true at vision-embedding positions only.
-        public let visualMask: MLXArray?
+        package let visualMask: MLXArray?
         /// Three tensors, each `[totalVisionTokens, hidden]`, concatenated over
         /// images in order.
-        public let deepstack: [MLXArray]
+        package let deepstack: [MLXArray]
         /// `minimax_token_tags`: 1 for text, **0 for the whole vision block**
         /// including the flanking start/end tokens.
-        public let tags: [Int]
+        package let tags: [Int]
     }
 
     /// One `ref2va` reference, already through whatever encoding it needs.
@@ -67,7 +67,7 @@ public enum H3Presentation {
     ///    because "there is no embedding" shifts every position after it.
     ///  * `video` contributes a label and then one vision block per **frame
     ///    pair**, each preceded by its own `<T.T seconds>` timestamp text.
-    public enum RefItem {
+    package enum RefItem {
         case image(VisionBlock, VisionGrid)
         case audio
         case video(pairs: [(block: VisionBlock, grid: VisionGrid)], timestamps: [Double])
@@ -75,7 +75,7 @@ public enum H3Presentation {
 
     /// Builds the presentation. `blocks` must be in the same order as the
     /// `<Picture N>` labels, which is request order.
-    public static func assemble(prompt: String, blocks: [VisionBlock],
+    package static func assemble(prompt: String, blocks: [VisionBlock],
                                 tokenizer: Qwen2Tokenizer, encoder: TextEncoder,
                                 gridPerImage: [VisionGrid]) -> Assembled {
         precondition(blocks.count == gridPerImage.count,
@@ -92,7 +92,7 @@ public enum H3Presentation {
     /// `<Video 1>` — not 1, 2, 3. The caller owns the ordering; the node emits
     /// images, then videos (each paired soundtrack's `<Audio j>` immediately
     /// before its `<Video k>`), then standalone audio.
-    public static func assemble(prompt: String, items: [RefItem],
+    package static func assemble(prompt: String, items: [RefItem],
                                 tokenizer: Qwen2Tokenizer, encoder: TextEncoder) -> Assembled {
         var pieces: [MLXArray] = []
         var spans: [Span] = []

@@ -1,137 +1,362 @@
-# MiniMax-H3 for Apple Silicon
+# h3 — MiniMax-H3 on Apple silicon
 
-A native Swift/MLX implementation of [MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3),
-the joint video-and-audio diffusion transformer — 50 blocks, hidden 5376,
-56 heads, one packed sequence carrying text, audio and video together.
+Type a sentence, get a video **with the sound already in it**. No GPU rental, no
+Python environment, no node graph. One command, on your Mac.
 
-Ported against the CUDA reference with numerical parity **established rather
-than hoped for**: 225 gating taps inside CUDA-measured equivalence classes at
-production shape, plus 36 documented contracts in
-[FRAGILE_CONTRACTS.md](FRAGILE_CONTRACTS.md), each carrying the evidence that
-established it.
+<video src="https://github.com/loading-awesome/MiniMax-H3-Swift/raw/main/docs/media/stoplight.mp4" controls muted playsinline width="100%"></video>
+
+<sub>Rendered by this tool: 864×480, 7 s, 20 steps. The dialogue, the engine
+noise and the music were generated *together with the picture* — nothing was
+dubbed on afterwards. [Download](docs/media/stoplight.mp4) if your browser will
+not play it inline.</sub>
+
+```bash
+h3 render --prompt "a red kite over a beach at sunset" --out kite.mp4
+```
 
 ---
 
-## Read this before anything else: it will not run on most Macs
+## What this is
 
-The model is 124 GB of weights in bf16 and the activations at the verified
-render shape are tens of gigabytes more. **Activations do not shrink when the
-weights do** — they scale with packed sequence length and attention is quadratic
-in it — so a smaller checkpoint alone will not rescue a small machine.
+[MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) is an open-weights
+video model that is unusual in one specific way: **it generates the picture and
+the soundtrack in a single pass.** Most video models hand you a silent clip and
+leave you to add audio. H3 moves a character's lips and produces the voice
+saying those words at the same time, from the same prompt.
 
-| unified memory | verdict |
+`h3` is a native Swift and [MLX](https://github.com/ml-explore/mlx) port of it
+for Apple silicon — a command-line tool and a Swift library, with no Python
+anywhere in it.
+
+**It is not a small, friendly download.** The model is 124 GB of weights and the
+clip above took about twenty minutes on a Mac Studio. Please read the next
+section before you get attached to the idea.
+
+## Will it run on my Mac?
+
+Probably not, and I would rather say so here than have you find out after a very
+long download. Two things gate it, and **the disk usually stops people first**:
+
+| | you need |
 |---|---|
-| 8 / 16 / 24 GB | **cannot run.** Refused at startup, with the numbers. |
-| 32 / 36 GB | not at the verified shape |
-| 48 GB | approximate weights, reduced resolution or duration |
-| 64 GB | approximate weights comfortably |
-| 96 GB | tight for the full bf16 configuration |
-| **128 GB+** | bf16, the configuration parity was measured on |
+| **memory** | 96 GB unified memory, realistically 128 GB |
+| **disk** | 124 GB free for text-to-video, 190 GB for everything |
+| **chip** | any Apple silicon (M1 or later) |
+| **macOS** | 14 or later |
 
-`h3 doctor` tells you which of these you are, what it would select, and what it
-rejected, in about a second. It reads safetensors headers, not bodies.
+Which works out as:
+
+| Mac | verdict |
+|---|---|
+| MacBook Air, any configuration | **no.** A 16 GB Air with a 256 GB drive cannot *store* the model, never mind run it. |
+| MacBook Pro or mini, 16–36 GB | no |
+| M4 Pro, 48 GB | not yet — needs the work listed under [Status](#status) |
+| M4 Max, 64 GB | not yet |
+| **96 GB or more** | yes |
+| **Mac Studio, 128 GB+** | yes, comfortably |
+
+I would like this to reach further down the range, and it does not yet. Two
+specific pieces of work would bring it to roughly 48 GB — keeping the weights
+quantised in memory, and decoding the video in chunks. Neither is done, and
+neither is hand-waving: they are the two items at the top of [Status](#status).
+
+`h3 doctor` answers the question for your actual machine in about a second. It
+reads file headers, not file bodies, so it is fast even against 66 GB files:
 
 ```
 $ h3 doctor
 machine
   Apple M3 Ultra (Mac15,14), 275 GB unified memory, 28 cores
-  132 GB available right now (free + inactive + speculative)
+  145 GB available right now (free + inactive + speculative)
 
 memory plan at 15750 packed tokens
-  bf16         peak   98.7 GB   FITS, +17 GB headroom
-  int8         peak   98.7 GB   FITS, +17 GB headroom   [dequantised at load — saves disk, not memory]
+  bf16         peak   98.7 GB   FITS, +32 GB headroom
+  int8         peak   98.7 GB   FITS, +32 GB headroom   [dequantised at load — saves disk, not memory]
   pruned_bf16  peak   73.8 GB   refused (approximate weights)
+
+selected: bf16
+  textEncode   53.5 GB
+  vaeEncode     7.8 GB
+  sampling     98.7 GB   <- peak
+  decode       13.9 GB
+  available   145.9 GB
+  headroom     +32.4 GB after a 15% margin
+
+no problems found
 ```
 
-## Checkpoints
+---
 
-Two DiT partitions, and **which one you need is decided by what you are
-rendering, not by a flag**:
+## 1. Get `h3`
 
-| partition | serves |
+**Download the binary.** No compiler, no Xcode:
+
+### [⬇ Download the latest release](https://github.com/loading-awesome/MiniMax-H3-Swift/releases/latest)
+
+Unpack it, then **clear the quarantine flag**. macOS blocks any downloaded
+program not signed by a paid Apple developer account, and this one is not
+signed. In the folder you unpacked into, once:
+
+```bash
+xattr -dr com.apple.quarantine h3
+chmod +x h3
+./h3 doctor
+```
+
+Keep `h3` and `mlx.metallib` **in the same folder**. `h3` looks for its GPU
+kernels beside itself and will not start without them. To run it from anywhere:
+
+```bash
+sudo mkdir -p /usr/local/lib/h3 && sudo cp h3 mlx.metallib /usr/local/lib/h3/
+sudo ln -sf /usr/local/lib/h3/h3 /usr/local/bin/h3
+```
+
+<details>
+<summary><b>Or build it from source</b></summary>
+
+Needs Xcode 16 or later.
+
+```bash
+git clone https://github.com/loading-awesome/MiniMax-H3-Swift.git
+cd MiniMax-H3-Swift
+swift build -c release
+./Scripts/bootstrap-metal.sh
+.build/release/h3 doctor
+```
+
+`bootstrap-metal.sh` is not optional. SwiftPM does not build MLX's Metal
+kernels — mlx-swift compiles those in its Xcode project — so without it the
+first render dies with an unhelpful C++ error naming no file.
+See [CONTRIBUTING.md](CONTRIBUTING.md).
+</details>
+
+## 2. Get the model files
+
+The weights are **not** in this repository and are licensed separately by
+MiniMax. You need these, from the single-file conversions published for
+[WanGP](https://github.com/deepbeepmeep/Wan2GP) on Hugging Face, which are
+derived from [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3):
+
+| file | size | what it does |
+|---|---|---|
+| `MiniMax-H3-FL2VA_bf16.safetensors` | 66.3 GB | text-to-video, and frame anchors |
+| `MiniMax-H3-Ref2VA_bf16.safetensors` | 66.3 GB | image, video and audio references |
+| `Qwen3-VL-32B-Instruct-layer50_bf16.safetensors` | 51.5 GB | reads your prompt |
+| `MiniMax-H3-video_vae_fp16.safetensors` | 5.2 GB | turns latents into pixels |
+| `MiniMax-H3-audio_vae_fp32.safetensors` | 0.6 GB | turns latents into sound |
+
+Plus a tokenizer folder holding `vocab.json`, `merges.txt` and
+`tokenizer_config.json`.
+
+**You do not need both of the big ones to start.** `FL2VA` alone gives you
+text-to-video and frame anchors, which is most of what people want — 124 GB
+instead of 190 GB.
+
+Put them anywhere you like; `h3` never moves or copies them.
+
+> You will also see `int8` and `pruned` versions with smaller file sizes. They
+> are worth knowing about and mostly will not help yet — see
+> [Speed and quality](#speed-and-quality).
+
+## 3. Point `h3` at them
+
+```bash
+h3 config init
+```
+
+That writes `~/.config/minimax-h3/config.json` with the filenames already filled
+in. Open it and set two things — the folder your models are in, and the
+tokenizer:
+
+```json
+{
+  "checkpoints": {
+    "root": "/Users/you/models/MiniMax-H3",
+    "tokenizer": "/Users/you/models/MiniMax-H3/tokenizer"
+  }
+}
+```
+
+Then check your work:
+
+```bash
+h3 doctor
+```
+
+Every file is identified **from its own header, not from its name**, so one that
+has been renamed, truncated or converted differently is reported as what it
+actually is rather than what it claims. Anything missing is listed with the path
+that was checked. When it says **`no problems found`**, you are ready.
+
+## 4. Render something
+
+```bash
+h3 render --prompt "a red kite over a beach at sunset" --out kite.mp4
+```
+
+```
+  making    text to video and audio
+  size      1344 x 768, 5 s at 24 fps (124 frames)
+  steps     20
+  quality   faithful — no approximation
+  model     MiniMax-H3-FL2VA_bf16.safetensors
+  estimate  about 34m 11s of sampling
+
+[1/4] reading the prompt
+[2/4] sampling  ████████··············   8/20   61.2 s/step   12m 14s left
+```
+
+The countdown is measured from **your** render rather than read from a table, so
+it settles after a couple of steps and then tracks reality.
+
+Two flags worth knowing straight away:
+
+```bash
+h3 render --prompt "..." --out out.mp4 --dry-run           # what would this cost? (1 second)
+h3 render --prompt "..." --out out.mp4 --quality balanced  # roughly twice as fast
+```
+
+---
+
+## What you can make
+
+| you want | how |
 |---|---|
-| **FL2VA** | text-to-video, first-frame, last-frame |
-| **Ref2VA** | image / video / audio references |
+| video from a description | just `--prompt` |
+| a character who speaks | put the words in the prompt (below) |
+| start from your photo | `--first-frame photo.png` |
+| start here, end there | `--first-frame a.png --last-frame b.png` |
+| a consistent character | `--reference-images face1.png face2.png` |
+| match a clip's motion | `--reference-videos clip.mp4` |
+| lip-sync to your own audio | `--reference-audio speech.wav` |
 
-They share an architecture and differ in weights, so loading the wrong one
-renders successfully, without error, from weights that were never trained for
-the job. The catalog refuses it — including when a configuration files an FL2VA
-file under the `ref2va` key.
+**Which model file gets loaded follows from what you asked for**, never from a
+flag you might set wrongly. References load `Ref2VA`; prompts and frame anchors
+load `FL2VA`. Point the config at the wrong one and `h3` refuses, rather than
+producing something that looks fine and was made by weights never trained for
+the job.
 
-Four variants ship per partition. Two of the names are misleading and the
-catalog reports what the file *is*, read from its own header:
+### Making a character talk
 
-| variant | on disk | resident | note |
-|---|---|---|---|
-| `bf16` | 66.3 GB | 66.3 GB | the configuration parity was measured on |
-| `int8` | 34.0 GB | **66.3 GB** | per-channel int8, dequantised at load — saves disk, not memory |
-| `pruned_bf16` | 41.4 GB | 41.4 GB | **not pruning**: AdaLN is a rank-64 curve approximation |
-| `pruned_int8` | 22.1 GB | 41.4 GB | both of the above |
-
-The `pruned` variants change numerics by construction and are refused unless
-`policy.allow_approximate_weights` is set. Do not compare their output to the
-gated configuration.
-
-## Configuration
+Put the dialogue in the prompt with a speaker tag. The lip movement and the
+voice come out of the same pass:
 
 ```bash
-h3 config init          # writes ~/.config/minimax-h3/config.json
-h3 config validate      # resolves every path and identifies what is there
-h3 doctor               # the whole startup decision, printed
+h3 render --out hello.mp4 --prompt \
+  'A woman in a sunlit kitchen looks at the camera. (S1) smiles and says
+   <d>[English] This is running on Apple silicon now.</d>'
 ```
 
-Precedence is defaults, then the config file, then environment, then CLI flags.
+The clip at the top of this page uses two speakers, `(S1)` and `(S2)`.
+[docs/PROMPTING.md](docs/PROMPTING.md) has the full grammar — camera moves,
+soundscape, music — and is worth ten minutes if you want reliable results.
 
-## Rendering
+---
 
-```bash
-h3 render --prompt "..." --width 864 --height 480 --seconds 5 --out out.mp4
+## Speed and quality
+
+Measured on a Mac Studio (M3 Ultra) at 864×480, 5 seconds, 20 steps:
+
+| quality | time | what changes |
+|---|---|---|
+| `faithful` *(default)* | ~23 min | nothing is approximated |
+| `balanced` | ~13 min | reuses work between steps — **16% less fine detail** |
+| `fast` | ~10 min | 28% less fine detail |
+
+`faithful` is the default deliberately. `balanced` is a genuinely good trade for
+drafts, and it is still an approximation — so it says so on every run and it is
+recorded in the render's receipt. Nobody should discover months later that their
+comparison was against a shortcut.
+
+Larger costs more than proportionally: attention grows with the *square* of the
+sequence length, so doubling the resolution roughly quadruples the time.
+`--dry-run` tells you before you commit twenty minutes.
+
+The `int8` files are half the size on disk and **exactly the same size in
+memory**, because they are expanded back to full precision at load. They save
+download and storage, not RAM. The `pruned` files genuinely are smaller in
+memory and they change the maths, so `h3` refuses them unless you set
+`allow_approximate_weights` in the config — nobody should accidentally compare
+one against the real thing.
+
+---
+
+## All the commands
+
+```
+h3 doctor            what this Mac can run, which files it found, what it chose
+h3 config init       write a configuration file
+h3 config validate   resolve every path and identify what is there
+h3 render            make a video
 ```
 
-One mp4 carrying both streams. H3 generates video and audio jointly, so handing
-back a silent video and a loose wav would throw away the thing that makes the
-model interesting. `--out-audio` adds the wav as a side-car, and it is also
-what survives if muxing fails at the end of a thirty-minute render.
+Useful `render` options:
 
-The partition follows from what you asked for: references select Ref2VA,
-anchors and plain prompts select FL2VA, and a checkpoint filed under the wrong
-key is refused rather than used.
+| | |
+|---|---|
+| `--out-audio out.wav` | also write the audio on its own |
+| `--seconds 4…15` | duration. Use 5 or more; 4 lands under the model's trained floor |
+| `--steps 20` | more is slower and slightly better; 20 is the verified value |
+| `--seed 7` | same seed, machine and version → the same video |
+| `--width` / `--height` | exact size, multiples of 32 |
+| `--aspect-ratio 16:9` | or `9:16`, `21:9`, `4:3`, `3:4`, `1:1` |
+| `--cfg-scale 5` | stronger prompt adherence, at twice the work per step |
+| `--negative-prompt "..."` | needs `--cfg-scale` above 1 to do anything at all |
+| `--dry-run` | print the plan and the estimate, load nothing |
+| `--verbose` | memory figures and backend choice while it runs |
 
-**The cross-step cache is on by default at 0.10, and it is an approximation.**
-Every run says so. Swept at 864x480x124x20 against an uncached control of the
-same prompt and seed:
+`h3 render --help` lists every one.
 
-| threshold | steps skipped | speedup | high-frequency detail |
-|---|---|---|---|
-| 0 | 0/20 | — | baseline |
-| **0.10** | 10/20 | **1.93x** | **−16%** |
-| 0.15 | 13/20 | 2.60x | −28% |
-| 0.25 | 14/20 | 2.93x | −44% |
+## Examples
 
-0.15 to 0.25 buys 13% more speed and costs another 16% of detail. 0.10 is the
-knee. Pass `--cache-threshold 0` for a faithful render.
+**Speech generated with the picture.** 864×480, 5 s. The audio was transcribed
+back with Whisper at a word error rate of **0.00** against the prompt's line,
+and a face was detected with landmarks in **124 of 124 frames**.
 
-As a library, with progress and cancellation:
+<video src="https://github.com/loading-awesome/MiniMax-H3-Swift/raw/main/docs/media/talking-head.mp4" controls muted playsinline width="100%"></video>
+
+<sub>[Download](docs/media/talking-head.mp4)</sub>
+
+---
+
+## For developers
+
+It is a Swift package as well as a tool. The render API is an actor, so one
+process cannot start a second render by accident — a model this size must never
+be loaded twice:
 
 ```swift
-let result = try H3Pipeline.render(
-    request: RenderRequest(prompt: "...", videoOutput: url),
-    checkpoints: checkpoints,
-    progress: { print($0.phase.rawValue, $0.detail) },
-    cancellation: token)
+import MiniMaxH3
+
+let engine = RenderEngine(models: models)
+let job = try await engine.start(RenderRequest(prompt: "...", videoOutput: url))
+for await event in job.events { print(event) }
+let result = try await job.value()
 ```
 
-Cancellation is observed between sampler steps. A step is minutes at production
-shape, so it cannot be instant, and abandoning a half-finished forward would
-gain nothing.
+MLX types never appear in the public API, which is what lets the attention
+backend, the quantisation scheme and the compute backend change without breaking
+callers.
 
-## Architecture
+**On correctness.** This was ported against the CUDA reference with parity
+established by measurement rather than hope: 225 gating taps inside
+CUDA-measured equivalence classes at production shape, and 36 documented
+contracts in [FRAGILE_CONTRACTS.md](FRAGILE_CONTRACTS.md), each carrying the
+evidence that established it. That file exists because this codebase's failure
+mode is *silent* — a wrong packed layout, a dropped label or a transposed qkv
+all keep every tensor exactly the right shape.
 
-Dependencies point downward only. The two lowest layers do not link MLX, which
-means the geometry, the 17k+5 frame lattice, checkpoint identification, the
-flow schedule and the memory planner are all testable in seconds with no GPU
-and no 66 GB download — and those are precisely the places where an error stays
-silent.
+Further reading: [CONTRIBUTING.md](CONTRIBUTING.md) for setup and house style,
+[docs/adr/](docs/adr/) for design decisions and their reasons, and
+[docs/OPERATIONS.md](docs/OPERATIONS.md) for running it in anger.
+
+<details>
+<summary><b>Architecture</b></summary>
+
+Dependencies point downward only, and the four lowest layers do not link MLX —
+so geometry, the frame lattice, checkpoint identification and the memory planner
+all test in milliseconds with no GPU and no 66 GB download. Those are exactly
+the places where an error stays silent.
 
 | target | owns | MLX |
 |---|---|---|
@@ -145,30 +370,26 @@ silent.
 | `H3Conformance` | the retained numerical checks | yes |
 | `MiniMaxH3` | the public API | no |
 
-MLX types do not appear in the public API. That is what lets the attention
-backend, the quantisation scheme and the compute backend change without a
-breaking release.
+</details>
 
 ## Status
 
-Ported and gated: the DiT stack, both VAEs, the vision tower, the tokenizer
-(bit-identical), the packed layout for every conditioning kind, and the
-conditioning presentations for keyframes and references.
+Verified end to end through this package: text-to-video with joint audio at
+864×480×124, checked with two oracles that need no reference — speech at
+**WER 0.00**, and a face with landmarks in **124/124 frames**.
 
-**Rendered end to end through this package**, 864x480x124 at 20 steps, bf16
-FL2VA, cache at the 0.10 default — 782 s wall clock, 9 of 20 steps skipped,
-MLX peak 87.2 GB. Checked with the two oracles that need no golden: speech
-transcribed at **WER 0.00** against the prompt's dialogue, and a face detected
-with landmarks in **124/124 frames** with no flash events.
+Frame anchors and the three reference kinds were rendered end to end in the
+experimental tree this was ported from, and have not yet been re-run here.
 
-The other conditioning modes — anchors, image, video and audio references —
-were rendered end to end in the experimental tree this was ported from, and
-have not yet been re-run through this package.
+Not done:
 
-Not implemented: in-context 2K upscaling (the upscaler is unreleased), and
-resident quantised matmul — which is the item that decides whether 64 GB
-machines are supportable. `H3Conformance` has no fixtures yet, so the 36
-contracts are documented rather than enforced.
+- **Resident quantised weights.** The single item that decides whether 48–64 GB
+  Macs are supported.
+- **Chunked video decode.** Currently the largest memory allocation in an entire
+  render, and not a hard problem.
+- **2K output.** Produced by a separate upscaler that MiniMax has not released.
+- **Fixtures for `H3Conformance`**, so the 36 contracts are documented but not
+  yet enforced by a test.
 
 ## Licence
 
@@ -179,12 +400,7 @@ Modify it, fork it, ship it. Two things travel with it: keep the copyright and
 the `NOTICE` file in what you distribute, and state that you changed the files
 you changed. That is the attribution.
 
-Apache-2.0 rather than MIT for one reason beyond attribution: it grants patent
-rights explicitly, from every contributor. For an inference implementation of a
-model this is worth having stated rather than assumed, and it is what most of
-the ML ecosystem — including `swift-argument-parser` — already uses.
-
 `Resources/mlx.metallib` is MLX's compiled Metal kernel library, redistributed
-here under its own MIT licence; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
-The model weights are not in this repository and are licensed separately by
-MiniMax.
+here under its own MIT licence — see
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). The model weights are not in
+this repository and are licensed separately by MiniMax.

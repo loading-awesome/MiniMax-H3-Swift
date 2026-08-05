@@ -18,7 +18,7 @@ extension H3Transformer {
     /// - Parameter backend: resolved once here rather than per call. Every block
     ///   holds the same instance, and the selection is logged at build time, so
     ///   a render cannot be half one backend and half another.
-    public init(weights: H3Weights, computeDType: DType = .bfloat16,
+    package init(weights: H3Weights, computeDType: DType = .bfloat16,
                 fp32Attention: Bool = false,
                 keepAdaLNFP32Resident: Bool = false,
                 backend: any H3AttentionBackend = SDPABackend()) throws {

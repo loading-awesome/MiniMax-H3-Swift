@@ -21,17 +21,17 @@ import H3Foundation
 ///
 /// This planner models resident footprint, weights included, because that is
 /// the number that gets a process killed.
-public struct MemoryPlan: Sendable, Equatable {
+package struct MemoryPlan: Sendable, Equatable {
 
     /// Sizes as published, in bytes. Measured from the files, not estimated.
-    public enum Precision: String, Sendable, CaseIterable {
+    package enum Precision: String, Sendable, CaseIterable {
         case bf16
         case int8
         case prunedBF16 = "pruned_bf16"
         case prunedInt8 = "pruned_int8"
 
         /// DiT bytes for one partition.
-        public var ditBytes: UInt64 {
+        package var ditBytes: UInt64 {
             switch self {
             case .bf16:       66_280_000_000
             case .int8:       34_040_000_000
@@ -46,7 +46,7 @@ public struct MemoryPlan: Sendable, Equatable {
         /// projection is `[96768, 64]` rather than `[96768, 2688]`, which is
         /// exactly the 24.9 GB they save. That changes numerics by
         /// construction, so it is a different model and is labelled one.
-        public var isApproximate: Bool {
+        package var isApproximate: Bool {
             self == .prunedBF16 || self == .prunedInt8
         }
 
@@ -58,9 +58,9 @@ public struct MemoryPlan: Sendable, Equatable {
         /// Keeping them resident needs a quantised matmul whose layout differs
         /// from MLX's group-wise one. Until that lands, `residentBytes` says so
         /// rather than promising a saving that does not exist.
-        public var isResidentQuantised: Bool { false }
+        package var isResidentQuantised: Bool { false }
 
-        public var residentDITBytes: UInt64 {
+        package var residentDITBytes: UInt64 {
             isResidentQuantised ? ditBytes : dequantisedDITBytes
         }
 
@@ -72,12 +72,12 @@ public struct MemoryPlan: Sendable, Equatable {
             }
         }
 
-        public var textEncoderBytes: UInt64 {
+        package var textEncoderBytes: UInt64 {
             self == .bf16 || self == .prunedBF16 ? 51_510_000_000 : 26_720_000_000
         }
     }
 
-    public static let vaeBytes: UInt64 = 5_820_000_000
+    package static let vaeBytes: UInt64 = 5_820_000_000
 
     /// A phase of the render, with what it holds while it runs.
     ///
@@ -85,19 +85,19 @@ public struct MemoryPlan: Sendable, Equatable {
     /// phase and not the sum. That ordering is a memory contract: encoding
     /// every condition *before* the DiT is loaded is what keeps the text
     /// encoder and the DiT from being resident together.
-    public enum Phase: String, Sendable, CaseIterable {
+    package enum Phase: String, Sendable, CaseIterable {
         case textEncode, vaeEncode, sampling, decode
     }
 
-    public let precision: Precision
-    public let phaseBytes: [Phase: UInt64]
-    public let peakBytes: UInt64
-    public let availableBytes: UInt64
-    public let headroomBytes: Int64
+    package let precision: Precision
+    package let phaseBytes: [Phase: UInt64]
+    package let peakBytes: UInt64
+    package let availableBytes: UInt64
+    package let headroomBytes: Int64
 
-    public var peakGB: Double { Double(peakBytes) / 1e9 }
-    public var availableGB: Double { Double(availableBytes) / 1e9 }
-    public var fits: Bool { headroomBytes > 0 }
+    package var peakGB: Double { Double(peakBytes) / 1e9 }
+    package var availableGB: Double { Double(availableBytes) / 1e9 }
+    package var fits: Bool { headroomBytes > 0 }
 
     /// Activation bytes during sampling, from packed sequence length.
     ///
@@ -107,14 +107,14 @@ public struct MemoryPlan: Sendable, Equatable {
     /// verified configuration — and should be re-fitted whenever the attention
     /// backend changes, because a backend that never materialises the score
     /// matrix removes the quadratic term entirely.
-    public static func samplingActivationBytes(packedTokens S: Int) -> UInt64 {
+    package static func samplingActivationBytes(packedTokens S: Int) -> UInt64 {
         let s = Double(S)
         let linear = 1.6e6 * s          // residual stream, qkv, mlp working set
         let quadratic = 2.9e1 * s * s   // attention scores
         return UInt64(max(0, linear + quadratic))
     }
 
-    public static func plan(precision: Precision, packedTokens: Int,
+    package static func plan(precision: Precision, packedTokens: Int,
                             availableBytes: UInt64,
                             marginFraction: Double = 0.15) -> MemoryPlan {
         let act = samplingActivationBytes(packedTokens: packedTokens)
@@ -136,7 +136,7 @@ public struct MemoryPlan: Sendable, Equatable {
     /// Ordered most faithful first. `allowApproximate` gates the two `pruned`
     /// variants, because falling back to them silently would hand somebody a
     /// different model and let them compare its output to the gated one.
-    public static func best(packedTokens: Int, availableBytes: UInt64,
+    package static func best(packedTokens: Int, availableBytes: UInt64,
                             allowApproximate: Bool) -> MemoryPlan? {
         let order: [Precision] = allowApproximate
             ? [.bf16, .int8, .prunedBF16, .prunedInt8]
@@ -149,7 +149,7 @@ public struct MemoryPlan: Sendable, Equatable {
         return nil
     }
 
-    public var explanation: String {
+    package var explanation: String {
         var out = [String]()
         out.append(String(format: "  precision      %@%@", precision.rawValue,
                           precision.isApproximate ? "  (approximate weights)" : ""))

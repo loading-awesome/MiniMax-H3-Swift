@@ -1,6 +1,8 @@
 import Foundation
 import ArgumentParser
 import MiniMaxH3
+import H3Foundation
+import H3Catalog
 
 struct ConfigCommand: ParsableCommand {
     static let configuration = CommandConfiguration(

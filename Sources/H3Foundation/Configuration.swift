@@ -13,19 +13,19 @@ import Foundation
 /// library and a TOML parser is a dependency. The schema below is small enough
 /// that the difference in ergonomics is a few quotation marks, and a
 /// configuration format is a poor place to spend a supply-chain risk.
-public struct H3Configuration: Codable, Sendable, Equatable {
+package struct H3Configuration: Codable, Sendable, Equatable {
 
-    public struct Checkpoints: Codable, Sendable, Equatable {
+    package struct Checkpoints: Codable, Sendable, Equatable {
         /// Everything else is resolved relative to this unless absolute.
-        public var root: String?
-        public var fl2va: [String: String]
-        public var ref2va: [String: String]
-        public var textEncoder: [String: String]
-        public var videoVAE: String?
-        public var audioVAE: String?
-        public var tokenizer: String?
+        package var root: String?
+        package var fl2va: [String: String]
+        package var ref2va: [String: String]
+        package var textEncoder: [String: String]
+        package var videoVAE: String?
+        package var audioVAE: String?
+        package var tokenizer: String?
 
-        public init(root: String? = nil,
+        package init(root: String? = nil,
                     fl2va: [String: String] = [:], ref2va: [String: String] = [:],
                     textEncoder: [String: String] = [:],
                     videoVAE: String? = nil, audioVAE: String? = nil,
@@ -62,7 +62,7 @@ public struct H3Configuration: Codable, Sendable, Equatable {
         /// checkpoints it owns — a perfectly reasonable thing to write — fails
         /// to decode with `keyNotFound`. A partial config is the normal case,
         /// not an error.
-        public init(from decoder: Decoder) throws {
+        package init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
             root = try c.decodeIfPresent(String.self, forKey: .root)
             fl2va = try c.decodeIfPresent([String: String].self, forKey: .fl2va) ?? [:]
@@ -74,18 +74,18 @@ public struct H3Configuration: Codable, Sendable, Equatable {
         }
     }
 
-    public struct Policy: Codable, Sendable, Equatable {
+    package struct Policy: Codable, Sendable, Equatable {
         /// Gates the `pruned` variants, whose AdaLN is a rank-64 curve
         /// approximation rather than the released projection. Off by default:
         /// falling back to them silently would hand somebody a different model
         /// and let them compare its output to the gated configuration.
-        public var allowApproximateWeights: Bool
+        package var allowApproximateWeights: Bool
         /// Wall-clock ceiling before a render is refused without an explicit
         /// opt-in.
-        public var maxRenderSeconds: Double
+        package var maxRenderSeconds: Double
         /// Fraction of available memory held back when planning. Memory
         /// pressure is not a cliff the planner can see coming.
-        public var memoryMarginFraction: Double
+        package var memoryMarginFraction: Double
 
         enum CodingKeys: String, CodingKey {
             case allowApproximateWeights = "allow_approximate_weights"
@@ -93,7 +93,7 @@ public struct H3Configuration: Codable, Sendable, Equatable {
             case memoryMarginFraction = "memory_margin_fraction"
         }
 
-        public init(allowApproximateWeights: Bool = false,
+        package init(allowApproximateWeights: Bool = false,
                     maxRenderSeconds: Double = 3 * 3600,
                     memoryMarginFraction: Double = 0.15) {
             self.allowApproximateWeights = allowApproximateWeights
@@ -101,7 +101,7 @@ public struct H3Configuration: Codable, Sendable, Equatable {
             self.memoryMarginFraction = memoryMarginFraction
         }
 
-        public init(from decoder: Decoder) throws {
+        package init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
             allowApproximateWeights = try c.decodeIfPresent(Bool.self, forKey: .allowApproximateWeights) ?? false
             maxRenderSeconds = try c.decodeIfPresent(Double.self, forKey: .maxRenderSeconds) ?? 3 * 3600
@@ -109,29 +109,29 @@ public struct H3Configuration: Codable, Sendable, Equatable {
         }
     }
 
-    public struct Attention: Codable, Sendable, Equatable {
+    package struct Attention: Codable, Sendable, Equatable {
         /// `auto`, or a registered backend identifier.
-        public var backend: String
-        public init(backend: String = "auto") { self.backend = backend }
+        package var backend: String
+        package init(backend: String = "auto") { self.backend = backend }
 
-        public init(from decoder: Decoder) throws {
+        package init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
             backend = try c.decodeIfPresent(String.self, forKey: .backend) ?? "auto"
         }
     }
 
-    public var checkpoints: Checkpoints
-    public var policy: Policy
-    public var attention: Attention
+    package var checkpoints: Checkpoints
+    package var policy: Policy
+    package var attention: Attention
 
-    public init(checkpoints: Checkpoints = .init(), policy: Policy = .init(),
+    package init(checkpoints: Checkpoints = .init(), policy: Policy = .init(),
                 attention: Attention = .init()) {
         self.checkpoints = checkpoints
         self.policy = policy
         self.attention = attention
     }
 
-    public init(from decoder: Decoder) throws {
+    package init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         checkpoints = try c.decodeIfPresent(Checkpoints.self, forKey: .checkpoints) ?? .init()
         policy = try c.decodeIfPresent(Policy.self, forKey: .policy) ?? .init()
@@ -140,7 +140,7 @@ public struct H3Configuration: Codable, Sendable, Equatable {
 
     // MARK: loading
 
-    public static var defaultURL: URL {
+    package static var defaultURL: URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".config/minimax-h3/config.json")
     }
@@ -152,7 +152,7 @@ public struct H3Configuration: Codable, Sendable, Equatable {
     /// exists and cannot be parsed **is** an error, and names the line, because
     /// silently falling back to defaults after somebody edited a file is how a
     /// render ends up using a checkpoint nobody chose.
-    public static func load(from url: URL? = nil) throws -> (H3Configuration, URL?) {
+    package static func load(from url: URL? = nil) throws -> (H3Configuration, URL?) {
         let target = url ?? defaultURL
         guard FileManager.default.fileExists(atPath: target.path) else {
             if url != nil {
@@ -176,7 +176,7 @@ public struct H3Configuration: Codable, Sendable, Equatable {
     }
 
     /// Absolute URL for a path that may be relative to `checkpoints.root`.
-    public func resolve(_ path: String?) -> URL? {
+    package func resolve(_ path: String?) -> URL? {
         guard let path, !path.isEmpty else { return nil }
         if path.hasPrefix("/") { return URL(fileURLWithPath: path) }
         guard let root = checkpoints.root else { return URL(fileURLWithPath: path) }
@@ -184,7 +184,7 @@ public struct H3Configuration: Codable, Sendable, Equatable {
     }
 
     /// A starting config pointing at nothing, for `h3 config init`.
-    public static var template: H3Configuration {
+    package static var template: H3Configuration {
         H3Configuration(
             checkpoints: .init(
                 root: "/path/to/MiniMax-H3",
@@ -204,7 +204,7 @@ public struct H3Configuration: Codable, Sendable, Equatable {
             policy: .init(), attention: .init())
     }
 
-    public func encoded() throws -> Data {
+    package func encoded() throws -> Data {
         let e = JSONEncoder()
         e.outputFormatting = [.prettyPrinted, .sortedKeys]
         return try e.encode(self)

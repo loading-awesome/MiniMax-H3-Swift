@@ -6,16 +6,16 @@ import Foundation
 /// every value here is checked against the CUDA reference in `H3CoreTests`.
 /// A shape bug shows up at L1 as a SHAPE verdict rather than a value mismatch,
 /// which is the easiest possible failure to diagnose — get these green first.
-public struct LatentGeometry: Sendable, Equatable {
-    public let frameCount: Int
-    public let latentT: Int
-    public let audioT: Int
-    public let latentH: Int
-    public let latentW: Int
-    public let config: H3Config
+package struct LatentGeometry: Sendable, Equatable {
+    package let frameCount: Int
+    package let latentT: Int
+    package let audioT: Int
+    package let latentH: Int
+    package let latentW: Int
+    package let config: H3Config
 
     /// Snap a requested frame count up onto the 17k+5 lattice, minimum 5.
-    public static func alignFrameCount(_ length: Int) -> Int {
+    package static func alignFrameCount(_ length: Int) -> Int {
         let n = max(H3Video.latticeOffset, length)
         let k = Int((Double(n - H3Video.latticeOffset) / Double(H3Video.lattice)).rounded(.up))
         return H3Video.latticeOffset + k * H3Video.lattice
@@ -23,7 +23,7 @@ public struct LatentGeometry: Sendable, Equatable {
 
     /// `latentT = 5(F-5)/17 + 2`, `audioT = round(F/24 * 40)`.
     /// Verified against the reference at F = 5, 22, 39, 73, 124, 141, 362.
-    public init(width: Int, height: Int, length: Int, config: H3Config = H3Config()) {
+    package init(width: Int, height: Int, length: Int, config: H3Config = H3Config()) {
         let f = Self.alignFrameCount(length)
         self.frameCount = f
         self.latentT = 5 * (f - H3Video.latticeOffset) / H3Video.lattice + 2
@@ -34,27 +34,27 @@ public struct LatentGeometry: Sendable, Equatable {
     }
 
     /// `[B, 24, latentT, H/16, W/16]`
-    public func videoLatentShape(batch: Int = 1) -> [Int] {
+    package func videoLatentShape(batch: Int = 1) -> [Int] {
         [batch, config.videoLatentDim, latentT, latentH, latentW]
     }
 
     /// `[B, 32, 2, audioT]` — the 2 is not a batch or channel axis; it is part
     /// of the audio latent's own layout.
-    public func audioLatentShape(batch: Int = 1) -> [Int] {
+    package func audioLatentShape(batch: Int = 1) -> [Int] {
         [batch, config.audioLatentDim, 2, audioT]
     }
 
     /// Video tokens after patchify: `latentT * (H/2) * (W/2)`.
-    public var videoTokens: Int {
+    package var videoTokens: Int {
         latentT * (latentH / config.patchSize[1]) * (latentW / config.patchSize[2])
     }
 
     /// Audio tokens: `2 * audioT`.
-    public var audioTokens: Int { 2 * audioT }
+    package var audioTokens: Int { 2 * audioT }
 
     /// Whether the frame count sits inside the trained range. Renders outside
     /// it are numerically fine but must not be read as quality signals.
-    public var inTrainedRange: Bool { H3Video.trainedFrameRange.contains(frameCount) }
+    package var inTrainedRange: Bool { H3Video.trainedFrameRange.contains(frameCount) }
 }
 
 // PackedLayout lives in PackedSequence.swift — it carries position ids and a

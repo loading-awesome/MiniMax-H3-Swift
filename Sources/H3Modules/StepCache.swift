@@ -47,7 +47,7 @@ import H3Foundation
 /// **Never skip the first or last steps.** The first has no history. The last
 /// determines the output that is actually decoded, and a reused delta there
 /// lands directly in the pixels.
-public final class H3StepCache {
+package final class H3StepCache {
 
     /// Relative L1 change in block 0's residual below which the rest of the
     /// stack is skipped.
@@ -57,40 +57,40 @@ public final class H3StepCache {
     /// means judging the **audio as well as the video**: the two streams come
     /// out of one forward pass and there is no reason for them to degrade at the
     /// same rate.
-    public let threshold: Double
+    package let threshold: Double
 
     /// Upper bound on consecutive reuses.
-    public let maxConsecutiveSkips: Int
+    package let maxConsecutiveSkips: Int
 
     /// Steps at the start and end of the schedule that always run in full.
-    public let warmupSteps: Int
-    public let cooldownSteps: Int
+    package let warmupSteps: Int
+    package let cooldownSteps: Int
 
     private var previousProbe: MLXArray?
     private var cachedTotalResidual: MLXArray?
     private var consecutiveSkips = 0
 
-    public private(set) var stepsRun = 0
-    public private(set) var stepsSkipped = 0
+    package private(set) var stepsRun = 0
+    package private(set) var stepsSkipped = 0
     /// The measured relative change at each step, for tuning the threshold
     /// against something other than intuition.
-    public private(set) var observedChange: [Double] = []
+    package private(set) var observedChange: [Double] = []
     /// The audio stream's own relative change, recorded separately so a sweep
     /// can see whether the two streams actually move together.
-    public private(set) var observedAudioChange: [Double] = []
+    package private(set) var observedAudioChange: [Double] = []
     /// The whole-sequence change — what every other cache implementation
     /// measures. Recorded so the two can be compared directly rather than
     /// argued about.
-    public private(set) var observedVideoChange: [Double] = []
+    package private(set) var observedVideoChange: [Double] = []
 
     /// When false, the probe is the mean over the **whole packed sequence** —
     /// what every published cache for this model does. Kept as an option
     /// purely so the two can be compared under identical conditions; a claim
     /// that splitting the probe matters is worth nothing without the run that
     /// does not split it.
-    public let perStreamProbe: Bool
+    package let perStreamProbe: Bool
 
-    public init(threshold: Double, maxConsecutiveSkips: Int = 3,
+    package init(threshold: Double, maxConsecutiveSkips: Int = 3,
                 warmupSteps: Int = 1, cooldownSteps: Int = 1,
                 perStreamProbe: Bool = true) {
         self.perStreamProbe = perStreamProbe
@@ -101,7 +101,7 @@ public final class H3StepCache {
     }
 
     /// What the block loop should do this step.
-    public enum Decision {
+    package enum Decision {
         /// Run every remaining block, then call `record(totalResidual:)`.
         case runFull
         /// Skip them; add this to the stack's input instead.
@@ -115,7 +115,7 @@ public final class H3StepCache {
     ///   - audioRange: rows of the packed sequence carrying the target audio.
     ///   - step: 0-based sampler step.
     ///   - totalSteps: how many steps this render has.
-    public func decide(probe: MLXArray, audioRange: Range<Int>?,
+    package func decide(probe: MLXArray, audioRange: Range<Int>?,
                        step: Int, totalSteps: Int) -> Decision {
         defer { previousProbe = probe }
 
@@ -190,19 +190,19 @@ public final class H3StepCache {
     }
 
     /// Records the full stack's total residual after a `runFull` step.
-    public func record(totalResidual: MLXArray) {
+    package func record(totalResidual: MLXArray) {
         cachedTotalResidual = totalResidual
     }
 
     /// Frees the cached tensors. The residual is the size of the packed hidden
     /// state — at 20k tokens and hidden 5376 that is ~215 MB in bf16, held for
     /// the whole render and doubled under CFG.
-    public func release() {
+    package func release() {
         previousProbe = nil
         cachedTotalResidual = nil
     }
 
-    public var summary: String {
+    package var summary: String {
         let total = stepsRun + stepsSkipped
         guard total > 0 else { return "step cache: unused" }
         let pct = 100.0 * Double(stepsSkipped) / Double(total)

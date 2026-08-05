@@ -6,32 +6,32 @@ import Foundation
 /// inferred from a marketing name, because the same marketing name ships with
 /// memory configurations that differ by a factor of eight — an "M3 Ultra Mac
 /// Studio" is 96, 256 or 512 GB, and only one of those runs this model in bf16.
-public struct Machine: Sendable, Equatable {
+package struct Machine: Sendable, Equatable {
 
     /// `hw.model`, e.g. `Mac16,9`.
-    public let model: String
+    package let model: String
     /// `machdep.cpu.brand_string`, e.g. `Apple M3 Ultra`.
-    public let chip: String
+    package let chip: String
     /// Physical memory in bytes, from `hw.memsize`.
-    public let memoryBytes: UInt64
+    package let memoryBytes: UInt64
     /// Performance + efficiency cores.
-    public let cores: Int
+    package let cores: Int
     /// True when the enclosure is a notebook.
     ///
     /// This is not cosmetic. The throughput this library estimates from was
     /// measured on a desktop under sustained load; a notebook throttles over a
     /// twenty-minute render and will finish late. The estimate says so rather
     /// than being quietly wrong.
-    public let isPortable: Bool
+    package let isPortable: Bool
 
-    public var memoryGB: Double { Double(memoryBytes) / 1e9 }
+    package var memoryGB: Double { Double(memoryBytes) / 1e9 }
 
     /// Public because `detect()` is not the only way a caller legitimately gets
     /// here: planning for a machine you are not sitting at — "would this fit a
     /// 48 GB MacBook Pro?" — is a question the planner should answer without
     /// owning one, and it is how the memory plan is tested across configurations
     /// that no single CI box can provide.
-    public init(model: String, chip: String, memoryBytes: UInt64,
+    package init(model: String, chip: String, memoryBytes: UInt64,
                 cores: Int, isPortable: Bool) {
         self.model = model
         self.chip = chip
@@ -42,7 +42,7 @@ public struct Machine: Sendable, Equatable {
 
     // MARK: measurement
 
-    public static func detect() -> Machine {
+    package static func detect() -> Machine {
         Machine(model: sysctlString("hw.model") ?? "unknown",
                 chip: sysctlString("machdep.cpu.brand_string") ?? "unknown",
                 memoryBytes: sysctlUInt64("hw.memsize") ?? 0,
@@ -61,7 +61,7 @@ public struct Machine: Sendable, Equatable {
     ///
     /// Free plus inactive plus speculative, all of which the kernel can hand
     /// over under pressure. Wired and active pages cannot be counted on.
-    public static func availableBytes() -> UInt64 {
+    package static func availableBytes() -> UInt64 {
         var size = mach_msg_type_number_t(MemoryLayout<vm_statistics64_data_t>.size
                                           / MemoryLayout<integer_t>.size)
         var stats = vm_statistics64_data_t()
@@ -86,7 +86,8 @@ public struct Machine: Sendable, Equatable {
         guard sysctlbyname(name, nil, &len, nil, 0) == 0, len > 0 else { return nil }
         var buf = [CChar](repeating: 0, count: len)
         guard sysctlbyname(name, &buf, &len, nil, 0) == 0 else { return nil }
-        return String(cString: buf)
+        let bytes = buf.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
+        return String(decoding: bytes, as: UTF8.self)
     }
 
     static func sysctlUInt64(_ name: String) -> UInt64? {
@@ -96,7 +97,7 @@ public struct Machine: Sendable, Equatable {
         return value
     }
 
-    public var summary: String {
+    package var summary: String {
         String(format: "%@ (%@), %.0f GB unified memory, %d cores%@",
                chip, model, memoryGB, cores, isPortable ? ", portable" : "")
     }

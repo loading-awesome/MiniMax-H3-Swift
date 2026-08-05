@@ -36,7 +36,7 @@ import H3Foundation
 ///
 /// The metallib is version-coupled to the pinned mlx-swift revision in
 /// `Package.resolved`. Bump one and you replace the other.
-public enum MetalLibrary {
+package enum MetalLibrary {
 
     /// The directory holding the binary this code is compiled into.
     ///
@@ -51,7 +51,7 @@ public enum MetalLibrary {
     /// `#dsohandle` is the current image's handle, so this resolves to the same
     /// binary MLX resolves to whether that is the CLI, a test bundle, or a host
     /// application that has linked this library.
-    public static var binaryDirectory: URL? {
+    package static var binaryDirectory: URL? {
         var info = Dl_info()
         guard dladdr(#dsohandle, &info) != 0, let name = info.dli_fname else { return nil }
         return URL(fileURLWithPath: String(cString: name))
@@ -62,7 +62,7 @@ public enum MetalLibrary {
     ///
     /// Reported verbatim by `h3 doctor`: a list of places checked is worth more
     /// to somebody stuck than a summary that says "not found".
-    public static var searchPaths: [URL] {
+    package static var searchPaths: [URL] {
         var paths: [URL] = []
         if let dir = binaryDirectory {
             paths.append(dir.appendingPathComponent("mlx.metallib"))
@@ -74,7 +74,7 @@ public enum MetalLibrary {
     }
 
     /// The first path that exists, or nil.
-    public static func locate() -> URL? {
+    package static func locate() -> URL? {
         searchPaths.first { FileManager.default.fileExists(atPath: $0.path) }
     }
 
@@ -84,7 +84,7 @@ public enum MetalLibrary {
     /// Not an error — it is what the experimental tree ran on — but it means
     /// the process works only from this directory, so it is worth saying out
     /// loud rather than letting somebody discover it after they install.
-    public static func locatedOnlyViaWorkingDirectory() -> Bool {
+    package static func locatedOnlyViaWorkingDirectory() -> Bool {
         guard let found = locate() else { return false }
         return found.lastPathComponent == "default.metallib"
     }
@@ -93,7 +93,7 @@ public enum MetalLibrary {
     ///
     /// Call this ahead of any MLX work rather than letting the C++ exception
     /// surface: that one is untyped, unlocalised, and carries no path.
-    public static func preflight() throws {
+    package static func preflight() throws {
         guard locate() == nil else { return }
         let looked = searchPaths.map { "    \($0.path)" }.joined(separator: "\n")
         throw H3Error.unreadable(

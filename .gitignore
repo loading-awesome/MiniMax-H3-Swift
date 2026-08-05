@@ -5,6 +5,10 @@
 *.pth
 *.mp4
 *.wav
+# ...except the two clips the README embeds. They are the only evidence a
+# first-time reader has that any of this works, and a link to a file that is
+# not in the repository is worse than no link.
+!docs/media/*.mp4
 
 # build / env
 .build/
@@ -16,3 +20,6 @@
 .env
 *.token
 **/hf_token*
+
+# release archives
+dist/

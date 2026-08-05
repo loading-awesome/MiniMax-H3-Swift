@@ -24,18 +24,18 @@ import Foundation
 /// sequence is 95.1% video and 2.6% audio, and the audio residual was measured
 /// moving 32% more per step than the whole-sequence average. A probe averaged
 /// over everything is a video-only decision wearing a disguise.
-public struct StepCachePolicy: Sendable, Equatable {
+package struct StepCachePolicy: Sendable, Equatable {
 
-    public let threshold: Double
-    public let maxConsecutiveSkips: Int
-    public let warmupSteps: Int
-    public let cooldownSteps: Int
+    package let threshold: Double
+    package let maxConsecutiveSkips: Int
+    package let warmupSteps: Int
+    package let cooldownSteps: Int
     /// When false, the whole-sequence change alone decides — what every other
     /// published cache for this model does. Kept so the two can be compared
     /// under identical conditions rather than argued about.
-    public let perStream: Bool
+    package let perStream: Bool
 
-    public init(threshold: Double, maxConsecutiveSkips: Int = 3,
+    package init(threshold: Double, maxConsecutiveSkips: Int = 3,
                 warmupSteps: Int = 1, cooldownSteps: Int = 1,
                 perStream: Bool = true) {
         self.threshold = threshold
@@ -45,7 +45,7 @@ public struct StepCachePolicy: Sendable, Equatable {
         self.perStream = perStream
     }
 
-    public enum Decision: Sendable, Equatable {
+    package enum Decision: Sendable, Equatable {
         case runFull
         case reuse
     }
@@ -56,7 +56,7 @@ public struct StepCachePolicy: Sendable, Equatable {
     ///     layout has none.
     ///   - consecutiveSkips: how many reuses immediately preceded this step.
     ///   - haveCachedResidual: false before the first full step has been recorded.
-    public func decide(wholeSequenceChange: Double, audioChange: Double?,
+    package func decide(wholeSequenceChange: Double, audioChange: Double?,
                        step: Int, totalSteps: Int,
                        consecutiveSkips: Int, haveCachedResidual: Bool) -> Decision {
         guard haveCachedResidual else { return .runFull }

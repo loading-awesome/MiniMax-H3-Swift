@@ -14,19 +14,19 @@ import H3Foundation
 /// no fp32 DiT to fall back to, so bf16 IS the reference and matching it is the
 /// target. Keeping weights bf16 also matters for residency: fp32 would be
 /// 132 GB.
-public final class H3Weights {
-    public let url: URL
-    public let inventory: CheckpointInventory
-    public let config: H3Config
+package final class H3Weights {
+    package let url: URL
+    package let inventory: CheckpointInventory
+    package let config: H3Config
 
     private let lock = NSLock()
     private var cache: [String: MLXArray] = [:]
     private var all: [String: MLXArray]?
 
-    public enum Error: Swift.Error, CustomStringConvertible {
+    package enum Error: Swift.Error, CustomStringConvertible {
         case invalid([String])
         case missing(String)
-        public var description: String {
+        package var description: String {
             switch self {
             case .invalid(let p): "checkpoint failed validation:\n  " + p.joined(separator: "\n  ")
             case .missing(let n): "checkpoint has no tensor named \(n)"
@@ -38,7 +38,7 @@ public final class H3Weights {
     /// derived architecture disagrees with the reference — the default, because
     /// silently proceeding on a mismatched checkpoint wastes far more time than
     /// it saves.
-    public init(url: URL, strict: Bool = true) throws {
+    package init(url: URL, strict: Bool = true) throws {
         self.url = url
         let archive = try Safetensors.Archive(url: url)
         let inv = try CheckpointInventory(archive: archive,
@@ -49,7 +49,7 @@ public final class H3Weights {
     }
 
     /// Header-only view: shapes and dtypes without materialising anything.
-    public func describe(_ name: String) throws -> Safetensors.TensorInfo {
+    package func describe(_ name: String) throws -> Safetensors.TensorInfo {
         try Safetensors.Archive(url: url).info(name)
     }
 
@@ -57,12 +57,12 @@ public final class H3Weights {
     /// mmap-backed, so this is not a 62 GiB copy — but it is still the moment
     /// the process commits to the file, so it is deliberate rather than
     /// implicit in a subscript.
-    public func loadAll() throws {
+    package func loadAll() throws {
         lock.lock(); defer { lock.unlock() }
         if all == nil { all = try MLX.loadArrays(url: url) }
     }
 
-    public func tensor(_ name: String) throws -> MLXArray {
+    package func tensor(_ name: String) throws -> MLXArray {
         lock.lock(); defer { lock.unlock() }
         if let a = cache[name] { return a }
         if all == nil { all = try MLX.loadArrays(url: url) }
@@ -87,14 +87,14 @@ public final class H3Weights {
                 .reshaped([3 * heads * headDim, hidden])
     }
 
-    public subscript(name: String) -> MLXArray? { try? tensor(name) }
+    package subscript(name: String) -> MLXArray? { try? tensor(name) }
 
     /// Block-scoped accessor: `w.block(0, "attn.qkv_proj.weight")`.
-    public func block(_ index: Int, _ suffix: String) throws -> MLXArray {
+    package func block(_ index: Int, _ suffix: String) throws -> MLXArray {
         try tensor("blocks.\(index).\(suffix)")
     }
 
-    public func has(_ name: String) -> Bool {
+    package func has(_ name: String) -> Bool {
         (try? Safetensors.Archive(url: url).info(name)) != nil
     }
 }

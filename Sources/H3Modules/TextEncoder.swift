@@ -19,45 +19,45 @@ import H3Foundation
 /// The vision tower ships in the same file (27 blocks, 1152-dim) and is not
 /// ported here: it is only reachable through image prompts, which the DiT
 /// payload path does not support yet either.
-public struct TextEncoderConfig: Sendable, Equatable {
-    public var hiddenSize = 5120
-    public var numLayers = 50
-    public var numHeads = 64
+package struct TextEncoderConfig: Sendable, Equatable {
+    package var hiddenSize = 5120
+    package var numLayers = 50
+    package var numHeads = 64
     /// Grouped-query attention: 64 query heads share 8 key/value heads.
-    public var numKVHeads = 8
-    public var headDim = 128
-    public var intermediateSize = 25600
-    public var vocabSize = 151_936
-    public var rmsNormEps: Float = 1e-6
+    package var numKVHeads = 8
+    package var headDim = 128
+    package var intermediateSize = 25600
+    package var vocabSize = 151_936
+    package var rmsNormEps: Float = 1e-6
     /// 5e6, not the 1e6 of plain Qwen3 — the VL variant widens it.
-    public var ropeTheta: Float = 5_000_000.0
+    package var ropeTheta: Float = 5_000_000.0
     /// Interleaved-mRoPE band widths for t, h, w. They sum to `headDim / 2`.
-    public var ropeDims = [24, 20, 20]
-    public init() {}
+    package var ropeDims = [24, 20, 20]
+    package init() {}
 
-    public var innerDim: Int { numHeads * headDim }
-    public var kvDim: Int { numKVHeads * headDim }
+    package var innerDim: Int { numHeads * headDim }
+    package var kvDim: Int { numKVHeads * headDim }
 }
 
-public final class TextEncoder {
-    public let config: TextEncoderConfig
-    public let url: URL
+package final class TextEncoder {
+    package let config: TextEncoderConfig
+    package let url: URL
 
-    public struct Layer {
-        public let inputNorm: H3RMSNorm
-        public let postAttnNorm: H3RMSNorm
-        public let q: MLXArray, k: MLXArray, v: MLXArray, o: MLXArray
-        public let qNorm: H3RMSNorm, kNorm: H3RMSNorm
-        public let gate: MLXArray, up: MLXArray, down: MLXArray
+    package struct Layer {
+        package let inputNorm: H3RMSNorm
+        package let postAttnNorm: H3RMSNorm
+        package let q: MLXArray, k: MLXArray, v: MLXArray, o: MLXArray
+        package let qNorm: H3RMSNorm, kNorm: H3RMSNorm
+        package let gate: MLXArray, up: MLXArray, down: MLXArray
     }
 
-    public let embedTokens: MLXArray
-    public let layers: [Layer]
+    package let embedTokens: MLXArray
+    package let layers: [Layer]
 
-    public enum Error: Swift.Error, CustomStringConvertible {
+    package enum Error: Swift.Error, CustomStringConvertible {
         case missing(String)
         case unexpected(String)
-        public var description: String {
+        package var description: String {
             switch self {
             case .missing(let n): "text encoder checkpoint has no tensor named \(n)"
             case .unexpected(let m): m
@@ -73,7 +73,7 @@ public final class TextEncoder {
     ///
     /// Detected from the keys rather than assumed, and reported, because a
     /// silent wrong guess here fails as "missing tensor" fifty layers deep.
-    public static func languagePrefix(_ names: some Collection<String>) throws -> String {
+    package static func languagePrefix(_ names: some Collection<String>) throws -> String {
         let s = Set(names)
         if s.contains("model.layers.0.self_attn.q_proj.weight") { return "model." }
         if s.contains("model.language_model.layers.0.self_attn.q_proj.weight") {
@@ -84,7 +84,7 @@ public final class TextEncoder {
                               + "is this a Qwen3-VL conditioning checkpoint?")
     }
 
-    public init(url: URL, config: TextEncoderConfig = TextEncoderConfig()) throws {
+    package init(url: URL, config: TextEncoderConfig = TextEncoderConfig()) throws {
         self.url = url
         self.config = config
         let all = try MLX.loadArrays(url: url)
@@ -210,7 +210,7 @@ public final class TextEncoder {
     ///
     /// The embedding table is bf16 in the checkpoint and the stack runs fp32,
     /// so this upcasts once here rather than per layer.
-    public func embed(ids: [Int]) -> MLXArray {
+    package func embed(ids: [Int]) -> MLXArray {
         let idx = MLXArray(ids.map { Int32($0) })
         return embedTokens[idx].expandedDimensions(axis: 0).asType(.float32)
     }
@@ -219,7 +219,7 @@ public final class TextEncoder {
     ///
     /// Returns the tags alongside, because the packed layout needs a modality
     /// per text token and a pure-text prompt is not the only possible case.
-    public func encode(_ text: String, tokenizer: Qwen2Tokenizer,
+    package func encode(_ text: String, tokenizer: Qwen2Tokenizer,
                        computeDType: DType = .float32)
         -> (cond: MLXArray, ids: [Int], tags: [Int]) {
         let ids = tokenizer.encodePrompt(text)
@@ -229,10 +229,10 @@ public final class TextEncoder {
         return (cond, ids, tokenizer.textTags(count: ids.count))
     }
 
-    public struct Taps {
+    package struct Taps {
         /// Hidden state after each recorded layer index.
-        public var layers: [Int: MLXArray] = [:]
-        public init() {}
+        package var layers: [Int: MLXArray] = [:]
+        package init() {}
     }
 
     /// Runs the language stack over pre-computed token embeddings.
@@ -253,7 +253,7 @@ public final class TextEncoder {
     ///
     /// - Parameter embeds: `[1, S, hiddenSize]`
     /// - Returns: `[1, S, hiddenSize]` — the **unnormalized** layer-50 state.
-    public func callAsFunction(embeds: MLXArray,
+    package func callAsFunction(embeds: MLXArray,
                                computeDType: DType = .float32,
                                recordLayers: Set<Int> = [],
                                positionIds: MLXArray? = nil,

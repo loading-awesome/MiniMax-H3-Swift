@@ -16,16 +16,16 @@ import H3Foundation
 ///     permutation that interleaves 2x2 merge blocks. That permutation is the
 ///     reason a token's neighbours in the sequence are its neighbours in the
 ///     block, which is what the merger's reshape assumes.
-public enum VisionPreprocess {
-    public static let mean: Float = 0.5
-    public static let std: Float = 0.5
+package enum VisionPreprocess {
+    package static let mean: Float = 0.5
+    package static let std: Float = 0.5
 
     /// Target patch grid for an image, given the reference's rounding rules.
     ///
     /// The min/max pixel clamps exist in the reference and are reproduced here,
     /// but note the H3 path never approaches either: 3136 px is a 56x56 image
     /// and 12.8 Mpx is larger than anything a prompt carries.
-    public static func grid(width: Int, height: Int,
+    package static func grid(width: Int, height: Int,
                             config: VisionTowerConfig = VisionTowerConfig(),
                             minPixels: Int = 3136, maxPixels: Int = 12_845_056)
         -> (width: Int, height: Int, grid: VisionGrid) {
@@ -49,10 +49,10 @@ public enum VisionPreprocess {
     ///
     /// Resizing is the caller's job because it belongs to whatever decoded the
     /// file; this is the part that has to match the reference bit for bit.
-    public static func patches(image: MLXArray, grid: VisionGrid,
+    package static func patches(image: MLXArray, grid: VisionGrid,
                                config: VisionTowerConfig = VisionTowerConfig()) throws -> MLXArray {
-        let p = config.patchSize, m = config.spatialMergeSize
-        let tp = config.temporalPatchSize, ch = config.inChannels
+        let p = config.patchSize
+        let tp = config.temporalPatchSize
         guard image.dim(1) == grid.h * p && image.dim(2) == grid.w * p else {
             throw H3Error.mediaOffCanvas(
                 path: "presented image", size: "\(image.dim(2))x\(image.dim(1))",
@@ -78,7 +78,7 @@ public enum VisionPreprocess {
     ///
     /// `grid.t` stays 1 — the pair fills the temporal patch, it does not add a
     /// temporal grid step.
-    public static func patches(framePair: MLXArray, grid: VisionGrid,
+    package static func patches(framePair: MLXArray, grid: VisionGrid,
                                config: VisionTowerConfig = VisionTowerConfig()) throws -> MLXArray {
         let p = config.patchSize, tp = config.temporalPatchSize
         guard framePair.dim(0) == tp else {

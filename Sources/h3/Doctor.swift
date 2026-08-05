@@ -1,6 +1,9 @@
 import Foundation
 import ArgumentParser
 import MiniMaxH3
+import H3Foundation
+import H3Hardware
+import H3Catalog
 
 /// Everything the library decided at startup, and why.
 ///

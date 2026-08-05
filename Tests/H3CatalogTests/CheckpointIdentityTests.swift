@@ -6,20 +6,26 @@ import H3Foundation
 /// Identification and refusal, exercised against synthetic safetensors headers
 /// so the suite needs no 66 GB checkpoint and runs anywhere.
 ///
-/// The header format is `[u64 length][JSON][blob]`, so a valid file with no
-/// tensor bodies is a few hundred bytes — enough to test every decision this
-/// layer makes.
+/// The header format is `[u64 length][JSON][blob]`. Fixtures use sparse files:
+/// their logical payload lengths match the declared shapes while consuming no
+/// physical blocks for tensor bodies.
 @Suite("checkpoint identity")
 struct CheckpointIdentityTests {
 
-    /// Writes a header-only safetensors file. Offsets are all zero-length,
-    /// which is legal and never read because identification is header-only.
+    /// Writes a shape-valid sparse safetensors file. A zero-length range for a
+    /// non-empty shape is malformed and the production parser correctly
+    /// refuses it, even when the caller only wants identity metadata.
     static func writeHeader(metadata: [String: String],
                             tensors: [String: [Int]]) throws -> URL {
         var obj: [String: Any] = [:]
         if !metadata.isEmpty { obj["__metadata__"] = metadata }
-        for (name, shape) in tensors {
-            obj[name] = ["dtype": "BF16", "shape": shape, "data_offsets": [0, 0]]
+        var offset = 0
+        for (name, shape) in tensors.sorted(by: { $0.key < $1.key }) {
+            let elements = shape.reduce(1, *)
+            let end = offset + elements * 2
+            obj[name] = ["dtype": "BF16", "shape": shape,
+                         "data_offsets": [offset, end]]
+            offset = end
         }
         let json = try JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])
         var out = Data()
@@ -28,6 +34,9 @@ struct CheckpointIdentityTests {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("h3-test-\(UUID().uuidString).safetensors")
         try out.write(to: url)
+        let handle = try FileHandle(forWritingTo: url)
+        try handle.truncate(atOffset: UInt64(out.count + offset))
+        try handle.close()
         return url
     }
 
@@ -140,5 +149,20 @@ struct CheckpointIdentityTests {
         #expect(cfg.checkpoints.fl2va.isEmpty)
         #expect(cfg.policy.allowApproximateWeights == false)
         #expect(cfg.attention.backend == "auto")
+    }
+
+    @Test("catalog resolution never falls back to another text precision")
+    func noTextPrecisionFallback() throws {
+        let dit = try Self.writeHeader(
+            metadata: ["repo_id": "MiniMaxAI/MiniMax-H3", "partition": "FL2VA"],
+            tensors: Self.ditTensors)
+        defer { try? FileManager.default.removeItem(at: dit) }
+        let config = H3Configuration(checkpoints: .init(
+            fl2va: ["int8": dit.path],
+            textEncoder: ["bf16": "/unused/bf16.safetensors"]))
+
+        #expect(throws: H3Error.self) {
+            try Catalog(config: config).resolve(mode: .textToVideo, precision: "int8")
+        }
     }
 }

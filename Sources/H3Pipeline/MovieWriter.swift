@@ -12,12 +12,30 @@ private final class MuxCursor: @unchecked Sendable {
     var sample = 0
 }
 
-/// First error from either mux queue, whichever gets there first.
-private final class MuxErrors: @unchecked Sendable {
+/// Joins AVFoundation's two required callback queues without blocking a Swift
+/// concurrency worker. All mutable state is protected by the lock; the class is
+/// the containment boundary for the callback API's non-Sendable objects.
+private final class MuxCompletion: @unchecked Sendable {
     private let lock = NSLock()
-    private var value: String?
-    func record(_ m: String) { lock.lock(); if value == nil { value = m }; lock.unlock() }
-    var first: String? { lock.lock(); defer { lock.unlock() }; return value }
+    private var remaining: Int
+    private var firstError: String?
+    private var continuation: CheckedContinuation<String?, Never>?
+
+    init(remaining: Int, continuation: CheckedContinuation<String?, Never>) {
+        self.remaining = remaining
+        self.continuation = continuation
+    }
+
+    func finish(error: String? = nil) {
+        lock.lock()
+        if firstError == nil { firstError = error }
+        remaining -= 1
+        let result = remaining == 0 ? firstError : nil
+        let done = remaining == 0 ? continuation : nil
+        if remaining == 0 { continuation = nil }
+        lock.unlock()
+        done?.resume(returning: result)
+    }
 }
 
 /// Writing the two streams out — as one mp4, and as a side-car wav.
@@ -86,7 +104,7 @@ enum MovieWriter {
     /// - Parameter argb: `[T, H, W, 4]` uint8, alpha first.
     static func writeMovie(argb: MLXArray, waveform: [[Float]], to url: URL,
                            fps: Double, sampleRate: Int,
-                           withAudio: Bool = true) throws {
+                           withAudio: Bool = true) async throws {
         let frameCount = argb.dim(0), height = argb.dim(1), width = argb.dim(2)
         guard frameCount > 0 else {
             throw H3Error.invalidRequest(rule: "nothing to write", detail: "no frames",
@@ -168,30 +186,33 @@ enum MovieWriter {
         }
         nonisolated(unsafe) let source = mtlBuffer.contents()
 
-        let group = DispatchGroup()
         // AVFoundation's writer objects are not Sendable, but each is touched by
         // exactly one serial queue here and `finishWriting` happens after both
         // have finished. That is the contract the API documents.
         nonisolated(unsafe) let vIn = videoInput
         nonisolated(unsafe) let vAdaptor = adaptor
         nonisolated(unsafe) let wr = writer
-        let errors = MuxErrors()
         let cursor = MuxCursor()
 
-        group.enter()
-        vIn.requestMediaDataWhenReady(on: DispatchQueue(label: "h3.video.mux")) {
-            while vIn.isReadyForMoreMediaData {
-                let i = cursor.frame
-                if i >= frameCount { vIn.markAsFinished(); group.leave(); return }
+        let muxError = await withCheckedContinuation { continuation in
+            let completion = MuxCompletion(remaining: withAudio ? 2 : 1,
+                                           continuation: continuation)
+            vIn.requestMediaDataWhenReady(on: DispatchQueue(label: "h3.video.mux")) {
+                while vIn.isReadyForMoreMediaData {
+                    let i = cursor.frame
+                    if i >= frameCount {
+                        vIn.markAsFinished(); completion.finish(); return
+                    }
                 guard let pool = vAdaptor.pixelBufferPool else {
-                    errors.record("pixel buffer pool unavailable")
-                    vIn.markAsFinished(); group.leave(); return
+                    vIn.markAsFinished(); completion.finish(error: "pixel buffer pool unavailable")
+                    return
                 }
                 var pb: CVPixelBuffer?
                 guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &pb) == kCVReturnSuccess,
                       let buffer = pb else {
-                    errors.record("could not allocate a pixel buffer for frame \(i)")
-                    vIn.markAsFinished(); group.leave(); return
+                    vIn.markAsFinished()
+                    completion.finish(error: "could not allocate a pixel buffer for frame \(i)")
+                    return
                 }
                 CVPixelBufferLockBaseAddress(buffer, [])
                 if let base = CVPixelBufferGetBaseAddress(buffer) {
@@ -205,22 +226,22 @@ enum MovieWriter {
                 let pts = CMTime(value: CMTimeValue(Double(i) / fps * Double(timescale)),
                                  timescale: timescale)
                 guard vAdaptor.append(buffer, withPresentationTime: pts) else {
-                    errors.record("video append failed at frame \(i): "
-                                  + (wr.error?.localizedDescription ?? "unknown"))
-                    vIn.markAsFinished(); group.leave(); return
+                    vIn.markAsFinished()
+                    completion.finish(error: "video append failed at frame \(i): "
+                                      + (wr.error?.localizedDescription ?? "unknown"))
+                    return
                 }
                 cursor.frame = i + 1
+                }
             }
-        }
 
-        if let audioIn = audioInput, let format = audioFormat {
-            nonisolated(unsafe) let aIn = audioIn
-            let total = waveform[0].count
-            group.enter()
-            aIn.requestMediaDataWhenReady(on: DispatchQueue(label: "h3.audio.mux")) {
-                while aIn.isReadyForMoreMediaData {
+            if let audioIn = audioInput, let format = audioFormat {
+                nonisolated(unsafe) let aIn = audioIn
+                let total = waveform[0].count
+                aIn.requestMediaDataWhenReady(on: DispatchQueue(label: "h3.audio.mux")) {
+                    while aIn.isReadyForMoreMediaData {
                     let offset = cursor.sample
-                    if offset >= total { aIn.markAsFinished(); group.leave(); return }
+                    if offset >= total { aIn.markAsFinished(); completion.finish(); return }
                     let n = min(1024, total - offset)
                     var interleaved = [Float](repeating: 0, count: n * 2)
                     for j in 0 ..< n {
@@ -235,8 +256,9 @@ enum MovieWriter {
                             customBlockSource: nil, offsetToData: 0, dataLength: byteCount,
                             flags: 0, blockBufferOut: &block) == noErr, let bb = block,
                           CMBlockBufferAssureBlockMemory(bb) == noErr else {
-                        errors.record("could not allocate an audio block buffer")
-                        aIn.markAsFinished(); group.leave(); return
+                        aIn.markAsFinished()
+                        completion.finish(error: "could not allocate an audio block buffer")
+                        return
                     }
                     interleaved.withUnsafeBytes { raw in
                         _ = CMBlockBufferReplaceDataBytes(with: raw.baseAddress!, blockBuffer: bb,
@@ -256,31 +278,32 @@ enum MovieWriter {
                             sampleTimingEntryCount: 1, sampleTimingArray: &timing,
                             sampleSizeEntryCount: 1, sampleSizeArray: &sizes,
                             sampleBufferOut: &sample) == noErr, let sb = sample else {
-                        errors.record("could not build an audio sample buffer")
-                        aIn.markAsFinished(); group.leave(); return
+                        aIn.markAsFinished()
+                        completion.finish(error: "could not build an audio sample buffer")
+                        return
                     }
                     guard aIn.append(sb) else {
-                        errors.record("audio append failed at sample \(offset): "
-                                      + (wr.error?.localizedDescription ?? "unknown"))
-                        aIn.markAsFinished(); group.leave(); return
+                        aIn.markAsFinished()
+                        completion.finish(error: "audio append failed at sample \(offset): "
+                                          + (wr.error?.localizedDescription ?? "unknown"))
+                        return
                     }
                     cursor.sample = offset + n
+                    }
                 }
             }
         }
 
-        group.wait()
         // Both queues read `source` straight out of MLX's storage. ARC's last
         // use of the array and its Metal wrapper is the `contents()` call above,
         // so without this it is free to release them — and free the storage —
         // while a queue is still copying.
         withExtendedLifetime(contiguous) { withExtendedLifetime(mtlBuffer) {} }
-        if let e = errors.first { throw fail(e) }
+        if let muxError { throw fail(muxError) }
 
-        let done = DispatchGroup()
-        done.enter()
-        writer.finishWriting { done.leave() }
-        done.wait()
+        await withCheckedContinuation { continuation in
+            writer.finishWriting { continuation.resume() }
+        }
         guard writer.status == .completed else {
             throw fail("writing ended in status \(writer.status.rawValue): "
                        + (writer.error?.localizedDescription ?? "unknown"))

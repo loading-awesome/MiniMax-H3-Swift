@@ -22,6 +22,14 @@ private final class FlagBox: @unchecked Sendable {
     var done = false
 }
 
+/// `AVAudioConverter` marks its synchronous pull callback `@Sendable` even
+/// though the buffer is consumed before `convert` returns. This immutable box
+/// documents and contains that imported-framework mismatch.
+private final class AudioBufferBox: @unchecked Sendable {
+    let value: AVAudioPCMBuffer
+    init(_ value: AVAudioPCMBuffer) { self.value = value }
+}
+
 enum MediaLoad {
     enum Error: Swift.Error, CustomStringConvertible {
         case unreadable(String, String)
@@ -101,48 +109,6 @@ enum MediaLoad {
             .expandedDimensions(axis: 0)                    // [1, H, W, 3]
     }
 
-    /// `AVAsset`'s loaders are async and these call sites are not. A box
-    /// crossing the boundary satisfies the compiler's concurrency checking
-    /// without making every caller async for three property reads.
-    private final class LoadBox<T>: @unchecked Sendable {
-        var value: T?
-        var error: Swift.Error?
-    }
-
-    private static func blocking<T>(_ body: @escaping @Sendable () async throws -> T) throws -> T {
-        let box = LoadBox<T>()
-        let sem = DispatchSemaphore(value: 0)
-        Task { [box] in
-            do { box.value = try await body() } catch { box.error = error }
-            sem.signal()
-        }
-        sem.wait()
-        if let e = box.error { throw e }
-        return box.value!
-    }
-
-    /// `AVAssetTrack` is not `Sendable`, so it cannot be captured directly by
-    /// the `@Sendable` closure above even though the closure runs to completion
-    /// before this thread resumes.
-    private final class TrackBox: @unchecked Sendable {
-        let track: AVAssetTrack
-        init(_ t: AVAssetTrack) { self.track = t }
-    }
-
-    private static func videoTrack(_ asset: AVURLAsset) throws -> AVAssetTrack? {
-        try blocking { try await asset.loadTracks(withMediaType: .video).first }
-    }
-
-    private static func loadNaturalSize(_ track: AVAssetTrack) throws -> CGSize {
-        let b = TrackBox(track)
-        return try blocking { try await b.track.load(.naturalSize) }
-    }
-
-    private static func loadFrameRate(_ track: AVAssetTrack) throws -> Double {
-        let b = TrackBox(track)
-        return Double(try blocking { try await b.track.load(.nominalFrameRate) })
-    }
-
     /// Video file -> `([T, H, W, 3]` in **[0, 1]**, nominal fps)` at the file's
     /// own resolution and frame rate.
     ///
@@ -162,13 +128,13 @@ enum MediaLoad {
     ///  * Qwen's 2 fps sampling is `range(0, n, FPS // 2)` with a hardcoded
     ///    `FPS = 24`. Frames are taken by index, so a 30 fps file would be
     ///    stamped `<0.5 seconds>` for something 0.4 s in.
-    static func videoHWC(at path: String, maxFrames: Int? = nil) throws
+    static func videoHWC(at path: String, maxFrames: Int? = nil) async throws
         -> (frames: MLXArray, fps: Double) {
         let asset = AVURLAsset(url: URL(fileURLWithPath: path))
-        guard let track = try videoTrack(asset) else {
+        guard let track = try await asset.loadTracks(withMediaType: .video).first else {
             throw Error.noTrack(path, "video")
         }
-        let size = try loadNaturalSize(track)
+        let size = try await track.load(.naturalSize)
         let w = Int(size.width.rounded()), h = Int(size.height.rounded())
         guard w % 32 == 0 && h % 32 == 0 else {
             throw Error.unreadable(path, "\(w)x\(h) is not a multiple of 32 on both axes. "
@@ -209,7 +175,8 @@ enum MediaLoad {
             count += 1
         }
         guard count > 0 else { throw Error.unreadable(path, "decoded no frames") }
-        return (MLXArray(planes, [count, h, w, 3]), try loadFrameRate(track))
+        return (MLXArray(planes, [count, h, w, 3]),
+                Double(try await track.load(.nominalFrameRate)))
     }
 
     /// Audio file -> `[1, 2, L]` in [-1, 1], resampled to 32 kHz stereo.
@@ -252,11 +219,12 @@ enum MediaLoad {
         catch { throw Error.unreadable(path, error.localizedDescription) }
 
         let fed = FlagBox()
+        let sourceBuffer = AudioBufferBox(whole)
         let status = converter.convert(to: out, error: nil) { _, outStatus in
             if fed.done { outStatus.pointee = .endOfStream; return nil }
             fed.done = true
             outStatus.pointee = .haveData
-            return whole
+            return sourceBuffer.value
         }
         guard status != .error, out.frameLength > 0, let data = out.floatChannelData else {
             throw Error.unreadable(path, "conversion produced no samples")

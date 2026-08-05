@@ -10,21 +10,21 @@ import H3Foundation
 /// with our assumptions is caught before a single tensor is multiplied — and a
 /// mis-detected checkpoint (wrong partition, wrong quant, truncated download)
 /// surfaces as a named mismatch rather than as garbage output.
-public struct CheckpointInventory: Sendable {
-    public let tensorCount: Int
-    public let dtypes: [String: Int]
-    public let totalBytes: Int
-    public let derived: H3Config
-    public let blockCount: Int
-    public let refinerBlockCount: Int
-    public let partition: Partition
-    public let problems: [String]
+package struct CheckpointInventory: Sendable {
+    package let tensorCount: Int
+    package let dtypes: [String: Int]
+    package let totalBytes: Int
+    package let derived: H3Config
+    package let blockCount: Int
+    package let refinerBlockCount: Int
+    package let partition: Partition
+    package let problems: [String]
 
     /// FL2VA serves text-to-video and first/last-frame; Ref2VA is
     /// reference-to-video. Same architecture, different weights — the file name
     /// is the only external hint, so we record what was claimed and let the
     /// caller cross-check.
-    public enum Partition: String, Sendable { case fl2va, ref2va, unknown }
+    package enum Partition: String, Sendable { case fl2va, ref2va, unknown }
 
     /// Which conversion produced this file. **This is not cosmetic**: the two
     /// bf16 conversions store the fused `attn.qkv_proj.weight` in DIFFERENT
@@ -38,31 +38,31 @@ public struct CheckpointInventory: Sendable {
     /// dtype or statistics check will NOT catch it. Detected by metadata:
     /// Comfy-Org writes only `config`; DeepBeepMeep writes `repo_id`,
     /// `partition`, `precision`, `source_revision`.
-    public enum Vendor: String, Sendable {
+    package enum Vendor: String, Sendable {
         case comfyOrg, deepBeepMeep, unknown
 
         /// Does `attn.qkv_proj.weight` need permuting into Comfy-Org order?
-        public var needsQKVPermute: Bool { self == .deepBeepMeep }
+        package var needsQKVPermute: Bool { self == .deepBeepMeep }
 
-        public static func detect(metadata: [String: String]) -> Vendor {
+        package static func detect(metadata: [String: String]) -> Vendor {
             if metadata["repo_id"] != nil || metadata["partition"] != nil { return .deepBeepMeep }
             if metadata["config"] != nil { return .comfyOrg }
             return .unknown
         }
     }
 
-    public var vendor: Vendor = .unknown
+    package var vendor: Vendor = .unknown
 
-    public var isValid: Bool { problems.isEmpty }
+    package var isValid: Bool { problems.isEmpty }
 
     /// H3 is identified exactly as ComfyUI identifies it: the presence of both
     /// patch projections. This is the cheapest possible "is this even H3".
-    public static func looksLikeH3(_ names: some Collection<String>) -> Bool {
+    package static func looksLikeH3(_ names: some Collection<String>) -> Bool {
         let s = Set(names)
         return s.contains("video_patch_proj.weight") && s.contains("audio_patch_proj.weight")
     }
 
-    public init(archive: Safetensors.Archive, claimedName: String = "") throws {
+    package init(archive: Safetensors.Archive, claimedName: String = "") throws {
         let t = archive.tensors
         var problems: [String] = []
 
@@ -160,7 +160,7 @@ public struct CheckpointInventory: Sendable {
     /// Every tensor the model will ask for, derived from the config. Anything
     /// the checkpoint is missing is a load failure waiting to happen; anything
     /// extra usually means a different variant than intended.
-    public func expectedTensorNames() -> Set<String> {
+    package func expectedTensorNames() -> Set<String> {
         var s: Set<String> = [
             "video_patch_proj.weight", "video_patch_proj.bias",
             "audio_patch_proj.weight", "audio_patch_proj.bias",
@@ -196,14 +196,14 @@ public struct CheckpointInventory: Sendable {
         return s
     }
 
-    public func coverage(archive: Safetensors.Archive) -> (missing: [String], extra: [String]) {
+    package func coverage(archive: Safetensors.Archive) -> (missing: [String], extra: [String]) {
         let have = Set(archive.tensors.keys)
         let want = expectedTensorNames()
         return (missing: want.subtracting(have).sorted(),
                 extra: have.subtracting(want).sorted())
     }
 
-    public var summary: String {
+    package var summary: String {
         let gb = Double(totalBytes) / 1e9
         let d = dtypes.map { "\($0.key)x\($0.value)" }.sorted().joined(separator: " ")
         return """

@@ -18,6 +18,29 @@ import H3Recipes
 /// can switch on.
 public struct RenderRequest: Sendable {
 
+    /// Named, auditable numerical behavior. The default is the configuration
+    /// whose implementation parity was measured; faster profiles are explicit
+    /// approximations and are recorded in every render receipt.
+    public enum QualityProfile: String, Codable, Sendable, CaseIterable {
+        case faithful
+        case balanced
+        case fast
+        case custom
+
+        public var cacheThreshold: Double {
+            switch self {
+            case .faithful: 0
+            case .balanced: 0.10
+            case .fast: 0.15
+            case .custom: 0
+            }
+        }
+
+        public var isApproximate: Bool {
+            self == .balanced || self == .fast
+        }
+    }
+
     // MARK: what to render
 
     public var prompt: String
@@ -60,13 +83,14 @@ public struct RenderRequest: Sendable {
     // MARK: numerics
 
     public var cfgScale: Double
+    public var qualityProfile: QualityProfile
     /// Cross-step residual reuse. 0 disables it and renders faithfully.
     ///
     /// 0.10 is the measured knee, swept at 864x480x124x20 against an uncached
     /// control of the same prompt and seed: 1.93x faster for 16% less
     /// high-frequency detail. 0.15 buys 2.60x and costs 28%; 0.25 buys 2.93x and
-    /// costs 44%. The trade turns bad quickly, which is why the default sits at
-    /// the knee and not past it.
+    /// costs 44%. Faithful output is the default; selecting this optimization
+    /// is an explicit quality decision.
     public var cacheThreshold: Double
     public var cacheMaxSkips: Int
     /// Probe the whole packed sequence rather than per stream — what every other
@@ -87,6 +111,9 @@ public struct RenderRequest: Sendable {
     /// its own author, and cost an evening chasing a decoder bug that did not
     /// exist.
     public var allowSuboptimal: Bool
+
+    /// Existing final artifacts are protected unless replacement is explicit.
+    public var overwriteOutput: Bool
 
     // MARK: output
 
@@ -112,12 +139,14 @@ public struct RenderRequest: Sendable {
                 referenceVideoSoundtracks: [URL?] = [],
                 referenceAudio: [URL] = [],
                 cfgScale: Double = 1.0,
-                cacheThreshold: Double = 0.10,
+                qualityProfile: QualityProfile = .faithful,
+                cacheThreshold: Double? = nil,
                 cacheMaxSkips: Int = 3,
                 cacheWholeSequenceProbe: Bool = false,
                 conditioningNoise: URL? = nil,
                 attentionBackend: String = "auto",
-                allowSuboptimal: Bool = false) {
+                allowSuboptimal: Bool = false,
+                overwriteOutput: Bool = false) {
         self.prompt = prompt
         self.videoOutput = videoOutput
         self.audioOutput = audioOutput
@@ -137,12 +166,14 @@ public struct RenderRequest: Sendable {
         self.referenceVideoSoundtracks = referenceVideoSoundtracks
         self.referenceAudio = referenceAudio
         self.cfgScale = cfgScale
-        self.cacheThreshold = cacheThreshold
+        self.qualityProfile = cacheThreshold == nil ? qualityProfile : .custom
+        self.cacheThreshold = cacheThreshold ?? qualityProfile.cacheThreshold
         self.cacheMaxSkips = cacheMaxSkips
         self.cacheWholeSequenceProbe = cacheWholeSequenceProbe
         self.conditioningNoise = conditioningNoise
         self.attentionBackend = attentionBackend
         self.allowSuboptimal = allowSuboptimal
+        self.overwriteOutput = overwriteOutput
     }
 
     // MARK: derived
@@ -188,6 +219,8 @@ public struct RenderRequest: Sendable {
         return "text to video and audio"
     }
 
+    public var usesApproximateSampling: Bool { cacheThreshold > 0 }
+
     /// Pixel dimensions, from whichever source was given.
     public func dimensions() throws -> (width: Int, height: Int) {
         if let id = recipe {
@@ -217,11 +250,11 @@ public struct RenderRequest: Sendable {
     /// and a `video_audio` block puts its audio rows *ahead* of its video rows
     /// inside the block. So a paired soundtrack is consumed before any
     /// standalone clip, whatever order the caller supplied them in.
-    public var orderedAudio: [URL] {
+    package var orderedAudio: [URL] {
         (0 ..< referenceVideos.count).compactMap { soundtrack(for: $0) } + referenceAudio
     }
 
-    public func soundtrack(for videoIndex: Int) -> URL? {
+    package func soundtrack(for videoIndex: Int) -> URL? {
         guard videoIndex < referenceVideoSoundtracks.count else { return nil }
         return referenceVideoSoundtracks[videoIndex]
     }
@@ -321,7 +354,7 @@ public struct RenderRequest: Sendable {
     ///
     /// Separate from `validate()` because it is advisory when `allowSuboptimal`
     /// is set, and because it needs the geometry.
-    public func policyViolations(geometry: LatentGeometry) -> [PolicyViolation] {
+    package func policyViolations(geometry: LatentGeometry) -> [PolicyViolation] {
         let (w, h) = (try? dimensions()) ?? (0, 0)
         return H3RenderPolicy.check(width: w, height: h, frameCount: geometry.frameCount,
                                     steps: steps,

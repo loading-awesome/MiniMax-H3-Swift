@@ -3,20 +3,20 @@ import MLX
 import MLXNN
 import H3Foundation
 
-public func snake(_ x: MLXArray, alpha: MLXArray, beta: MLXArray) -> MLXArray {
+package func snake(_ x: MLXArray, alpha: MLXArray, beta: MLXArray) -> MLXArray {
     let t = sin(alpha * x)
     return (t * t) / (beta + 1e-9) + x
 }
 
-public struct VaeConv1d {
-    public let weight: MLXArray
-    public let bias: MLXArray?
-    public let stride: Int
-    public let padding: Int
-    public let dilation: Int
-    public let groups: Int
+package struct VaeConv1d {
+    package let weight: MLXArray
+    package let bias: MLXArray?
+    package let stride: Int
+    package let padding: Int
+    package let dilation: Int
+    package let groups: Int
     
-    public init(weight: MLXArray, bias: MLXArray? = nil, stride: Int = 1, padding: Int = 0, dilation: Int = 1, groups: Int = 1) {
+    package init(weight: MLXArray, bias: MLXArray? = nil, stride: Int = 1, padding: Int = 0, dilation: Int = 1, groups: Int = 1) {
         self.weight = weight
         self.bias = bias
         self.stride = stride
@@ -25,7 +25,7 @@ public struct VaeConv1d {
         self.groups = groups
     }
     
-    public func callAsFunction(_ x: MLXArray) -> MLXArray {
+    package func callAsFunction(_ x: MLXArray) -> MLXArray {
         var out = conv1d(x, weight, stride: stride, padding: padding, dilation: dilation, groups: groups)
         if let bias {
             out = out + bias.reshaped([1, 1, bias.dim(0)])
@@ -34,15 +34,15 @@ public struct VaeConv1d {
     }
 }
 
-public struct VaeConvTransposed1d {
-    public let weight: MLXArray
-    public let bias: MLXArray?
-    public let stride: Int
-    public let padding: Int
-    public let dilation: Int
-    public let groups: Int
+package struct VaeConvTransposed1d {
+    package let weight: MLXArray
+    package let bias: MLXArray?
+    package let stride: Int
+    package let padding: Int
+    package let dilation: Int
+    package let groups: Int
     
-    public init(weight: MLXArray, bias: MLXArray? = nil, stride: Int = 1, padding: Int = 0, dilation: Int = 1, groups: Int = 1) {
+    package init(weight: MLXArray, bias: MLXArray? = nil, stride: Int = 1, padding: Int = 0, dilation: Int = 1, groups: Int = 1) {
         self.weight = weight
         self.bias = bias
         self.stride = stride
@@ -51,7 +51,7 @@ public struct VaeConvTransposed1d {
         self.groups = groups
     }
     
-    public func callAsFunction(_ x: MLXArray) -> MLXArray {
+    package func callAsFunction(_ x: MLXArray) -> MLXArray {
         var out = convTransposed1d(x, weight, stride: stride, padding: padding, dilation: dilation, groups: groups)
         if let bias {
             out = out + bias.reshaped([1, 1, bias.dim(0)])
@@ -60,32 +60,32 @@ public struct VaeConvTransposed1d {
     }
 }
 
-public class SnakeBeta: Module {
-    public let alpha: MLXArray
-    public let beta: MLXArray
+package class SnakeBeta: Module {
+    package let alpha: MLXArray
+    package let beta: MLXArray
 
-    public init(alpha: MLXArray, beta: MLXArray) {
+    package init(alpha: MLXArray, beta: MLXArray) {
         self.alpha = alpha
         self.beta = beta
         super.init()
     }
 
-    public func callAsFunction(_ x: MLXArray) -> MLXArray {
+    package func callAsFunction(_ x: MLXArray) -> MLXArray {
         let a = exp(alpha).reshaped([1, 1, alpha.dim(0)])
         let b = exp(beta).reshaped([1, 1, beta.dim(0)])
         return snake(x, alpha: a, beta: b)
     }
 }
 
-public class UpSample1d: Module {
-    public let ratio: Int
-    public let stride: Int
-    public let pad: Int
-    public let padLeft: Int
-    public let padRight: Int
-    public let filter: MLXArray
+package class UpSample1d: Module {
+    package let ratio: Int
+    package let stride: Int
+    package let pad: Int
+    package let padLeft: Int
+    package let padRight: Int
+    package let filter: MLXArray
 
-    public init(ratio: Int = 2, kernelSize: Int = 12, filter: MLXArray) {
+    package init(ratio: Int = 2, kernelSize: Int = 12, filter: MLXArray) {
         self.ratio = ratio
         self.stride = ratio
         self.pad = kernelSize / ratio - 1
@@ -95,7 +95,7 @@ public class UpSample1d: Module {
         super.init()
     }
 
-    public func callAsFunction(_ x: MLXArray) -> MLXArray {
+    package func callAsFunction(_ x: MLXArray) -> MLXArray {
         let padWidths: [IntOrPair] = [
             0,
             [pad, pad],
@@ -116,13 +116,13 @@ public class UpSample1d: Module {
     }
 }
 
-public class LowPassFilter1d: Module {
-    public let padLeft: Int
-    public let padRight: Int
-    public let stride: Int
-    public let filter: MLXArray
+package class LowPassFilter1d: Module {
+    package let padLeft: Int
+    package let padRight: Int
+    package let stride: Int
+    package let filter: MLXArray
 
-    public init(cutoff: Float = 0.5, halfWidth: Float = 0.6, stride: Int = 1, kernelSize: Int = 12, filter: MLXArray) {
+    package init(cutoff: Float = 0.5, halfWidth: Float = 0.6, stride: Int = 1, kernelSize: Int = 12, filter: MLXArray) {
         self.padLeft = kernelSize / 2 - (kernelSize % 2 == 0 ? 1 : 0)
         self.padRight = kernelSize / 2
         self.stride = stride
@@ -130,7 +130,7 @@ public class LowPassFilter1d: Module {
         super.init()
     }
 
-    public func callAsFunction(_ x: MLXArray) -> MLXArray {
+    package func callAsFunction(_ x: MLXArray) -> MLXArray {
         let padWidths: [IntOrPair] = [
             0,
             [padLeft, padRight],
@@ -145,44 +145,44 @@ public class LowPassFilter1d: Module {
     }
 }
 
-public class DownSample1d: Module {
-    public let lowpass: LowPassFilter1d
+package class DownSample1d: Module {
+    package let lowpass: LowPassFilter1d
 
-    public init(ratio: Int = 2, kernelSize: Int = 12, filter: MLXArray) {
+    package init(ratio: Int = 2, kernelSize: Int = 12, filter: MLXArray) {
         self.lowpass = LowPassFilter1d(stride: ratio, kernelSize: kernelSize, filter: filter)
         super.init()
     }
 
-    public func callAsFunction(_ x: MLXArray) -> MLXArray {
+    package func callAsFunction(_ x: MLXArray) -> MLXArray {
         return lowpass(x)
     }
 }
 
-public class Activation1d: Module {
-    public let act: SnakeBeta
-    public let upsample: UpSample1d
-    public let downsample: DownSample1d
+package class Activation1d: Module {
+    package let act: SnakeBeta
+    package let upsample: UpSample1d
+    package let downsample: DownSample1d
 
-    public init(activation: SnakeBeta, upFilter: MLXArray, downFilter: MLXArray) {
+    package init(activation: SnakeBeta, upFilter: MLXArray, downFilter: MLXArray) {
         self.act = activation
         self.upsample = UpSample1d(ratio: 2, kernelSize: 12, filter: upFilter)
         self.downsample = DownSample1d(ratio: 2, kernelSize: 12, filter: downFilter)
         super.init()
     }
 
-    public func callAsFunction(_ x: MLXArray) -> MLXArray {
+    package func callAsFunction(_ x: MLXArray) -> MLXArray {
         var h = upsample(x)
         h = act(h)
         return downsample(h)
     }
 }
 
-public class AMPBlock1: Module {
-    public let convs1: [VaeConv1d]
-    public let convs2: [VaeConv1d]
-    public let activations: [Activation1d]
+package class AMPBlock1: Module {
+    package let convs1: [VaeConv1d]
+    package let convs2: [VaeConv1d]
+    package let activations: [Activation1d]
 
-    public init(channels: Int, kernelSize: Int, dilation: [Int],
+    package init(channels: Int, kernelSize: Int, dilation: [Int],
                 convs1Weights: [MLXArray], convs1Biases: [MLXArray],
                 convs2Weights: [MLXArray], convs2Biases: [MLXArray],
                 alphas: [MLXArray], betas: [MLXArray],
@@ -218,7 +218,7 @@ public class AMPBlock1: Module {
         super.init()
     }
 
-    public func callAsFunction(_ x: MLXArray) -> MLXArray {
+    package func callAsFunction(_ x: MLXArray) -> MLXArray {
         var x = x
         for i in 0 ..< convs1.count {
             let a1 = activations[2 * i]
@@ -236,16 +236,16 @@ public class AMPBlock1: Module {
     }
 }
 
-public class BigVGAN: Module {
-    public let convPre: VaeConv1d
-    public let ups: [VaeConvTransposed1d]
-    public let resblocks: [AMPBlock1]
-    public let activationPost: Activation1d
-    public let convPost: VaeConv1d
-    public let numKernels: Int
-    public let numUpsamples: Int
+package class BigVGAN: Module {
+    package let convPre: VaeConv1d
+    package let ups: [VaeConvTransposed1d]
+    package let resblocks: [AMPBlock1]
+    package let activationPost: Activation1d
+    package let convPost: VaeConv1d
+    package let numKernels: Int
+    package let numUpsamples: Int
 
-    public init(numMels: Int, upsampleInitialChannel: Int,
+    package init(numMels: Int, upsampleInitialChannel: Int,
                 upsampleRates: [Int] = [5, 5, 2, 2, 2, 2, 2],
                 upsampleKernelSizes: [Int] = [9, 9, 4, 4, 4, 4, 4],
                 resblockKernelSizes: [Int] = [3, 7, 11],
@@ -338,7 +338,7 @@ public class BigVGAN: Module {
         super.init()
     }
 
-    public func callAsFunction(_ x: MLXArray) -> MLXArray {
+    package func callAsFunction(_ x: MLXArray) -> MLXArray {
         var x = convPre(x)
         for i in 0 ..< numUpsamples {
             x = ups[i](x)
@@ -360,14 +360,14 @@ public class BigVGAN: Module {
     }
 }
 
-public final class MiniMaxH3AudioVAE {
-    public let url: URL
-    public let latentsMean: MLXArray
-    public let latentsStd: MLXArray
-    public let decInProj: VaeConv1d
-    public let decoder: BigVGAN
+package final class MiniMaxH3AudioVAE {
+    package let url: URL
+    package let latentsMean: MLXArray
+    package let latentsStd: MLXArray
+    package let decInProj: VaeConv1d
+    package let decoder: BigVGAN
 
-    public init(url: URL) throws {
+    package init(url: URL) throws {
         self.url = url
         let w = try MLX.loadArrays(url: url)
         
@@ -388,7 +388,7 @@ public final class MiniMaxH3AudioVAE {
         self.decoder = try BigVGAN(numMels: 2048, upsampleInitialChannel: 1024, weights: w)
     }
 
-    public func decode(_ z: MLXArray) -> MLXArray {
+    package func decode(_ z: MLXArray) -> MLXArray {
         let b = z.dim(0)
         let c = z.dim(1)
         let s = z.dim(2)

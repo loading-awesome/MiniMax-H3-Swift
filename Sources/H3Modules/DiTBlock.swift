@@ -11,13 +11,13 @@ import H3Attention
 /// tensors of `[M * modalities, hidden]`. The reshape interleaves modalities
 /// **within** each timestep, which is what makes the row index
 /// `timestepRow * modalities + modalityTag`.
-public struct AdalnProj {
-    public let weight: MLXArray      // [expand * hidden * modalities, tDim]
-    public let bias: MLXArray?
-    public let expand: Int
-    public let modalities: Int
-    public let hidden: Int
-    public let applySiLU: Bool
+package struct AdalnProj {
+    package let weight: MLXArray      // [expand * hidden * modalities, tDim]
+    package let bias: MLXArray?
+    package let expand: Int
+    package let modalities: Int
+    package let hidden: Int
+    package let applySiLU: Bool
     /// Compute the projection in fp32 and round the result back to the weight's
     /// dtype.
     ///
@@ -31,16 +31,16 @@ public struct AdalnProj {
     /// The cost is real but small: AdaLN weights are 26 of the checkpoint's
     /// 66 GB, so upcasting per call adds roughly 50 GB of transient traffic per
     /// forward — about 0.2% of a 61 s production pass. Measured, not assumed.
-    public let computeFP32: Bool
+    package let computeFP32: Bool
     /// Optional persistent fp32 copy for a render that has enough unified
     /// memory to trade ~48 GiB of stable residency for avoiding the repeated
     /// bf16-to-fp32 conversion of the 50 block AdaLN matrices.
     ///
     /// This is opt-in: capacity is workload-dependent, and the bf16 source
     /// remains the canonical checkpoint representation.
-    public let residentFP32Weight: MLXArray?
+    package let residentFP32Weight: MLXArray?
 
-    public init(weight: MLXArray, bias: MLXArray?, expand: Int, modalities: Int,
+    package init(weight: MLXArray, bias: MLXArray?, expand: Int, modalities: Int,
                 hidden: Int, applySiLU: Bool = true, computeFP32: Bool = true,
                 keepFP32Resident: Bool = false) {
         self.weight = weight
@@ -55,7 +55,7 @@ public struct AdalnProj {
 
     /// Returns `expand` tensors of `[M * modalities, hidden]`, in the weight's
     /// dtype whatever the internal precision.
-    public func callAsFunction(_ tEmb: MLXArray) -> [MLXArray] {
+    package func callAsFunction(_ tEmb: MLXArray) -> [MLXArray] {
         let out = weight.dtype
         let dt: DType = computeFP32 ? .float32 : out
         let input = applySiLU ? silu(tEmb.asType(dt)) : tEmb.asType(dt)
@@ -75,9 +75,9 @@ public struct AdalnProj {
 /// that looks structured but is wrong.
 ///
 /// Only the first `rot` channels rotate; the tail passes through untouched.
-public enum SplitHalfRoPE {
+package enum SplitHalfRoPE {
     /// `x` is `[S, heads, headDim]` or `[B, S, heads, headDim]`; `table` is the reference's rotation table.
-    public static func apply(_ x: MLXArray, table: MLXArray) -> MLXArray {
+    package static func apply(_ x: MLXArray, table: MLXArray) -> MLXArray {
         let half = table.dim(-3)
         let rot = half * 2
         let headDim = x.dim(-1)
@@ -110,25 +110,25 @@ public enum SplitHalfRoPE {
 /// Named `AttentionLayer` rather than `H3Attention` because `H3Attention` is the
 /// module that owns the backend protocol, and a type that shadows its own
 /// module's name reads as a mistake even when it compiles.
-public struct AttentionLayer {
-    public let qkvWeight: MLXArray     // [3 * inner, hidden], no bias
-    public let outWeight: MLXArray     // [hidden, inner], no bias
-    public let qNorm: H3RMSNorm
-    public let kNorm: H3RMSNorm
-    public let heads: Int
-    public let headDim: Int
+package struct AttentionLayer {
+    package let qkvWeight: MLXArray     // [3 * inner, hidden], no bias
+    package let outWeight: MLXArray     // [hidden, inner], no bias
+    package let qNorm: H3RMSNorm
+    package let kNorm: H3RMSNorm
+    package let heads: Int
+    package let headDim: Int
     /// Run the attention op itself in fp32 while the rest of the block stays
     /// bf16. Diagnostic: it isolates whether a deviation comes from the
     /// attention kernel's accumulation or from everything else.
-    public let fp32Attention: Bool
+    package let fp32Attention: Bool
     /// Resolved once at model build and held, rather than looked up per call.
     ///
     /// Defaults to dense, so every existing caller — the oracles, the refiner,
     /// anything that does not supply an `AttentionContext` — keeps the numerics
     /// the 225 parity taps were measured on.
-    public let backend: any H3AttentionBackend
+    package let backend: any H3AttentionBackend
 
-    public init(qkvWeight: MLXArray, outWeight: MLXArray,
+    package init(qkvWeight: MLXArray, outWeight: MLXArray,
                 qNormWeight: MLXArray, kNormWeight: MLXArray,
                 heads: Int, headDim: Int, eps: Float, fp32Attention: Bool = false,
                 backend: any H3AttentionBackend = SDPABackend()) {
@@ -153,12 +153,12 @@ public struct AttentionLayer {
     ///
     /// This is three floats per call against 226 MB of tensors, so it answers
     /// the question locally rather than shipping q/k/v to a rented GPU.
-    public final class ProxyProbe: @unchecked Sendable {
-        public var enabled = false
-        public var samples: [(skew: Double, kurt: Double, tail1: Double, tail2: Double)] = []
-        public init() {}
+    package final class ProxyProbe: @unchecked Sendable {
+        package var enabled = false
+        package var samples: [(skew: Double, kurt: Double, tail1: Double, tail2: Double)] = []
+        package init() {}
     }
-    public static let proxyProbe = ProxyProbe()
+    package static let proxyProbe = ProxyProbe()
 
     /// Writes real attention inputs to disk, for characterising a sparse kernel
     /// against the distribution it will actually meet.
@@ -172,14 +172,14 @@ public struct AttentionLayer {
     ///
     /// Captured by global call ordinal, `step * numLayers + block`, because
     /// `sdpa` is static and does not know which block invoked it.
-    public final class QKVCapture: @unchecked Sendable {
-        public var directory: String?
-        public var wantedOrdinals: Set<Int> = []
-        public var ordinal = 0
-        public var written: [String] = []
-        public init() {}
+    package final class QKVCapture: @unchecked Sendable {
+        package var directory: String?
+        package var wantedOrdinals: Set<Int> = []
+        package var ordinal = 0
+        package var written: [String] = []
+        package init() {}
     }
-    public static let qkvCapture = QKVCapture()
+    package static let qkvCapture = QKVCapture()
 
     static func maybeCapture(_ qh: MLXArray, _ kh: MLXArray, _ vh: MLXArray) {
         let n = qkvCapture.ordinal
@@ -235,7 +235,7 @@ public struct AttentionLayer {
     ///
     /// With `backend` and `context` omitted this is bit-for-bit what it was
     /// before the seam existed.
-    public static func sdpa(q: MLXArray, k: MLXArray, v: MLXArray,
+    package static func sdpa(q: MLXArray, k: MLXArray, v: MLXArray,
                             headDim: Int, fp32: Bool = false,
                             backend: (any H3AttentionBackend)? = nil,
                             context: AttentionContext? = nil) -> MLXArray {
@@ -278,7 +278,7 @@ public struct AttentionLayer {
     ///   a sparse backend that does not know which block it is in, or how far
     ///   through the schedule, cannot honour its own dense warm-up or its
     ///   first/last-block exclusions, and guessing is worse than declining.
-    public func callAsFunction(_ x: MLXArray, ropeTable: MLXArray?,
+    package func callAsFunction(_ x: MLXArray, ropeTable: MLXArray?,
                                context: AttentionContext? = nil) -> MLXArray {
         let qkv = matmul(x, qkvWeight.T)
         let qkvParts = qkv.split(parts: 3, axis: -1)
@@ -309,16 +309,16 @@ public struct AttentionLayer {
 /// `gate, up = chunk(2, dim: -1)` — **gate is the FIRST half**
 /// (`_swiglu_eager` in `comfy/ops.py`). Swapping them is a coin flip a port
 /// loses half the time, and the output stays plausible.
-public struct H3MLP {
-    public let fc1: MLXArray   // [2 * ffn, hidden]
-    public let fc2: MLXArray   // [hidden, ffn]
+package struct H3MLP {
+    package let fc1: MLXArray   // [2 * ffn, hidden]
+    package let fc2: MLXArray   // [hidden, ffn]
 
-    public init(fc1: MLXArray, fc2: MLXArray) {
+    package init(fc1: MLXArray, fc2: MLXArray) {
         self.fc1 = fc1
         self.fc2 = fc2
     }
 
-    public func callAsFunction(_ x: MLXArray) -> MLXArray {
+    package func callAsFunction(_ x: MLXArray) -> MLXArray {
         let h = matmul(x, fc1.T)
         let parts = h.split(parts: 2, axis: -1)
         let gate = parts[0]
@@ -338,14 +338,14 @@ public struct H3MLP {
 /// The reference mutates `x` in place and returns the same object. We return a
 /// new array — functionally identical, and MLX has no in-place residual to
 /// preserve.
-public struct DiTBlock {
-    public let norm1: H3RMSNorm
-    public let norm2: H3RMSNorm
-    public let attn: AttentionLayer
-    public let mlp: H3MLP
-    public let adaln: AdalnProj
+package struct DiTBlock {
+    package let norm1: H3RMSNorm
+    package let norm2: H3RMSNorm
+    package let attn: AttentionLayer
+    package let mlp: H3MLP
+    package let adaln: AdalnProj
 
-    public init(norm1: H3RMSNorm, norm2: H3RMSNorm, attn: AttentionLayer,
+    package init(norm1: H3RMSNorm, norm2: H3RMSNorm, attn: AttentionLayer,
                 mlp: H3MLP, adaln: AdalnProj) {
         self.norm1 = norm1
         self.norm2 = norm2
@@ -354,7 +354,7 @@ public struct DiTBlock {
         self.adaln = adaln
     }
 
-    public func callAsFunction(_ x: MLXArray, tEmb: MLXArray, index: ModulationIndex,
+    package func callAsFunction(_ x: MLXArray, tEmb: MLXArray, index: ModulationIndex,
                                ropeTable: MLXArray?,
                                context: AttentionContext? = nil) -> MLXArray {
         let m = adaln(tEmb)

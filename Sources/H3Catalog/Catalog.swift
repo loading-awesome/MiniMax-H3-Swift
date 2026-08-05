@@ -10,18 +10,18 @@ import H3Foundation
 /// partition for the mode, an approximation used without permission. Each of
 /// those either crashes at minute twenty or, worse, renders something
 /// plausible. Reading four safetensors headers takes milliseconds.
-public struct Catalog: Sendable {
+package struct Catalog: Sendable {
 
-    public struct Resolution: Sendable {
-        public let mode: RenderMode
-        public let precision: String
-        public let dit: CheckpointIdentity
-        public let textEncoder: CheckpointIdentity
-        public let videoVAE: CheckpointIdentity
-        public let audioVAE: CheckpointIdentity
-        public let tokenizerDirectory: URL?
+    package struct Resolution: Sendable {
+        package let mode: RenderMode
+        package let precision: String
+        package let dit: CheckpointIdentity
+        package let textEncoder: CheckpointIdentity
+        package let videoVAE: CheckpointIdentity
+        package let audioVAE: CheckpointIdentity
+        package let tokenizerDirectory: URL?
 
-        public var description: String {
+        package var description: String {
             var out = ["  mode           \(mode.rawValue)  (needs the "
                        + "\(mode.requiredPartition.rawValue) partition)",
                        "  precision      \(precision)",
@@ -35,14 +35,14 @@ public struct Catalog: Sendable {
     }
 
     let config: H3Configuration
-    public init(config: H3Configuration) { self.config = config }
+    package init(config: H3Configuration) { self.config = config }
 
     /// Every configured checkpoint, identified, whether or not it is usable.
     ///
     /// This is what `h3 doctor` prints. It reports rather than throws, because
     /// the value of a diagnostic is seeing *all* the problems at once — a
     /// doctor that stops at the first missing file makes you run it four times.
-    public func inventory() -> [(role: String, path: String, result: Result<CheckpointIdentity, Error>)] {
+    package func inventory() -> [(role: String, path: String, result: Result<CheckpointIdentity, Error>)] {
         var rows: [(String, String, Result<CheckpointIdentity, Error>)] = []
         /// `expect` cross-checks the slot the file is filed under against the
         /// partition the file says it is.
@@ -92,7 +92,7 @@ public struct Catalog: Sendable {
     /// `precision` names a key in the config's per-partition table, not a
     /// dtype: the caller has already been told by the memory planner which key
     /// fits, and the catalog's job is to find it and prove it is what it claims.
-    public func resolve(mode: RenderMode, precision: String) throws -> Resolution {
+    package func resolve(mode: RenderMode, precision: String) throws -> Resolution {
         let ditTable = mode.requiredPartition == .ref2va
             ? config.checkpoints.ref2va : config.checkpoints.fl2va
         let role = "dit \(mode.requiredPartition.rawValue)/\(precision)"
@@ -113,10 +113,11 @@ public struct Catalog: Sendable {
         // silently would change the conditioning without changing the render's
         // description of itself.
         let tePrecision = precision.hasPrefix("pruned") ? String(precision.dropFirst(7)) : precision
-        guard let tePath = config.checkpoints.textEncoder[tePrecision]
-                ?? config.checkpoints.textEncoder["bf16"],
+        guard let tePath = config.checkpoints.textEncoder[tePrecision],
               let teURL = config.resolve(tePath) else {
-            throw H3Error.checkpointMissing(role: "text encoder", path: "not configured")
+            throw H3Error.checkpointMissing(
+                role: "text encoder/\(tePrecision)",
+                path: "no '\(tePrecision)' text-encoder entry in the configuration")
         }
         guard let vvPath = config.checkpoints.videoVAE, let vvURL = config.resolve(vvPath) else {
             throw H3Error.checkpointMissing(role: "video vae", path: "not configured")

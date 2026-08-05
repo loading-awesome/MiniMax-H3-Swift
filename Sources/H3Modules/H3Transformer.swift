@@ -7,12 +7,12 @@ import H3Attention
 /// Packing helpers. These decide the ROW ORDER of the packed sequence, so an
 /// error here misaligns every downstream tap while keeping all the shapes
 /// correct — the most expensive kind of bug to find late.
-public enum H3Packing {
+package enum H3Packing {
     /// `[B,C,T,H,W] -> [B*t*h*w, C*pt*ph*pw]`, rows ordered t-major then h then w.
     ///
     /// Reference: `einsum("nctrhpwq->nthwcrpq")`. Feature order within a row is
     /// `(c, pt, ph, pw)` — channel outermost, patch offsets innermost.
-    public static func patchifyVideo(_ latent: MLXArray, patch: [Int] = [1, 2, 2]) -> MLXArray {
+    package static func patchifyVideo(_ latent: MLXArray, patch: [Int] = [1, 2, 2]) -> MLXArray {
         let b = latent.dim(0), c = latent.dim(1)
         let (pt, ph, pw) = (patch[0], patch[1], patch[2])
         let t = latent.dim(2) / pt, h = latent.dim(3) / ph, w = latent.dim(4) / pw
@@ -22,7 +22,7 @@ public enum H3Packing {
                      .reshaped([b * t * h * w, c * pt * ph * pw])
     }
 
-    public static func unpatchifyVideo(_ rows: MLXArray, t: Int, h: Int, w: Int,
+    package static func unpatchifyVideo(_ rows: MLXArray, t: Int, h: Int, w: Int,
                                        channels: Int = 24, patch: [Int] = [1, 2, 2]) -> MLXArray {
         let (pt, ph, pw) = (patch[0], patch[1], patch[2])
         return rows.reshaped([-1, t, h, w, channels, pt, ph, pw])
@@ -32,12 +32,12 @@ public enum H3Packing {
 
     /// `[B,32,2,T] -> [2*T, 32]`, **channel-major**: ch0 t0..T-1 then ch1 t0..T-1.
     /// Reference: `latent[0].permute(1,2,0).reshape(ch*t, c)`.
-    public static func packAudio(_ latent: MLXArray) -> MLXArray {
+    package static func packAudio(_ latent: MLXArray) -> MLXArray {
         let c = latent.dim(1), ch = latent.dim(2), t = latent.dim(3)
         return latent[0].transposed(1, 2, 0).reshaped([ch * t, c])
     }
 
-    public static func unpackAudio(_ rows: MLXArray, channels: Int = 2) -> MLXArray {
+    package static func unpackAudio(_ rows: MLXArray, channels: Int = 2) -> MLXArray {
         let t = rows.dim(0) / channels
         return rows.reshaped([channels, t, rows.dim(-1)])
                    .transposed(2, 0, 1)
@@ -54,9 +54,9 @@ public enum H3Packing {
 /// The duplicated halves are why `rope_rotation_table` only reads the first
 /// half — and why `rot` is 96 while `headDim` is 128, leaving 32 channels
 /// unrotated.
-public enum H3RoPE {
+package enum H3RoPE {
     /// `positionIds` is `[S, 3]` (t, h, w). Returns `[S, 96]` angles.
-    public static func angles(positionIds: MLXArray, invFreq: MLXArray) -> MLXArray {
+    package static func angles(positionIds: MLXArray, invFreq: MLXArray) -> MLXArray {
         let pos = positionIds.asType(.float32)
         let inv = invFreq.asType(.float32).reshaped([1, 1, -1])
         let perAxis = pos.expandedDimensions(axis: -1) * inv          // [S,3,16]
@@ -66,7 +66,7 @@ public enum H3RoPE {
     }
 
     /// `[S, rot] angles -> [1, S, 1, rot/2, 2, 2]` holding `[[c, -s], [s, c]]`.
-    public static func rotationTable(angles: MLXArray) -> MLXArray {
+    package static func rotationTable(angles: MLXArray) -> MLXArray {
         let s = angles.dim(0)
         let half = angles.dim(-1) / 2
         let ang = angles[0..., 0 ..< half]
@@ -78,14 +78,14 @@ public enum H3RoPE {
 /// Sinusoidal-style timestep embedding: `proj_out(silu(proj_in(t)))`.
 /// Only used when the checkpoint has no `adaln_t_table`; ours does not, which
 /// the inventory confirms by deriving `timestepInputDim` from `proj_in`.
-public struct TimeEmbedder {
-    public let projInWeight: MLXArray
-    public let projInBias: MLXArray?
-    public let projOutWeight: MLXArray
-    public let projOutBias: MLXArray?
-    public let inputDim: Int
+package struct TimeEmbedder {
+    package let projInWeight: MLXArray
+    package let projInBias: MLXArray?
+    package let projOutWeight: MLXArray
+    package let projOutBias: MLXArray?
+    package let inputDim: Int
 
-    public init(projInWeight: MLXArray, projInBias: MLXArray?,
+    package init(projInWeight: MLXArray, projInBias: MLXArray?,
                 projOutWeight: MLXArray, projOutBias: MLXArray?, inputDim: Int) {
         self.projInWeight = projInWeight
         self.projInBias = projInBias
@@ -95,7 +95,7 @@ public struct TimeEmbedder {
     }
 
     /// `t` is `[M]` timestep values in [0, 1].
-    public func callAsFunction(_ t: MLXArray) -> MLXArray {
+    package func callAsFunction(_ t: MLXArray) -> MLXArray {
         var h = matmul(sinusoid(t), projInWeight.T)
         if let projInBias { h = h + projInBias }
         h = silu(h)
@@ -128,15 +128,15 @@ public struct TimeEmbedder {
 ///
 /// Its AdaLN has `modalities = 1`, unlike a block's 3 — so `ModSegment.row`
 /// here is the **timestep row alone**, not `timestepRow * 3 + tag`.
-public struct FinalLayer {
-    public let norm: H3RMSNorm
-    public let adaln: AdalnProj
-    public let videoOutWeight: MLXArray
-    public let videoOutBias: MLXArray?
-    public let audioOutWeight: MLXArray
-    public let audioOutBias: MLXArray?
+package struct FinalLayer {
+    package let norm: H3RMSNorm
+    package let adaln: AdalnProj
+    package let videoOutWeight: MLXArray
+    package let videoOutBias: MLXArray?
+    package let audioOutWeight: MLXArray
+    package let audioOutBias: MLXArray?
 
-    public init(norm: H3RMSNorm, adaln: AdalnProj,
+    package init(norm: H3RMSNorm, adaln: AdalnProj,
                 videoOutWeight: MLXArray, videoOutBias: MLXArray?,
                 audioOutWeight: MLXArray, audioOutBias: MLXArray?) {
         self.norm = norm
@@ -148,7 +148,7 @@ public struct FinalLayer {
     }
 
     /// `seg` entries are `(start, stop, modRow)`.
-    public func callAsFunction(_ h: MLXArray, tEmb: MLXArray,
+    package func callAsFunction(_ h: MLXArray, tEmb: MLXArray,
                                videoSeg: ModSegment, audioSeg: ModSegment)
         -> (video: MLXArray, audio: MLXArray) {
         let m = adaln(tEmb)
@@ -174,7 +174,7 @@ public struct FinalLayer {
 /// Covers the span the parity contract makes testable without a text encoder:
 /// conditioning in, sampled-latent-shaped velocity out. Both VAEs are separate
 /// models and are not part of this type.
-public struct H3Transformer {
+package struct H3Transformer {
     /// Immutable tensors shared by every denoise step of one render.
     ///
     /// The conditioning projection/refiner and RoPE table depend on the prompt
@@ -183,7 +183,7 @@ public struct H3Transformer {
     /// weights on every step. It is deliberately supplied by the caller rather
     /// than kept as mutable state on the model: one model may serve multiple
     /// prompts or geometries without a stale-cache hazard.
-    public final class RenderState: @unchecked Sendable {
+    package final class RenderState: @unchecked Sendable {
         fileprivate let layout: PackedLayout
         fileprivate let contextTokens: Int
         fileprivate let textStates: MLXArray
@@ -200,20 +200,20 @@ public struct H3Transformer {
         }
     }
 
-    public let config: H3Config
-    public let conditionProj: (weight: MLXArray, bias: MLXArray?)
-    public let videoPatchProj: (weight: MLXArray, bias: MLXArray?)
-    public let audioPatchProj: (weight: MLXArray, bias: MLXArray?)
-    public let tokenRefiner: TokenRefiner
-    public let timeEmbedder: TimeEmbedder
-    public let blocks: [DiTBlock]
-    public let finalLayer: FinalLayer
-    public let ropeInvFreq: MLXArray
+    package let config: H3Config
+    package let conditionProj: (weight: MLXArray, bias: MLXArray?)
+    package let videoPatchProj: (weight: MLXArray, bias: MLXArray?)
+    package let audioPatchProj: (weight: MLXArray, bias: MLXArray?)
+    package let tokenRefiner: TokenRefiner
+    package let timeEmbedder: TimeEmbedder
+    package let blocks: [DiTBlock]
+    package let finalLayer: FinalLayer
+    package let ropeInvFreq: MLXArray
     /// The dtype the block stack runs in. The reference takes it from the
     /// incoming context, which is bf16 in every real run.
-    public let computeDType: DType
+    package let computeDType: DType
 
-    public init(config: H3Config,
+    package init(config: H3Config,
                 conditionProj: (weight: MLXArray, bias: MLXArray?),
                 videoPatchProj: (weight: MLXArray, bias: MLXArray?),
                 audioPatchProj: (weight: MLXArray, bias: MLXArray?),
@@ -233,16 +233,16 @@ public struct H3Transformer {
     }
 
     /// Taps recorded while running, keyed by the parity contract's names.
-    public struct Taps {
-        public var conditionProj: MLXArray?
-        public var tokenRefiner: MLXArray?
-        public var videoPatchProj: MLXArray?
-        public var audioPatchProj: MLXArray?
-        public var timeEmbedder: MLXArray?
-        public var blocks: [Int: MLXArray] = [:]
-        public var finalVideo: MLXArray?
-        public var finalAudio: MLXArray?
-        public init() {}
+    package struct Taps {
+        package var conditionProj: MLXArray?
+        package var tokenRefiner: MLXArray?
+        package var videoPatchProj: MLXArray?
+        package var audioPatchProj: MLXArray?
+        package var timeEmbedder: MLXArray?
+        package var blocks: [Int: MLXArray] = [:]
+        package var finalVideo: MLXArray?
+        package var finalAudio: MLXArray?
+        package init() {}
     }
 
     private func linear(_ x: MLXArray, _ p: (weight: MLXArray, bias: MLXArray?)) -> MLXArray {
@@ -252,12 +252,12 @@ public struct H3Transformer {
     }
 
     /// Which block outputs get recorded. Matches the contract's `block_NN` taps.
-    public static let tappedBlocks: Set<Int> = [0, 1, 24, 49]
+    package static let tappedBlocks: Set<Int> = [0, 1, 24, 49]
 
     /// Precompute the exact prompt- and geometry-invariant DiT inputs for one
     /// render. Call once before the sampler loop and pass the result to every
     /// ``velocity`` / ``guidedVelocity`` invocation in that loop.
-    public func prepareRender(context: MLXArray, geometry: LatentGeometry,
+    package func prepareRender(context: MLXArray, geometry: LatentGeometry,
                               keyframes: [KeyframeConfig] = [],
                               refs: [ReferenceBlock] = []) throws -> RenderState {
         let layout = try PackedLayout(textTokens: context.dim(1), geometry: geometry,
@@ -290,7 +290,7 @@ public struct H3Transformer {
     ///     both; two pairs would eventually disagree. (These were `cacheStep`
     ///     and `cacheTotalSteps`, named for their first consumer.) Omitted, the
     ///     cache is inactive and attention runs dense.
-    public func packedForward(videoLatent: MLXArray, audioLatent: MLXArray,
+    package func packedForward(videoLatent: MLXArray, audioLatent: MLXArray,
                               context: MLXArray, layout: PackedLayout,
                               plan: TimestepPlan, index: ModulationIndex,
                               tapsOut: inout Taps,
@@ -499,7 +499,7 @@ public struct H3Transformer {
     /// are negated**, and audio is additionally scaled by `d(sigma_a)/d(sigma_v)`
     /// so that the single flat ODE the sampler integrates is each stream's true
     /// ODE on its own shifted schedule.
-    public func velocity(videoLatent: MLXArray, audioLatent: MLXArray,
+    package func velocity(videoLatent: MLXArray, audioLatent: MLXArray,
                           context: MLXArray, sigmaVideo: Double,
                           geometry: LatentGeometry, textTags: [Int]? = nil,
                           keyframes: [KeyframeConfig] = [],
@@ -553,7 +553,7 @@ public struct H3Transformer {
     /// `BasicGuider`, i.e. no CFG, so no golden exercises this path. The
     /// combination is the standard one; the claim that it is what MiniMax's own
     /// stack does is not something this repo has measured.
-    public func guidedVelocity(videoLatent: MLXArray, audioLatent: MLXArray,
+    package func guidedVelocity(videoLatent: MLXArray, audioLatent: MLXArray,
                                context: MLXArray, negative: MLXArray?,
                                scale: Float, sigmaVideo: Double,
                                geometry: LatentGeometry,
@@ -605,30 +605,30 @@ public struct H3Transformer {
 
 /// Two pre-norm blocks with plain residuals, then a final RMSNorm. No AdaLN,
 /// no RoPE — the refiner sees text only.
-public struct TokenRefiner {
-    public struct Block {
-        public let norm1: H3RMSNorm
-        public let norm2: H3RMSNorm
-        public let attn: AttentionLayer
-        public let mlp: H3MLP
-        public init(norm1: H3RMSNorm, norm2: H3RMSNorm, attn: AttentionLayer, mlp: H3MLP) {
+package struct TokenRefiner {
+    package struct Block {
+        package let norm1: H3RMSNorm
+        package let norm2: H3RMSNorm
+        package let attn: AttentionLayer
+        package let mlp: H3MLP
+        package init(norm1: H3RMSNorm, norm2: H3RMSNorm, attn: AttentionLayer, mlp: H3MLP) {
             self.norm1 = norm1
             self.norm2 = norm2
             self.attn = attn
             self.mlp = mlp
         }
-        public func callAsFunction(_ x: MLXArray) -> MLXArray {
+        package func callAsFunction(_ x: MLXArray) -> MLXArray {
             let a = attn(norm1(x), ropeTable: nil) + x
             return mlp(norm2(a)) + a
         }
     }
-    public let blocks: [Block]
-    public let finalNorm: H3RMSNorm
-    public init(blocks: [Block], finalNorm: H3RMSNorm) {
+    package let blocks: [Block]
+    package let finalNorm: H3RMSNorm
+    package init(blocks: [Block], finalNorm: H3RMSNorm) {
         self.blocks = blocks
         self.finalNorm = finalNorm
     }
-    public func callAsFunction(_ x: MLXArray) -> MLXArray {
+    package func callAsFunction(_ x: MLXArray) -> MLXArray {
         var h = x
         for b in blocks { h = b(h) }
         return finalNorm(h)

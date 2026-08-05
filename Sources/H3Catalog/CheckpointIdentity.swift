@@ -8,11 +8,11 @@ import H3Foundation
 /// reliable thing about this model family: `MiniMax-H3-FL2VA-pruned_bf16` is
 /// not pruned, `…_int8_convrot` does not stay int8 in memory, and the same
 /// `_bf16` suffix covers two mutually incompatible tensor layouts.
-public struct CheckpointIdentity: Sendable, Equatable {
+package struct CheckpointIdentity: Sendable, Equatable {
 
     /// Which conversion produced the file. Determines the fused-attention
     /// layout, and getting it wrong is silent — see `Vendor`.
-    public enum Vendor: String, Sendable {
+    package enum Vendor: String, Sendable {
         case comfyOrg = "Comfy-Org"
         case deepBeepMeep = "DeepBeepMeep"
     }
@@ -25,13 +25,13 @@ public struct CheckpointIdentity: Sendable, Equatable {
     /// Ref2VA serves image / video / audio references. Loading FL2VA for a
     /// reference render produces a picture, produces no error, and produces it
     /// from weights that were never trained to consume reference blocks.
-    public enum Partition: String, Sendable {
+    package enum Partition: String, Sendable {
         case fl2va = "FL2VA"
         case ref2va = "Ref2VA"
     }
 
     /// How the weights are stored, which is not how they are held.
-    public enum Quantisation: Sendable, Equatable {
+    package enum Quantisation: Sendable, Equatable {
         case none
         /// Per-output-channel symmetric int8: `I8` weights with `F32`
         /// `weight_scale [out, 1]`, plus ComfyUI's `comfy_quant` descriptor.
@@ -48,27 +48,27 @@ public struct CheckpointIdentity: Sendable, Equatable {
     /// text encoder or a VAE with no recognised vendor metadata is not
     /// suspicious; the first version of this check reported the Qwen encoder as
     /// UNIDENTIFIED VENDOR and was wrong to.
-    public enum Kind: String, Sendable {
+    package enum Kind: String, Sendable {
         case dit, textEncoder, vae, unknown
     }
 
-    public let url: URL
-    public let kind: Kind
-    public let vendor: Vendor?
-    public let partition: Partition?
-    public let quantisation: Quantisation
+    package let url: URL
+    package let kind: Kind
+    package let vendor: Vendor?
+    package let partition: Partition?
+    package let quantisation: Quantisation
     /// True when AdaLN has been replaced by the low-rank curve approximation.
-    public let isApproximate: Bool
-    public let approximationDetail: String?
-    public let sizeBytes: UInt64
-    public let tensorCount: Int
+    package let isApproximate: Bool
+    package let approximationDetail: String?
+    package let sizeBytes: UInt64
+    package let tensorCount: Int
 
     /// Reads the header only — a few hundred kilobytes, not the 66 GB body.
     ///
     /// `headerOnly` matters more than it looks: identification runs over every
     /// configured checkpoint at startup, and mapping four 66 GB files to read
     /// their metadata would make `h3 doctor` a memory event.
-    public static func identify(url: URL) throws -> CheckpointIdentity {
+    package static func identify(url: URL) throws -> CheckpointIdentity {
         let header: Safetensors.Archive
         do {
             header = try Safetensors.Archive(url: url, headerOnly: true)
@@ -144,7 +144,7 @@ public struct CheckpointIdentity: Sendable, Equatable {
     /// Two independent refusals, both of which the experimental tree lacked:
     /// an unidentifiable vendor (silently wrong attention), and a partition
     /// that does not match the requested mode (silently untrained conditioning).
-    public func validate(forMode mode: RenderMode,
+    package func validate(forMode mode: RenderMode,
                          allowApproximate: Bool) throws {
         // Only the DiT carries fused attention weights, so only the DiT has a
         // layout that can be silently misread.
@@ -166,7 +166,7 @@ public struct CheckpointIdentity: Sendable, Equatable {
         }
     }
 
-    public var summary: String {
+    package var summary: String {
         var bits = [String]()
         if kind == .dit {
             bits.append(vendor?.rawValue ?? "UNIDENTIFIED VENDOR")
@@ -198,7 +198,7 @@ public enum RenderMode: String, Sendable, CaseIterable {
     case firstLastFrame = "fl2va"
     case reference = "ref2va"
 
-    public var requiredPartition: CheckpointIdentity.Partition {
+    package var requiredPartition: CheckpointIdentity.Partition {
         switch self {
         // FL2VA serves text-to-video as well as the keyframe modes; there is
         // no separate T2VA partition.

@@ -65,7 +65,7 @@ public final class RenderCancellation: @unchecked Sendable {
 /// A distinct type rather than an `H3Error` case: cancellation is not a
 /// failure, and a caller catching `H3Error` to report a problem should not
 /// report this one.
-public struct RenderCancelled: Error, CustomStringConvertible {
+public struct RenderCancelled: Error, CustomStringConvertible, Sendable {
     public let phase: RenderProgress.Phase
     public let detail: String
     public init(phase: RenderProgress.Phase, detail: String) {
@@ -89,6 +89,9 @@ public struct RenderResult: Sendable {
     public let timings: Timings
     /// The cache's own account of what it skipped, when one was running.
     public let cacheSummary: String?
+    /// False only when audio muxing failed and the pipeline deliberately
+    /// retained a playable video plus a recovery WAV.
+    public let muxedAudio: Bool
 
     public struct Timings: Sendable {
         public var textConditioning: TimeInterval = 0
@@ -100,9 +103,36 @@ public struct RenderResult: Sendable {
         public var mux: TimeInterval = 0
         public init() {}
 
+        public init(textConditioning: TimeInterval, conditionEncoding: TimeInterval,
+                    sampling: TimeInterval, audioDecode: TimeInterval,
+                    videoDecode: TimeInterval, pixelPack: TimeInterval,
+                    mux: TimeInterval) {
+            self.textConditioning = textConditioning
+            self.conditionEncoding = conditionEncoding
+            self.sampling = sampling
+            self.audioDecode = audioDecode
+            self.videoDecode = videoDecode
+            self.pixelPack = pixelPack
+            self.mux = mux
+        }
+
         public var total: TimeInterval {
             textConditioning + conditionEncoding + sampling
                 + audioDecode + videoDecode + pixelPack + mux
         }
+    }
+
+    public init(video: URL, audio: URL?, frameCount: Int, width: Int,
+                height: Int, seconds: Double, timings: Timings,
+                cacheSummary: String?, muxedAudio: Bool = true) {
+        self.video = video
+        self.audio = audio
+        self.frameCount = frameCount
+        self.width = width
+        self.height = height
+        self.seconds = seconds
+        self.timings = timings
+        self.cacheSummary = cacheSummary
+        self.muxedAudio = muxedAudio
     }
 }
