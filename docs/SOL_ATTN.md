@@ -197,7 +197,91 @@ Recommended order: **cross-step cache first** (pure Swift, no kernel, biggest
 win), **fused AdaLN second** (bounded kernel work, and this port already has the
 AdaLN residency machinery), **Sol-Attn third**.
 
-## 8. Open questions before a Metal port
+## 8. Measured on real H3 attention, 2026-08-05
+
+Run on an RTX PRO 6000 Blackwell (sm_120) against q/k/v captured from an actual
+render at 864x480x124, step 5, blocks 0 and 24. `S = 15731, H = 56, D = 128`.
+
+**Random tensors were tried first and are worthless here.** Gaussian q/k/v give
+rel_rms 0.17 even at beta = 0, because unstructured attention has no dominant
+blocks to keep. Any class measured that way describes the worst possible input.
+It is a useful negative control and nothing else: whatever quality Sol-Attn
+delivers comes from real structure in real attention.
+
+### The equivalence class, at kijai's beta = 1.2 with `exact_kv`
+
+| | rel_rms | cos | kernel speedup |
+|---|---|---|---|
+| block 0 | **0.132** | 0.9914 | 2.39x |
+| block 24 | **0.245** | 0.9710 | 2.72x |
+
+**This port gates DiT blocks against CUDA at rel_rms 8.5e-03 to 2.3e-02.**
+Sol-Attn is 10-30x outside that. It cannot be gated against the existing
+goldens, it must declare its own class, and conformance has to run per backend.
+That is what `equivalenceClass` on the protocol is for, and this is the number.
+
+### The sink is worth more, and costs more, than either source says
+
+At beta = 1.2, block 0, measuring the conditioning rows separately:
+
+| | conditioning-row rel_rms | time |
+|---|---|---|
+| no sink | 0.210 | 7.27 ms |
+| `exact_kv` | **0.153** (-27%) | 8.52 ms (**+17%**) |
+
+NVIDIA quote ~1% cost for the prefix sink; kijai's node quotes ~3% for
+`exact_kv`. **Measured here it is 17%** at this shape. The benefit is real and
+larger than advertised — 27% less error on exactly the rows carrying text,
+audio and lip-sync — but it is not close to free.
+
+### The middle of the stack is harder than the ends
+
+Block 24 is roughly **twice** as hard to approximate as block 0 (rel_rms 0.245
+against 0.132). Both the paper's first-layer warm-up and kijai's `dense_blocks`
+default assume the *first and last* blocks are the sensitive ones. On H3 that
+looks wrong. Two samples, so it is a lead rather than a finding — but if it
+holds, `dense_blocks` should be excluding different layers than everyone
+assumes.
+
+### Beta means on H3 what it means elsewhere
+
+Measured over 1000 attention calls of a real render:
+
+| | measured | Gaussian |
+|---|---|---|
+| skewness | +0.231 | 0 |
+| excess kurtosis | **+2.012** | 0 |
+| density at beta=1 | 14.67% | 15.87% |
+| density at beta=2 | 2.69% | 2.28% |
+
+The distribution is **not** Gaussian — clearly heavy-tailed — but `1 - Phi(beta)`
+still predicts density within 8% and 18%. So published tau settings transfer to
+this model. The Cornish-Fisher correction, which uses exactly the third and
+fourth moments above, is earning its place here.
+
+### What it is worth end to end
+
+2.4x on the attention kernel, and attention is 37% of DiT FLOPs at this shape,
+so **~1.25x end to end** — independently reproducing NVIDIA's stated 1.25x for
+H3 from a different direction.
+
+Against the cross-step cache already shipped at **1.93x with no kernel at all**,
+that keeps Sol-Attn third on the list.
+
+### Reproducing this
+
+Triton **3.3.0 cannot compile the kernel on sm_120** — `PassManager::run failed`
+in `make_ttgir`. 3.7.1 works. The kernel modules also run standalone without
+ComfyUI: `__init__.py` imports comfy, but `_tri_fwd`, `_preprocess` and
+`_int8_fwd` only import each other, so a package directory with an empty
+`__init__.py` is enough.
+
+Routing goldens — per-(query block, head) thresholds plus pooled `kc`/`vc` at
+beta 1.2 — are at `/Volumes/scratch_disk/H3_renders/qkv/routing_*.pt`, 7.4 MB
+each. A Metal kernel that selects the same blocks implements the same
+approximation; comparing routing is a stronger test than comparing outputs.
+
+## 9. Open questions before a Metal port
 
 1. **Is `MLXFast.metalKernel` expressive enough for the inner loop?** The exact
    branch is data-dependent control flow over a selection buffer — the one place
