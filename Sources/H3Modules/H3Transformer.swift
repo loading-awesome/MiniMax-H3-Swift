@@ -288,7 +288,10 @@ public struct H3Transformer {
                               tapsOut: inout Taps,
                               renderState: RenderState? = nil,
                               condVideo: MLXArray? = nil,
-                              condAudio: MLXArray? = nil)
+                              condAudio: MLXArray? = nil,
+                              stepCache: H3StepCache? = nil,
+                              cacheStep: Int? = nil,
+                              cacheTotalSteps: Int? = nil)
         -> (video: MLXArray, audio: MLXArray) {
 
         // text path — the context sets the compute dtype in the reference, so
@@ -393,9 +396,34 @@ public struct H3Transformer {
                 angles: H3RoPE.angles(positionIds: pos, invFreq: ropeInvFreq)).asType(dtype)
         }
 
-        for (i, block) in blocks.enumerated() {
-            h = block(h, tEmb: tEmb, index: index, ropeTable: table)
-            if Self.tappedBlocks.contains(i) { tapsOut.blocks[i] = h }
+        // Cross-step residual reuse. Block 0 always runs and doubles as the
+        // probe; if its residual barely moved since the previous step, the
+        // other 49 blocks are skipped and last step's total residual is
+        // re-applied. See `H3StepCache` for why the *total residual* is what
+        // gets cached rather than the output.
+        //
+        // With no cache this is the plain loop, unchanged and bit-identical.
+        if let cache = stepCache, let step = cacheStep, let total = cacheTotalSteps {
+            let hIn = h
+            h = blocks[0](h, tEmb: tEmb, index: index, ropeTable: table)
+            if Self.tappedBlocks.contains(0) { tapsOut.blocks[0] = h }
+
+            switch cache.decide(probe: h - hIn, audioRange: layout.audioRange,
+                                step: step, totalSteps: total) {
+            case .reuse(let residual):
+                h = hIn + residual
+            case .runFull:
+                for i in 1 ..< blocks.count {
+                    h = blocks[i](h, tEmb: tEmb, index: index, ropeTable: table)
+                    if Self.tappedBlocks.contains(i) { tapsOut.blocks[i] = h }
+                }
+                cache.record(totalResidual: h - hIn)
+            }
+        } else {
+            for (i, block) in blocks.enumerated() {
+                h = block(h, tEmb: tEmb, index: index, ropeTable: table)
+                if Self.tappedBlocks.contains(i) { tapsOut.blocks[i] = h }
+            }
         }
 
         // The final layer's AdaLN has one modality, so these rows are timestep
@@ -425,6 +453,9 @@ public struct H3Transformer {
                           condVideo: MLXArray? = nil,
                           condAudio: MLXArray? = nil,
                           renderState: RenderState? = nil,
+                          stepCache: H3StepCache? = nil,
+                          cacheStep: Int? = nil,
+                          cacheTotalSteps: Int? = nil,
                           taps: inout Taps) -> (video: MLXArray, audio: MLXArray) {
         let layout = renderState?.layout ?? PackedLayout(textTokens: context.dim(1), geometry: geometry,
                                                          keyframes: keyframes, refs: refs)
@@ -434,7 +465,10 @@ public struct H3Transformer {
                                    context: context, layout: layout, plan: plan,
                                    index: index, tapsOut: &taps,
                                    renderState: renderState,
-                                   condVideo: condVideo, condAudio: condAudio)
+                                   condVideo: condVideo, condAudio: condAudio,
+                                   stepCache: stepCache,
+                                   cacheStep: cacheStep,
+                                   cacheTotalSteps: cacheTotalSteps)
         let video = H3Packing.unpatchifyVideo(v, t: geometry.latentT,
                                               h: geometry.latentH / config.patchSize[1],
                                               w: geometry.latentW / config.patchSize[2],
@@ -477,6 +511,10 @@ public struct H3Transformer {
                                condAudio: MLXArray? = nil,
                                renderState: RenderState? = nil,
                                negativeRenderState: RenderState? = nil,
+                               stepCache: H3StepCache? = nil,
+                               negativeStepCache: H3StepCache? = nil,
+                               cacheStep: Int? = nil,
+                               cacheTotalSteps: Int? = nil,
                                taps: inout Taps) -> (video: MLXArray, audio: MLXArray) {
         let cond = velocity(videoLatent: videoLatent, audioLatent: audioLatent,
                             context: context, sigmaVideo: sigmaVideo,
@@ -484,6 +522,8 @@ public struct H3Transformer {
                             keyframes: keyframes, refs: refs,
                             condVideo: condVideo, condAudio: condAudio,
                             renderState: renderState,
+                            stepCache: stepCache, cacheStep: cacheStep,
+                            cacheTotalSteps: cacheTotalSteps,
                             taps: &taps)
         // scale 1.0 is the identity; skip the second pass rather than paying
         // 61 s to multiply by one.
@@ -499,6 +539,8 @@ public struct H3Transformer {
                               keyframes: keyframes, refs: refs,
                               condVideo: condVideo, condAudio: condAudio,
                               renderState: negativeRenderState,
+                              stepCache: negativeStepCache, cacheStep: cacheStep,
+                              cacheTotalSteps: cacheTotalSteps,
                               taps: &negTaps)
 
         let s = MLXArray(scale)
