@@ -71,12 +71,12 @@ enum SamplingLoop {
             negativeCache?.release()
         }
 
-        let renderState = model.prepareRender(context: conditioning.context,
+        let renderState = try model.prepareRender(context: conditioning.context,
                                               geometry: geometry,
                                               keyframes: conditions.keyframes,
                                               refs: conditions.refs)
-        let negativeRenderState = conditioning.negative.map {
-            model.prepareRender(context: $0, geometry: geometry,
+        let negativeRenderState = try conditioning.negative.map {
+            try model.prepareRender(context: $0, geometry: geometry,
                                 keyframes: conditions.keyframes, refs: conditions.refs)
         }
 
@@ -95,7 +95,7 @@ enum SamplingLoop {
             let prevSigma = i > 0 ? Float(sigmas[i - 1]) : nil
 
             var taps = H3Transformer.Taps()
-            let (videoVelocity, audioVelocity) = model.guidedVelocity(
+            let (videoVelocity, audioVelocity) = try model.guidedVelocity(
                 videoLatent: currentVideo, audioLatent: currentAudio,
                 context: conditioning.context, negative: conditioning.negative,
                 scale: Float(request.cfgScale), sigmaVideo: Double(sigma),

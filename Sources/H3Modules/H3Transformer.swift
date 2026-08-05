@@ -259,9 +259,9 @@ public struct H3Transformer {
     /// ``velocity`` / ``guidedVelocity`` invocation in that loop.
     public func prepareRender(context: MLXArray, geometry: LatentGeometry,
                               keyframes: [KeyframeConfig] = [],
-                              refs: [ReferenceBlock] = []) -> RenderState {
-        let layout = PackedLayout(textTokens: context.dim(1), geometry: geometry,
-                                  keyframes: keyframes, refs: refs)
+                              refs: [ReferenceBlock] = []) throws -> RenderState {
+        let layout = try PackedLayout(textTokens: context.dim(1), geometry: geometry,
+                                      keyframes: keyframes, refs: refs)
         let textStates = linear(context[0].asType(computeDType), conditionProj)
         let refined = tokenRefiner(textStates)
         let pos = MLXArray(layout.positionIds.map { Float($0) }, [layout.totalTokens, 3])
@@ -300,7 +300,7 @@ public struct H3Transformer {
                               stepCache: H3StepCache? = nil,
                               stepIndex: Int? = nil,
                               stepCount: Int? = nil)
-        -> (video: MLXArray, audio: MLXArray) {
+        throws -> (video: MLXArray, audio: MLXArray) {
 
         // text path — the context sets the compute dtype in the reference, so
         // cast it here rather than inheriting whatever the caller supplied. A
@@ -332,8 +332,17 @@ public struct H3Transformer {
         var condVideoOffset = 0
         for s in layout.segments {
             if s.kind == .cond || s.kind == .refImage {
+                // The layout says there are conditioning rows and the caller did
+                // not supply them. Reachable from ordinary wrong input — a
+                // keyframe declared but never encoded — so it refuses rather
+                // than trapping.
                 guard let condVideo = condVideo else {
-                    preconditionFailure("Segment \(s.kind) requires condVideo input")
+                    throw H3Error.invalidRequest(
+                        rule: "missing conditioning rows",
+                        detail: "the packed layout declares a \(s.kind.rawValue) segment of "
+                              + "\(s.count) row(s), and no conditioning video was supplied",
+                        remedy: "encode every declared condition before sampling; the layout "
+                              + "and the rows are built from the same latents for this reason.")
                 }
                 let slice = condVideo[condVideoOffset ..< (condVideoOffset + s.count)]
                 allVideoRows.append(slice)
@@ -349,7 +358,12 @@ public struct H3Transformer {
         for s in layout.segments {
             if s.kind == .refAudio {
                 guard let condAudio = condAudio else {
-                    preconditionFailure("Segment \(s.kind) requires condAudio input")
+                    throw H3Error.invalidRequest(
+                        rule: "missing conditioning rows",
+                        detail: "the packed layout declares a \(s.kind.rawValue) segment of "
+                              + "\(s.count) row(s), and no conditioning audio was supplied",
+                        remedy: "encode every declared condition before sampling; the layout "
+                              + "and the rows are built from the same latents for this reason.")
                 }
                 let slice = condAudio[condAudioOffset ..< (condAudioOffset + s.count)]
                 allAudioRows.append(slice)
@@ -496,12 +510,12 @@ public struct H3Transformer {
                           stepCache: H3StepCache? = nil,
                           stepIndex: Int? = nil,
                           stepCount: Int? = nil,
-                          taps: inout Taps) -> (video: MLXArray, audio: MLXArray) {
-        let layout = renderState?.layout ?? PackedLayout(textTokens: context.dim(1), geometry: geometry,
-                                                         keyframes: keyframes, refs: refs)
+                          taps: inout Taps) throws -> (video: MLXArray, audio: MLXArray) {
+        let layout = try renderState?.layout ?? PackedLayout(textTokens: context.dim(1), geometry: geometry,
+                                                             keyframes: keyframes, refs: refs)
         let plan = TimestepPlan(sigmaVideo: sigmaVideo, segments: layout.segments)
         let index = ModulationIndex(layout: layout, plan: plan, textTags: textTags)
-        let (v, a) = packedForward(videoLatent: videoLatent, audioLatent: audioLatent,
+        let (v, a) = try packedForward(videoLatent: videoLatent, audioLatent: audioLatent,
                                    context: context, layout: layout, plan: plan,
                                    index: index, tapsOut: &taps,
                                    renderState: renderState,
@@ -555,8 +569,8 @@ public struct H3Transformer {
                                negativeStepCache: H3StepCache? = nil,
                                stepIndex: Int? = nil,
                                stepCount: Int? = nil,
-                               taps: inout Taps) -> (video: MLXArray, audio: MLXArray) {
-        let cond = velocity(videoLatent: videoLatent, audioLatent: audioLatent,
+                               taps: inout Taps) throws -> (video: MLXArray, audio: MLXArray) {
+        let cond = try velocity(videoLatent: videoLatent, audioLatent: audioLatent,
                             context: context, sigmaVideo: sigmaVideo,
                             geometry: geometry, textTags: textTags,
                             keyframes: keyframes, refs: refs,
@@ -573,7 +587,7 @@ public struct H3Transformer {
         let uncondContext = negative ?? MLXArray.zeros(
             [context.dim(0), context.dim(1), context.dim(2)], dtype: context.dtype)
         let uncondTags = negative == nil ? textTags : negativeTextTags
-        let uncond = velocity(videoLatent: videoLatent, audioLatent: audioLatent,
+        let uncond = try velocity(videoLatent: videoLatent, audioLatent: audioLatent,
                               context: uncondContext, sigmaVideo: sigmaVideo,
                               geometry: geometry, textTags: uncondTags,
                               keyframes: keyframes, refs: refs,

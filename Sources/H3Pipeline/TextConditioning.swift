@@ -115,8 +115,8 @@ enum ConditioningEncoder {
                           + "that resize is not ported. Supply pixels on a multiple of 32.")
             }
             let patches = framePair
-                ? VisionPreprocess.patches(framePair: pixels, grid: grid)
-                : VisionPreprocess.patches(image: pixels, grid: grid)
+                ? try VisionPreprocess.patches(framePair: pixels, grid: grid)
+                : try VisionPreprocess.patches(image: pixels, grid: grid)
             let out = tower(patches: patches, grid: grid)
             return (H3Presentation.VisionBlock(merged: out.merged, deepstack: out.deepstack),
                     grid)

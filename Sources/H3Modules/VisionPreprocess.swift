@@ -50,11 +50,16 @@ public enum VisionPreprocess {
     /// Resizing is the caller's job because it belongs to whatever decoded the
     /// file; this is the part that has to match the reference bit for bit.
     public static func patches(image: MLXArray, grid: VisionGrid,
-                               config: VisionTowerConfig = VisionTowerConfig()) -> MLXArray {
+                               config: VisionTowerConfig = VisionTowerConfig()) throws -> MLXArray {
         let p = config.patchSize, m = config.spatialMergeSize
         let tp = config.temporalPatchSize, ch = config.inChannels
-        precondition(image.dim(1) == grid.h * p && image.dim(2) == grid.w * p,
-                     "image \(image.shape) does not match grid \(grid) at patch \(p)")
+        guard image.dim(1) == grid.h * p && image.dim(2) == grid.w * p else {
+            throw H3Error.mediaOffCanvas(
+                path: "presented image", size: "\(image.dim(2))x\(image.dim(1))",
+                remedy: "this grid wants \(grid.w * p)x\(grid.h * p). Resizing belongs to "
+                      + "whatever decoded the file; this step has to match the reference bit "
+                      + "for bit and so will not resize for you.")
+        }
 
         let norm = (image.asType(.float32).transposed(0, 3, 1, 2) - mean) / std  // [1,3,H,W]
         // The single frame is repeated across the temporal patch: the tower
@@ -74,12 +79,20 @@ public enum VisionPreprocess {
     /// `grid.t` stays 1 — the pair fills the temporal patch, it does not add a
     /// temporal grid step.
     public static func patches(framePair: MLXArray, grid: VisionGrid,
-                               config: VisionTowerConfig = VisionTowerConfig()) -> MLXArray {
+                               config: VisionTowerConfig = VisionTowerConfig()) throws -> MLXArray {
         let p = config.patchSize, tp = config.temporalPatchSize
-        precondition(framePair.dim(0) == tp,
-                     "a video block wants \(tp) frames, got \(framePair.dim(0))")
-        precondition(framePair.dim(1) == grid.h * p && framePair.dim(2) == grid.w * p,
-                     "frames \(framePair.shape) do not match grid \(grid) at patch \(p)")
+        guard framePair.dim(0) == tp else {
+            throw H3Error.invalidRequest(
+                rule: "wrong frame count for a video block",
+                detail: "a video block wants \(tp) frames, got \(framePair.dim(0))",
+                remedy: "present reference video as frame pairs at 2 fps; a pair fills the "
+                      + "temporal patch and does not add a temporal grid step.")
+        }
+        guard framePair.dim(1) == grid.h * p && framePair.dim(2) == grid.w * p else {
+            throw H3Error.mediaOffCanvas(
+                path: "presented frame pair", size: "\(framePair.dim(2))x\(framePair.dim(1))",
+                remedy: "this grid wants \(grid.w * p)x\(grid.h * p).")
+        }
         let norm = (framePair.asType(.float32).transposed(0, 3, 1, 2) - mean) / std  // [2,3,H,W]
         return pack(norm, grid: grid, config: config)
     }

@@ -63,10 +63,12 @@ public enum PositionGrid {
 
     /// `linspace((1-ratio)/2, (1+ratio)/2, dim/patch, endpoint=False) * 32`
     /// where `ratio = dim / sqrt(h*w)`.
-    public static func axis(dim: Int, patch: Int, sqrtArea: Double) -> [Double] {
+    public static func axis(dim: Int, patch: Int, sqrtArea: Double) throws -> [Double] {
         let ratio = Double(dim) / sqrtArea
         let n = dim / patch
-        precondition(n > 0, "axis \(dim) is smaller than patch \(patch)")
+        guard n > 0 else {
+            throw H3Error.dimensionOffGrid(width: dim, height: dim, multiple: patch)
+        }
         let step = ratio / Double(n)
         let origin = (1.0 - ratio) / 2.0
         return (0 ..< n).map { (Double($0) * step + origin) * 32.0 }
@@ -75,10 +77,10 @@ public enum PositionGrid {
     /// One latent frame's `(h, w)` coordinates, row-major over the 2x2-patch
     /// grid, plus the w axis on its own (the audio grid pins to its extremes).
     public static func frameGrid(h: Int, w: Int, patch: Int = 2)
-        -> (rows: [(h: Double, w: Double)], wAxis: [Double]) {
+        throws -> (rows: [(h: Double, w: Double)], wAxis: [Double]) {
         let area = (Double(h) * Double(w)).squareRoot()
-        let hAxis = axis(dim: h, patch: patch, sqrtArea: area)
-        let wAxis = axis(dim: w, patch: patch, sqrtArea: area)
+        let hAxis = try axis(dim: h, patch: patch, sqrtArea: area)
+        let wAxis = try axis(dim: w, patch: patch, sqrtArea: area)
         var rows: [(h: Double, w: Double)] = []
         rows.reserveCapacity(hAxis.count * wAxis.count)
         for hv in hAxis { for wv in wAxis { rows.append((hv, wv)) } }
@@ -148,13 +150,18 @@ public struct PackedLayout: Sendable, Equatable {
     /// Row-major `[S, 3]` of `(t, h, w)`, in float64 as the reference builds it.
     public let positionIds: [Double]
 
-    public init(textTokens: Int, geometry: LatentGeometry, keyframes: [KeyframeConfig] = [], refs: [ReferenceBlock] = []) {
+    /// - Throws: `H3Error.keyframeIndex` for an anchor the reference defines no
+    ///   `cond_t` for. This was a `preconditionFailure`, which in a library
+    ///   takes the host application down over a value the caller is entitled to
+    ///   get wrong.
+    public init(textTokens: Int, geometry: LatentGeometry,
+                keyframes: [KeyframeConfig] = [], refs: [ReferenceBlock] = []) throws {
         self.textTokens = textTokens
         self.audioTokens = geometry.audioTokens
         self.videoTokens = geometry.videoTokens
 
         let patch = geometry.config.patchSize[1]
-        let (frame, wAxis) = PositionGrid.frameGrid(h: geometry.latentH,
+        let (frame, wAxis) = try PositionGrid.frameGrid(h: geometry.latentH,
                                                     w: geometry.latentW, patch: patch)
         let wLow = wAxis.first ?? 0, wHigh = wAxis.last ?? 0
         var pos = [Double]()
@@ -181,9 +188,8 @@ public struct PackedLayout: Sendable, Equatable {
                 let tSpan = PositionGrid.videoTSpan(geometry.latentT)
                 condT = Double(textTokens) + tSpan - PositionGrid.frameRescale
             default:
-                preconditionFailure("keyframe anchor \(kf.resolvedFrameIndex) is neither the "
-                    + "first frame (0) nor the last (\(geometry.frameCount - 1)); "
-                    + "the reference supports only those two")
+                throw H3Error.keyframeIndex(index: kf.resolvedFrameIndex,
+                                            frameCount: geometry.frameCount)
             }
             segments.append(PackedSegment(start: row, stop: row + frame.count, kind: .cond))
             for r in frame { pos.append(contentsOf: [condT, r.h, r.w]) }
@@ -194,7 +200,7 @@ public struct PackedLayout: Sendable, Equatable {
         for blk in refs {
             switch blk.kind {
             case .image:
-                let (rFrame, _) = PositionGrid.frameGrid(h: blk.latentH, w: blk.latentW, patch: patch)
+                let (rFrame, _) = try PositionGrid.frameGrid(h: blk.latentH, w: blk.latentW, patch: patch)
                 let n = rFrame.count
                 segments.append(PackedSegment(start: row, stop: row + n, kind: .refImage))
                 for r in rFrame { pos.append(contentsOf: [cursor, r.h, r.w]) }
@@ -215,7 +221,7 @@ public struct PackedLayout: Sendable, Equatable {
             case .video, .videoAudio:
                 let rt = blk.refAudioT
                 let vt = blk.latentT
-                let (rFrame, rWAxis) = PositionGrid.frameGrid(h: blk.latentH, w: blk.latentW, patch: patch)
+                let (rFrame, rWAxis) = try PositionGrid.frameGrid(h: blk.latentH, w: blk.latentW, patch: patch)
                 let rWLow = rWAxis.first ?? 0, rWHigh = rWAxis.last ?? 0
                 if rt > 0 {
                     segments.append(PackedSegment(start: row, stop: row + rt * 2, kind: .refAudio))

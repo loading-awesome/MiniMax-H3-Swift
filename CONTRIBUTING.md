@@ -66,6 +66,13 @@ Nothing a caller can provoke may trap. `preconditionFailure` in a library takes
 down the host application. Every refusal is a `throws` carrying three things:
 the rule, the measurement that establishes it, and the remedy.
 
+`precondition` still appears, and the line is this: **if the value came from
+the caller, throw; if it came from our own arithmetic or from a checkpoint we
+already identified, precondition.** A keyframe index, an image size and a frame
+count are the caller's; "AdaLN must expand to 6" and "packed rows must equal the
+layout's total" are ours, and if one of those is false the fix is a code change,
+not a better error message.
+
 ## FRAGILE_CONTRACTS.md
 
 36 entries, each one a thing that breaks parity silently. Adding to it is
