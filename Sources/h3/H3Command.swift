@@ -11,6 +11,6 @@ struct H3: ParsableCommand {
         commandName: "h3",
         abstract: "MiniMax-H3 on Apple Silicon.",
         version: MiniMaxH3.version,
-        subcommands: [Doctor.self, ConfigCommand.self]
+        subcommands: [Doctor.self, ConfigCommand.self, RenderCommand.self]
     )
 }

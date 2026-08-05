@@ -90,9 +90,11 @@ let package = Package(
         .testTarget(name: "H3ModulesTests",
                     dependencies: ["H3Modules", "H3Attention", "H3Hardware",
                                    .product(name: "MLX", package: "mlx-swift")]),
-        .testTarget(
-            name: "H3ConformanceTests",
-            dependencies: ["H3Conformance", "H3Foundation"]
-        ),
+        .testTarget(name: "H3PipelineTests",
+                    dependencies: ["H3Pipeline", "H3Foundation", "H3Catalog",
+                                   .product(name: "MLX", package: "mlx-swift")]),
+        // H3ConformanceTests is absent until H3Conformance has a fixture to
+        // check: a declared test target with no source files only produces a
+        // build warning and an empty runner.
     ]
 )

@@ -3,8 +3,12 @@
 ## Setup: `swift build` is not enough
 
 ```bash
-swift build && ./Scripts/bootstrap-metal.sh
+swift build --build-tests && ./Scripts/bootstrap-metal.sh && swift test --skip-build
 ```
+
+`--skip-build` on the test run is not optional: a plain `swift test` relinks the
+test bundle, which deletes the `mlx.metallib` the bootstrap just put inside it.
+Build, bootstrap, then run.
 
 SwiftPM does not build MLX's Metal kernels. mlx-swift excludes them from its
 `Cmlx` target and compiles them in its Xcode project instead, so a command-line
@@ -26,6 +30,14 @@ remedy. Re-run the script after any build that relinks the test bundle.
 
 `Resources/mlx.metallib` is version-coupled to the mlx-swift revision pinned in
 `Package.resolved`. Bumping one means replacing the other.
+
+### If the suite dies with SIGBUS and no failing test
+
+Delete `.build` and rebuild. Adding or reordering a case in `H3Error` — or any
+other enum crossing a module boundary — changes its memory layout, and SwiftPM's
+incremental build does not always rebuild every dependent. The symptom is a
+crash in `outlined destroy` of whatever holds the error, attributed to a test
+that passes in isolation and has nothing to do with the change.
 
 ## The house style for comments
 

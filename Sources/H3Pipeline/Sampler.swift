@@ -2,14 +2,14 @@ import Foundation
 import MLX
 import H3Foundation
 
-public final class Sampler {
+final class Sampler {
     private var oldSigmaDown: Float? = nil
     private var oldDenoised: MLXArray? = nil
 
-    public init() {}
+    init() {}
 
     /// Advance one step of the res_multistep ODE integration.
-    public func step(
+    func step(
         x: MLXArray,
         denoised: MLXArray,
         sigma: Float,

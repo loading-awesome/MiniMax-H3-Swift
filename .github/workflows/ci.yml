@@ -18,5 +18,7 @@ jobs:
         run: swift build --build-tests
       - name: Bootstrap Metal kernels
         run: ./Scripts/bootstrap-metal.sh
+      # --skip-build, because a plain `swift test` relinks the test bundle and
+      # deletes the metallib the step above just placed inside it.
       - name: Test
-        run: swift test
+        run: swift test --skip-build

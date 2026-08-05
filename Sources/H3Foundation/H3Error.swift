@@ -42,6 +42,12 @@ public enum H3Error: Error, CustomStringConvertible, Sendable {
     /// A count limit from the reference node: 9 images, 3 videos, 3 audio.
     case tooManyReferences(kind: String, got: Int, limit: Int)
 
+    /// A request that is malformed before any of the specific rules above apply.
+    ///
+    /// Carries the same three parts as every other refusal so that "generic"
+    /// never means "unhelpful".
+    case invalidRequest(rule: String, detail: String, remedy: String)
+
     // MARK: checkpoints
 
     /// A checkpoint whose vendor could not be established from `__metadata__`.
@@ -103,6 +109,8 @@ public enum H3Error: Error, CustomStringConvertible, Sendable {
             return "conflicting conditioning: \(detail)"
         case let .tooManyReferences(kind, got, limit):
             return "\(got) \(kind) references; the reference node accepts at most \(limit)."
+        case let .invalidRequest(rule, detail, remedy):
+            return "\(rule): \(detail)\n  remedy: \(remedy)"
         case let .unidentifiedCheckpoint(url, detail):
             return "cannot identify \(url.lastPathComponent): \(detail). Refusing rather than "
                  + "guessing — the published bf16 conversions store fused attention weights in "
