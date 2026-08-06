@@ -15,8 +15,17 @@ package struct BenchmarkComparison {
     package struct Row {
         package let arm: String
         package let runs: Int
-        /// Median across repeats of each run's own median step time.
-        package let medianStepSeconds: Double
+        /// Median across repeats of each run's mean step time — the comparison
+        /// figure. Median *across repeats* to shrug off one contaminated run;
+        /// mean *within* a run because a cached render's step times are two
+        /// populations and a median inside a run picks one of them.
+        package let meanStepSeconds: Double
+        /// Median cost of the steps that ran the full stack.
+        ///
+        /// Beside the mean because the two separate a kernel win from a cache
+        /// win: a fused kernel makes full steps cheaper and shows up here, a
+        /// looser threshold skips more of them and does not.
+        package let fullStepSeconds: Double
         /// Spread across repeats, as a fraction of the median.
         ///
         /// **The number that says whether any of this means anything.** A 5%
@@ -60,8 +69,10 @@ package struct BenchmarkComparison {
         var rows: [Row] = []
         var unusable: [String] = []
         for (arm, runs) in byArm.sorted(by: { $0.key < $1.key }) {
-            let medians = runs.map(\.trace.medianStepSeconds).filter(\.isFinite)
+            let medians = runs.map(\.trace.meanStepSeconds).filter(\.isFinite)
             let median = SamplingTrace.median(medians)
+            let fullStep = SamplingTrace.median(
+                runs.map(\.trace.medianFullStepSeconds).filter(\.isFinite))
             // Full range rather than a standard deviation: with two or three
             // repeats a standard deviation is mostly a statement about the
             // sample size, while the spread between best and worst is exactly
@@ -89,7 +100,7 @@ package struct BenchmarkComparison {
                 let problems = mine.incomparabilities(with: base)
                 if problems.isEmpty {
                     let controlMedian = SamplingTrace.median(
-                        controlRuns.map(\.trace.medianStepSeconds))
+                        controlRuns.map(\.trace.meanStepSeconds))
                     if median > 0, controlMedian.isFinite { speedup = controlMedian / median }
                 } else {
                     refusals = problems
@@ -100,7 +111,8 @@ package struct BenchmarkComparison {
                 unusable.append(arm)
             }
 
-            rows.append(Row(arm: arm, runs: runs.count, medianStepSeconds: median,
+            rows.append(Row(arm: arm, runs: runs.count, meanStepSeconds: median,
+                            fullStepSeconds: fullStep,
                             repeatSpread: spread, stepsSkippedFraction: skipped,
                             peakGB: peak, speedup: speedup, refusals: refusals,
                             configurationDrift: drift))
@@ -112,17 +124,19 @@ package struct BenchmarkComparison {
     /// The table, for a terminal.
     package var report: String {
         var out = "control: \(controlArm)\n\n"
-        out += String(format: "  %-34@ %5@ %10@ %8@ %8@ %8@ %8@\n",
+        out += String(format: "  %-30@ %4@ %9@ %9@ %7@ %8@ %7@ %8@\n",
                       "arm" as NSString, "runs" as NSString, "s/step" as NSString,
-                      "spread" as NSString, "speedup" as NSString, "reused" as NSString,
-                      "peak GB" as NSString)
+                      "full step" as NSString, "spread" as NSString, "speedup" as NSString,
+                      "reused" as NSString, "peak GB" as NSString)
         for r in rows {
             let speed = r.speedup.map { String(format: "%.2fx", $0) } ?? "—"
-            out += String(format: "  %-34@ %5d %10.2f %7.1f%% %8@ %7.0f%% %8.1f\n",
-                          r.arm as NSString, r.runs, r.medianStepSeconds,
+            out += String(format: "  %-30@ %4d %9.2f %9.2f %6.1f%% %8@ %6.0f%% %8.1f\n",
+                          r.arm as NSString, r.runs, r.meanStepSeconds, r.fullStepSeconds,
                           r.repeatSpread * 100, speed as NSString,
                           r.stepsSkippedFraction * 100, r.peakGB)
         }
+        out += "\n  s/step is the mean — wall clock. `full step` is the median cost of the\n"
+             + "  steps that ran the stack: a kernel win moves it, a looser cache does not.\n"
         // Every gain is printed next to the noise floor it has to clear, rather
         // than leaving the reader to find the spread column and do it.
         if let control = rows.first(where: { $0.arm == controlArm }), control.repeatSpread > 0 {

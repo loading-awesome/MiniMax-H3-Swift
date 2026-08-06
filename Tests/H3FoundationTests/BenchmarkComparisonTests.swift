@@ -60,7 +60,7 @@ struct BenchmarkComparisonTests {
         ])
         let row = try! #require(c.rows.first)
         #expect(row.runs == 3)
-        #expect(row.medianStepSeconds == 40)
+        #expect(row.meanStepSeconds == 40)
         #expect(abs(row.repeatSpread - 0.1) < 1e-9)
         #expect(c.report.contains("a gain smaller than that is not a gain"))
 

@@ -64,7 +64,18 @@ struct BenchmarkEmitterTests {
         // different arms of an experiment.
         let overrides = BenchmarkEmitter.environmentOverrides()
         #expect(overrides["H3_BENCH_ARM"] == nil)
-        #expect(overrides.allSatisfy { $0.key.hasPrefix("H3_") })
+        #expect(overrides.allSatisfy { $0.key.hasPrefix("H3_")
+                                       || $0.key.hasPrefix("resolved.") })
+    }
+
+    @Test("switches that are on by default are recorded as resolved values")
+    func defaultsAreRecordedNotAssumed() {
+        // Scraping the environment records the exception and stays silent about
+        // the rule: with nothing overridden, a run with fused modulation on and
+        // a run from before it existed both write an empty overrides map. The
+        // fused path is a different computation by a few ulps, so a comparison
+        // between those two has to be able to see it.
+        #expect(BenchmarkEmitter.environmentOverrides()["resolved.fusedModulation"] != nil)
     }
 
     // MARK: fixtures

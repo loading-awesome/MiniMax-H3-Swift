@@ -208,8 +208,12 @@ package struct BenchmarkRecord: Codable, Sendable, Equatable {
         return out
     }
 
-    /// This record's median step time relative to a control's. Above 1 is
-    /// faster.
+    /// This record's mean step time relative to a control's. Above 1 is faster.
+    ///
+    /// Mean, not median — see `SamplingTrace.meanStepSeconds`. A cached render
+    /// has two populations of step times and the median lands inside the
+    /// full-step one, which made a cache saving half the sampling time report a
+    /// speed-up of 1.00x.
     ///
     /// Throws rather than returning a number when the two are not comparable.
     /// The alternative — returning a ratio anyway and leaving a caveat in a log
@@ -217,7 +221,7 @@ package struct BenchmarkRecord: Codable, Sendable, Equatable {
     package func speedup(over control: BenchmarkRecord) throws -> Double {
         let problems = incomparabilities(with: control)
         guard problems.isEmpty else { throw Incomparable(reasons: problems) }
-        let mine = trace.medianStepSeconds, theirs = control.trace.medianStepSeconds
+        let mine = trace.meanStepSeconds, theirs = control.trace.meanStepSeconds
         guard mine.isFinite, theirs.isFinite, mine > 0 else { return .nan }
         return theirs / mine
     }

@@ -40,15 +40,32 @@ struct BenchmarkRecordTests {
             trace: SamplingTrace(steps: [], stepSeconds: stepSeconds))
     }
 
-    @Test("a speed-up over an identical control is the ratio of median step times")
+    @Test("a speed-up over an identical control is the ratio of mean step times")
     func speedupOverControl() throws {
         let control = Self.record(arm: "control-dense", stepSeconds: [40, 40, 40, 40, 40])
         let cached = Self.record(arm: "cached", stepSeconds: [40, 20, 20, 20, 40],
                                  cacheThreshold: 0.1)
-        // Medians are 40 and 20. Wall-clock totals are 200 and 140, which would
-        // have said 1.43x — the first and last steps every arm must run in full
-        // diluting the figure by a fixed amount that varies with step count.
-        #expect(try cached.speedup(over: control) == 2.0)
+        // Means are 40 and 28. This is what the render actually cost, including
+        // the first and last steps both arms are required to run in full.
+        #expect(abs(try cached.speedup(over: control) - 40.0 / 28.0) < 1e-9)
+    }
+
+    @Test("a bimodal cached run is not reported as no faster than dense")
+    func bimodalSpeedupIsNotHidden() throws {
+        // The shape of a real cached render, from the first control sweep:
+        // twelve full steps at 59.9 s, eight reused at 1.26 s. Against a dense
+        // control at 59.9 s throughout, the honest answer is 1.64x. Ranking on
+        // the median of each run would compare 59.9 against 59.9 and report the
+        // cache as worthless — which is what it did, before this test existed.
+        let dense = Self.record(arm: "control-dense",
+                                stepSeconds: [Double](repeating: 59.9, count: 20))
+        let cached = Self.record(arm: "cached",
+                                 stepSeconds: [Double](repeating: 59.9, count: 12)
+                                            + [Double](repeating: 1.26, count: 8),
+                                 cacheThreshold: 0.1)
+        let speedup = try cached.speedup(over: dense)
+        #expect(abs(speedup - 1.644) < 0.01)
+        #expect(cached.trace.medianStepSeconds == dense.trace.medianStepSeconds)
     }
 
     @Test("a different seed makes the two runs incomparable")

@@ -230,8 +230,8 @@ private enum RenderOperation {
             receipt.warnings.append(
                 contentsOf: BenchmarkEmitter.write(benchmark, besideVideo: result.video))
             receipt.benchmarkArm = arm
-            receipt.medianStepSeconds = result.trace.medianStepSeconds.isFinite
-                ? result.trace.medianStepSeconds : nil
+            receipt.secondsPerStep = result.trace.meanStepSeconds.isFinite
+                ? result.trace.meanStepSeconds : nil
             try write(receipt, to: receiptURL)
             logger.info("render completed job=\(jobID.uuidString, privacy: .public)")
             return result

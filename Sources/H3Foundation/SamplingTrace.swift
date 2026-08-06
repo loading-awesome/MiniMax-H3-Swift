@@ -66,6 +66,60 @@ package struct StepTrace: Sendable, Codable, Equatable {
         self.reason = reason
         self.consecutiveSkipsBefore = consecutiveSkipsBefore
     }
+
+    // MARK: - Codable
+
+    /// Non-finite deltas encode as JSON `null`, and decode back to infinity.
+    ///
+    /// **Not a style choice — the synthesised conformance could not encode this
+    /// type at all.** `JSONEncoder` throws `invalidValue` on any non-finite
+    /// Double, and step 0 of every render has no predecessor and therefore an
+    /// infinite change by construction. So the very first step of the very
+    /// first control run silently took the whole record down: the CSV wrote,
+    /// the receipt recorded "benchmark record not written", and there was no
+    /// `.h3-bench.json` anywhere.
+    ///
+    /// `null` rather than the string `"inf"`, which is the other way out: a
+    /// null is what every JSON reader already understands as "no value here",
+    /// and it matches what the CSV does with the same quantity. A record whose
+    /// numeric column is sometimes a string is not machine-readable in any
+    /// useful sense.
+    private enum CodingKeys: String, CodingKey {
+        case step, branch, sigma, wholeSequenceChange, videoChange, audioChange
+        case decision, reason, consecutiveSkipsBefore
+    }
+
+    package init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        step = try c.decode(Int.self, forKey: .step)
+        branch = try c.decode(Branch.self, forKey: .branch)
+        func number(_ key: CodingKeys) throws -> Double {
+            try c.decodeIfPresent(Double.self, forKey: key) ?? .infinity
+        }
+        sigma = try number(.sigma)
+        wholeSequenceChange = try number(.wholeSequenceChange)
+        videoChange = try number(.videoChange)
+        audioChange = try number(.audioChange)
+        decision = try c.decode(StepCachePolicy.Decision.self, forKey: .decision)
+        reason = try c.decode(StepCachePolicy.Reason.self, forKey: .reason)
+        consecutiveSkipsBefore = try c.decode(Int.self, forKey: .consecutiveSkipsBefore)
+    }
+
+    package func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(step, forKey: .step)
+        try c.encode(branch, forKey: .branch)
+        func put(_ v: Double, _ key: CodingKeys) throws {
+            if v.isFinite { try c.encode(v, forKey: key) } else { try c.encodeNil(forKey: key) }
+        }
+        try put(sigma, .sigma)
+        try put(wholeSequenceChange, .wholeSequenceChange)
+        try put(videoChange, .videoChange)
+        try put(audioChange, .audioChange)
+        try c.encode(decision, forKey: .decision)
+        try c.encode(reason, forKey: .reason)
+        try c.encode(consecutiveSkipsBefore, forKey: .consecutiveSkipsBefore)
+    }
 }
 
 extension StepCachePolicy.Decision: Codable {
@@ -127,13 +181,57 @@ package struct SamplingTrace: Sendable, Codable, Equatable {
                                 : (f[f.count / 2 - 1] + f[f.count / 2]) / 2
     }
 
-    /// Seconds per step, median — the figure to compare across configurations.
+    /// **The figure to compare configurations on: mean seconds per step.**
     ///
-    /// **Not the mean, and not the total divided by steps.** Both are dominated
-    /// by the first and last steps, which every configuration is required to
-    /// run in full, so both understate the difference between two cache
-    /// settings by a fixed amount that varies with step count.
+    /// This was the median, and the median was badly wrong. The reasoning was
+    /// that the first and last steps run in full under every configuration and
+    /// dilute an average — true, and irrelevant next to what it missed. A
+    /// cached render's step times are not one distribution with outliers, they
+    /// are **two populations**: measured on the first control run, full steps
+    /// cost 59.9 s and reused steps cost 1.26 s, with nothing in between. Twelve
+    /// full and eight reused puts the median squarely inside the full-step
+    /// population, so the cached arm reported 59.7 s — within noise of what
+    /// dense would report — and the speed-up came out at roughly 1.00x for a
+    /// cache saving nearly half the sampling time.
+    ///
+    /// The mean is what wall clock is made of, and the first/last-step dilution
+    /// it carries is real cost that both arms pay.
+    package var meanStepSeconds: Double {
+        let f = stepSeconds.filter(\.isFinite)
+        guard !f.isEmpty else { return .nan }
+        return f.reduce(0, +) / Double(f.count)
+    }
+
+    /// Median seconds per step — a **diagnostic, not a comparison figure.**
+    ///
+    /// Kept because within a single population it says something the mean does
+    /// not: paired with `medianFullStepSeconds` it shows whether a change made
+    /// individual steps cheaper or merely skipped more of them. Those are
+    /// different achievements and only the first one composes with anything
+    /// else.
     package var medianStepSeconds: Double { Self.median(stepSeconds) }
+
+    /// Median cost of the steps that actually ran the stack.
+    ///
+    /// The number a kernel optimisation has to move. A cache change moves the
+    /// *count* of these; a fused kernel moves their *cost*. An improvement that
+    /// shows up in the mean but not here came from skipping more, which is a
+    /// quality trade and not a speed-up.
+    package var medianFullStepSeconds: Double {
+        Self.median(secondsOf(.runFull))
+    }
+
+    package var medianReusedStepSeconds: Double {
+        Self.median(secondsOf(.reuse))
+    }
+
+    /// Step times for the steps with a given decision, on the conditional
+    /// branch. One branch, because a step's wall clock covers both CFG forwards
+    /// and attributing it to each separately would double-count it.
+    private func secondsOf(_ decision: StepCachePolicy.Decision) -> [Double] {
+        steps.filter { $0.branch == .conditional && $0.decision == decision }
+             .compactMap { $0.step < stepSeconds.count ? stepSeconds[$0.step] : nil }
+    }
 
     /// The one-line form, for a terminal.
     package func summary(threshold: Double, perStreamProbe: Bool) -> String {

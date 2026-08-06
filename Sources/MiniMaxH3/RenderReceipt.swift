@@ -67,16 +67,17 @@ public struct RenderReceipt: Codable, Sendable {
     /// The label of the configuration this run measured, matching the `arm`
     /// field of the `.h3-bench.json` written beside the video.
     public var benchmarkArm: String?
-    /// Median seconds per sampler step.
+    /// Mean seconds per sampler step.
     ///
     /// Here as well as in the benchmark file because it is the one number worth
-    /// reading without opening anything else — and the median rather than
-    /// `sampling / steps`, which every configuration inflates by the first and
-    /// last steps it is required to run in full.
-    public var medianStepSeconds: Double?
+    /// reading without opening anything else. Mean rather than median: under
+    /// the cache a render's step times are two populations — full steps around
+    /// 60 s, reused steps around 1.3 s — and a median falls inside one of them
+    /// and reports it as though it were the render's cost.
+    public var secondsPerStep: Double?
 
     init(jobID: UUID, request: RequestSummary, environment: Environment) {
-        // 2 adds `benchmarkArm`, `medianStepSeconds`, and a `model_load` phase
+        // 2 adds `benchmarkArm`, `secondsPerStep`, and a `model_load` phase
         // that used to be counted in no phase at all.
         schemaVersion = 2
         self.jobID = jobID
