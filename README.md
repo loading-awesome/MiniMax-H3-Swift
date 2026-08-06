@@ -3,38 +3,32 @@
 Type a sentence, get a video **with the sound already in it**. No GPU rental, no
 Python environment, no node graph. One command, on your Mac.
 
-<video src="https://github.com/loading-awesome/MiniMax-H3-Swift/raw/main/docs/media/stoplight.mp4" controls muted playsinline width="100%"></video>
+[![Two drivers at a stoplight](demo-media/stoplight.jpg)](demo-media/stoplight.mp4)
 
-<sub>Rendered by this tool: 864×480, 7 s, 20 steps. The dialogue, the engine
-noise and the music were generated *together with the picture* — nothing was
-dubbed on afterwards. [Download](docs/media/stoplight.mp4) if your browser will
-not play it inline.</sub>
+<sub>**Two drivers at a stoplight.** 864×480, 7 s, 20 steps. The dialogue, the
+engine noise and the music were generated *together with the picture* — nothing
+was dubbed on afterwards. Click any still to get the clip; GitHub will not play
+video inline in a README.</sub>
 
 ```bash
 h3 render --prompt "a red kite over a beach at sunset" --out kite.mp4
 ```
 
-### Three more, from one command each
+### Three more, one command each
 
-Same settings, no flags — 864×480, 7 s, 20 steps, about 19 minutes apiece on a
-Mac Studio. **Every soundtrack below came out of the same forward pass as the
-picture**: the voices, the room they are in, and the score.
+No flags — 864×480, 7 s, 20 steps, about 19 minutes apiece on a Mac Studio.
 
-<video src="https://github.com/loading-awesome/MiniMax-H3-Swift/raw/main/docs/media/race.mp4" controls muted playsinline width="100%"></video>
+[![A drag race](demo-media/race.jpg)](demo-media/race.mp4)
 
-<sub>**Two speakers.** Both characters, both voices and both engines from one
-prompt. [Download](docs/media/race.mp4)</sub>
+<sub>**A drag race.** Two speakers, both voices and both engines from one prompt.</sub>
 
-<video src="https://github.com/loading-awesome/MiniMax-H3-Swift/raw/main/docs/media/anime.mp4" controls muted playsinline width="100%"></video>
+[![An anime girl at her computer](demo-media/anime.jpg)](demo-media/anime.mp4)
 
-<sub>**A different look entirely** — cel-shaded, with rain on the window and a
-piano under it, none of which is a filter over the first clip's world.
-[Download](docs/media/anime.mp4)</sub>
+<sub>**An anime girl at her computer.** Rain on the window and a piano under it.</sub>
 
-<video src="https://github.com/loading-awesome/MiniMax-H3-Swift/raw/main/docs/media/scifi.mp4" controls muted playsinline width="100%"></video>
+[![Two officers on a starship bridge](demo-media/scifi.jpg)](demo-media/scifi.mp4)
 
-<sub>**Dialogue against a score.** Two speakers over ship tone and strings, mixed
-in the same pass rather than laid over the top. [Download](docs/media/scifi.mp4)</sub>
+<sub>**Two officers on a starship bridge.** Dialogue over ship tone and strings.</sub>
 
 ---
 
@@ -366,9 +360,9 @@ Useful `render` options:
 back with Whisper at a word error rate of **0.00** against the prompt's line,
 and a face was detected with landmarks in **124 of 124 frames**.
 
-<video src="https://github.com/loading-awesome/MiniMax-H3-Swift/raw/main/docs/media/talking-head.mp4" controls muted playsinline width="100%"></video>
+[![A woman in a kitchen](demo-media/talking-head.jpg)](demo-media/talking-head.mp4)
 
-<sub>[Download](docs/media/talking-head.mp4)</sub>
+<sub>**A woman in a kitchen.**</sub>
 
 ---
 
