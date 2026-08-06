@@ -92,6 +92,23 @@ numbers mattered.
 Eight renders, 864×480×124, 20 steps, seed 7, one prompt, one machine, one
 binary.
 
+> **Every number in this section is conditioned on one easy prompt** — "a red
+> kite over a beach at sunset". Smooth sky, sand and water, almost no
+> high-frequency content. It was chosen for being the README's example, which
+> made it a convenient control and a poor probe.
+>
+> That conditions the speed figures and not only the quality ones. Reuse count
+> depends on how far the residual moves per step, so a calm scene qualifies
+> more steps than a busy one: **45% reuse and 1.79× are an easy-content result,
+> and were first reported as though they were general.** Expect both to fall on
+> demanding content.
+>
+> Content-independent, and therefore still safe to quote: the replay model,
+> which takes deltas as input; the instrument itself; and the 6B fusion verdict,
+> which is a memory-traffic argument that does not care what is in the frame.
+>
+> See *Detail-probe re-test* below.
+
 ```
 arm                             runs    s/step  full step   spread  speedup  reused
 control-dense                      2     59.39      59.21     1.4%    1.00x      0%
@@ -333,6 +350,31 @@ together there. It shows up wherever the cap does not coincidentally fire first.
 Unbounded reuse. The protocol gated it on caps 4–6 establishing a safe trend,
 and they establish the opposite. It would be a cliff-finding experiment with the
 cliff already located.
+
+### Detail-probe re-test *(running)*
+
+**The sweep above was run on a scene with almost no fine detail to lose**, which
+is a poor way to measure detail loss. Two probes chosen for what the beach
+lacked:
+
+| probe | what it adds |
+|---|---|
+| `foliage` | maximum high-frequency content — ferns, bark, dappled light — with motion through it |
+| `speaker` | a face, lip-sync, spoken dialogue and patterned fabric, on a scene that still carries texture |
+
+Arms: `dense`, `cap3`, `cap5` on foliage — dense to re-establish the detail
+ceiling on content that has one — and `cap3` vs `cap5` on speaker. Cap 5 because
+it is the only arm that cleared the speed gate; cap 4 bought nothing and cap 6
+tracked cap 5.
+
+Three questions this settles that the beach could not:
+
+1. **Does the cache still buy 1.79×** when the residual has more to move?
+2. **Is the cap cliff worse, or was it an artefact of a low-detail scene?**
+   Both directions are live: more detail means more to lose, but the Laplacian
+   on a near-featureless frame is also easy to move by a large relative fraction.
+3. **Does lip-sync or speech break before detail does** on a scene that has any?
+   The beach had no voice, so the audio gates were never really exercised.
 
 ---
 
