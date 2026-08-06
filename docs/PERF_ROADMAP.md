@@ -236,9 +236,9 @@ unless a later trace shows a threshold-controlled region worth fitting — the
 cache already identifies the useful middle window without one.
 
 ```
-1. Consecutive-cap sweep: 4 -> 5 -> 6            <- 6C, below
-2. Full coherence gates on any faster arm
-3. AdaLN schedule batching
+1. Consecutive-cap sweep: 4 -> 5 -> 6            DONE — all arms rejected
+2. Full coherence gates on any faster arm        n/a, nothing qualified
+3. AdaLN schedule batching                       <- next
 4. MLX dense-block compilation
 5. Canonical weight layout and GEMM profiling
 6. Selective resident quantized matmul research
@@ -248,9 +248,95 @@ Items 3–6 are untried and, unlike 6B, are not bounded above by activation
 traffic — 6B measured 1% because a step at this shape is bound by attention and
 the large GEMMs, which is where 5 and 6 aim.
 
+**Two of the three cache levers are now measured and both are already at their
+best setting.** The threshold does not control the middle of the schedule and
+the cap cannot be relaxed without paying more in detail than it returns in
+speed. What remains for the cache is not a tuning knob; it would have to be a
+different cache — one that refreshes the residual partially, or per stream,
+rather than all-or-nothing. That is a design, not a sweep, and it is not
+obviously worth it against a 1.79× baseline.
+
+So the remaining honest headroom is in items 3–6, which are about the GEMMs and
+the attention that actually dominate a step.
+
 ---
 
-## 6C — Consecutive-cap sweep *(next)*
+## 6C — Consecutive-cap sweep *(measured; all arms rejected; cap stays at 3)*
+
+**Verdict: raising the cap loses more detail than it gains speed, at every
+setting tried.** The shipping cap of 3 is where it should be.
+
+```
+arm                  speed   detail   accel   trade
+cap-3 (shipping)    1.000x    1.000   1.000   baseline
+cap-4               1.016x    0.978   1.031   +1.6% speed for -2.2% detail
+cap-5               1.098x    0.884   1.031   +9.8% speed for -11.6% detail
+cap-6               1.100x    0.846   1.021   +10.0% speed for -15.4% detail
+
+for scale, the cache itself buys +79% speed for -8.9% detail
+```
+
+Speed is end-to-end against `cap-3-recheck`; detail and accel are relative,
+from `Tools/coherence_check.py`, on a 0.5% noise floor.
+
+**The failure mode is softening, not warping.** Acceleration barely moves
+(1.02–1.03) and the pulse band stays clean, so every temporal measure says
+these renders are fine. They are not — caps 5 and 6 have lost 12% and 15% of
+their high-frequency detail. This is exactly the trap the blur guard exists
+for, and ranking on temporal stability alone would have promoted cap 6 as the
+steadiest arm in the set.
+
+**Audio is not the constraint.** Spectral correlation stays at 0.993–0.997 and
+envelope correlation above 0.99 across every cap. For once the picture degrades
+first.
+
+### The answer to the question that was actually open
+
+*How old can a reused full-stack residual get before coherence breaks?*
+The cliff is between allowing **four** and allowing **five** consecutive
+reuses:
+
+| step from → to | marginal detail cost |
+|---|---|
+| cap 3 → 4 | −2.2% |
+| cap 4 → 5 | −9.4% |
+| cap 5 → 6 | −3.8% |
+
+Cap 4 is the clean experiment and the informative one: **it does the same
+amount of work as cap 3** — nine reuses, refreshes merely relocated from
+7/11/15 to 8/13 — and still loses 2.2% of detail for a speed change inside the
+noise. Residual *age* therefore costs something on its own, independently of
+how many steps get skipped. There is no free placement.
+
+### The replay model was exact
+
+Every rendered arm reproduced its projection, step for step:
+
+| cap | projected reuses | actual | projected refreshes | actual |
+|---|---|---|---|---|
+| 3 | 9 | 9 | 7, 11, 15 | 7, 11, 15 |
+| 4 | 9 | 9 | 8, 13 | 8, 13 |
+| 5 | 10 | 10 | 9, 15 | 9, 15 |
+| 6 | 10 | 10 | 10 | 10 |
+
+So the offline replay can be trusted to *screen* future policy proposals, which
+is worth about an hour of GPU per rejected idea. It says nothing about quality,
+which is the part that decided this.
+
+One correction to the prose that preceded the sweep: the sole-audio veto at step
+15 appears at caps **4 and 6**, not "first at cap 6". At cap 5 the counter
+happens to reach its ceiling at step 15 as well, so cap and audio object
+together there. It shows up wherever the cap does not coincidentally fire first.
+
+### Not run
+
+Unbounded reuse. The protocol gated it on caps 4–6 establishing a safe trend,
+and they establish the opposite. It would be a cliff-finding experiment with the
+cliff already located.
+
+---
+
+### The sweep as it was specified
 
 Improve the existing cache **without changing its residual semantics.**
 
