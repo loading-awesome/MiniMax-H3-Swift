@@ -464,7 +464,9 @@ package struct H3Transformer {
             if Self.tappedBlocks.contains(0) { tapsOut.blocks[0] = h }
 
             switch cache.decide(probe: h - hIn, audioRange: layout.audioRange,
-                                step: step, totalSteps: total) {
+                                videoRange: layout.videoRange,
+                                step: step, totalSteps: total,
+                                sigma: Double(plan.sigmaVideo)) {
             case .reuse(let residual):
                 h = hIn + residual
             case .runFull:

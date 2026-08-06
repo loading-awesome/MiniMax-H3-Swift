@@ -220,6 +220,18 @@ private enum RenderOperation {
             if !result.muxedAudio {
                 receipt.warnings.append("audio mux failed; recovery WAV retained")
             }
+
+            // The benchmark record, written beside the video on every render.
+            // See `BenchmarkEmitter` for why this is not opt-in.
+            let arm = BenchmarkEmitter.armName(request: request, result: result)
+            let benchmark = BenchmarkEmitter.record(
+                arm: arm, request: request, result: result,
+                checkpoints: receipt.checkpoints, machine: machine, dimensions: dimensions)
+            receipt.warnings.append(
+                contentsOf: BenchmarkEmitter.write(benchmark, besideVideo: result.video))
+            receipt.benchmarkArm = arm
+            receipt.medianStepSeconds = result.trace.medianStepSeconds.isFinite
+                ? result.trace.medianStepSeconds : nil
             try write(receipt, to: receiptURL)
             logger.info("render completed job=\(jobID.uuidString, privacy: .public)")
             return result
@@ -257,14 +269,10 @@ private enum RenderOperation {
     }
 
     private static func timings(_ value: RenderResult.Timings) -> [String: TimeInterval] {
-        ["text_conditioning": value.textConditioning,
-         "condition_encoding": value.conditionEncoding,
-         "sampling": value.sampling,
-         "audio_decode": value.audioDecode,
-         "video_decode": value.videoDecode,
-         "pixel_pack": value.pixelPack,
-         "mux": value.mux,
-         "total": value.total]
+        // One source for the phase names, shared with the benchmark record, so
+        // the two files beside a render cannot disagree about what a phase is
+        // called or which phases exist.
+        value.asDictionary
     }
 
     private static func outputRecords(_ result: RenderResult) -> [RenderReceipt.Output] {

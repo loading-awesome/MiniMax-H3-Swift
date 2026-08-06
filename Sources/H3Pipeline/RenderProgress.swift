@@ -2,6 +2,7 @@
 // Copyright 2026 Sean Kammerich
 
 import Foundation
+import H3Foundation
 
 /// Where a render has got to, and the way to stop it.
 ///
@@ -96,9 +97,34 @@ public struct RenderResult: Sendable {
     /// retained a playable video plus a recovery WAV.
     public let muxedAudio: Bool
 
+    /// Per-step measurements, decisions and wall clock. `package` rather than
+    /// `public`: this is the evidence trail for tuning work inside the package,
+    /// and freezing its shape into the public API would make every future
+    /// column a source-breaking change.
+    package var trace = SamplingTrace()
+    /// MLX's own allocation peak for the whole render, in bytes. **Not resident
+    /// set** — the checkpoints are mapped, not allocated, and do not appear
+    /// here.
+    package var mlxPeakBytes: UInt64 = 0
+    package var mlxActiveBytesAtEnd: UInt64 = 0
+    /// The attention backend that actually ran, as resolved — not as requested.
+    /// `auto` resolving to `sdpa` and `auto` resolving to something else are
+    /// different runs, and a record that stored the request would call them
+    /// the same.
+    package var attentionBackend = "unknown"
+
     public struct Timings: Sendable {
         public var textConditioning: TimeInterval = 0
         public var conditionEncoding: TimeInterval = 0
+        /// Reading the 66 GB DiT and building the module tree.
+        ///
+        /// **Its own phase because it used to be nobody's.** The sampling clock
+        /// started after the load, and `total` was the sum of the phases, so a
+        /// minute or more of every render belonged to no bucket and vanished
+        /// from the accounting. Harmless while nothing depended on the numbers;
+        /// not harmless in a benchmark, where unattributed time is the first
+        /// place a regression hides.
+        public var modelLoad: TimeInterval = 0
         public var sampling: TimeInterval = 0
         public var audioDecode: TimeInterval = 0
         public var videoDecode: TimeInterval = 0
@@ -109,9 +135,10 @@ public struct RenderResult: Sendable {
         public init(textConditioning: TimeInterval, conditionEncoding: TimeInterval,
                     sampling: TimeInterval, audioDecode: TimeInterval,
                     videoDecode: TimeInterval, pixelPack: TimeInterval,
-                    mux: TimeInterval) {
+                    mux: TimeInterval, modelLoad: TimeInterval = 0) {
             self.textConditioning = textConditioning
             self.conditionEncoding = conditionEncoding
+            self.modelLoad = modelLoad
             self.sampling = sampling
             self.audioDecode = audioDecode
             self.videoDecode = videoDecode
@@ -120,8 +147,14 @@ public struct RenderResult: Sendable {
         }
 
         public var total: TimeInterval {
-            textConditioning + conditionEncoding + sampling
+            textConditioning + conditionEncoding + modelLoad + sampling
                 + audioDecode + videoDecode + pixelPack + mux
+        }
+
+        package var asDictionary: [String: TimeInterval] {
+            ["text_conditioning": textConditioning, "condition_encoding": conditionEncoding,
+             "model_load": modelLoad, "sampling": sampling, "audio_decode": audioDecode,
+             "video_decode": videoDecode, "pixel_pack": pixelPack, "mux": mux, "total": total]
         }
     }
 

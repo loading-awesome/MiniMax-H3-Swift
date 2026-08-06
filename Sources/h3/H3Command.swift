@@ -26,6 +26,7 @@ struct H3: AsyncParsableCommand {
                                  and what it would choose. Takes about a second.
               h3 config init     write a config file to fill in with your model paths
               h3 render          make a video
+              h3 bench           compare renders you have already made
 
             A first render, once `h3 doctor` reports no problems:
 
@@ -37,6 +38,6 @@ struct H3: AsyncParsableCommand {
             loading a checkpoint.
             """,
         version: MiniMaxH3.version,
-        subcommands: [Doctor.self, ConfigCommand.self, RenderCommand.self]
+        subcommands: [Doctor.self, ConfigCommand.self, RenderCommand.self, BenchCommand.self]
     )
 }

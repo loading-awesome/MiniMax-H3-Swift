@@ -64,8 +64,21 @@ public struct RenderReceipt: Codable, Sendable {
     public var errorCode: String?
     public var errorMessage: String?
 
+    /// The label of the configuration this run measured, matching the `arm`
+    /// field of the `.h3-bench.json` written beside the video.
+    public var benchmarkArm: String?
+    /// Median seconds per sampler step.
+    ///
+    /// Here as well as in the benchmark file because it is the one number worth
+    /// reading without opening anything else — and the median rather than
+    /// `sampling / steps`, which every configuration inflates by the first and
+    /// last steps it is required to run in full.
+    public var medianStepSeconds: Double?
+
     init(jobID: UUID, request: RequestSummary, environment: Environment) {
-        schemaVersion = 1
+        // 2 adds `benchmarkArm`, `medianStepSeconds`, and a `model_load` phase
+        // that used to be counted in no phase at all.
+        schemaVersion = 2
         self.jobID = jobID
         status = .running
         startedAt = .now
