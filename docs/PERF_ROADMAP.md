@@ -155,9 +155,37 @@ attributed to a configuration change.**
 calibration — "dense carries 8.4% more high-frequency detail than cached, which
 is the cache's actual quality cost". That number was 1.084 measured on
 downsampled frames; natively it is 1.013, and dense sits at dssim 0.0138, which
-is a different scene. **So the cache's quality cost has never actually been
-measured here.** It was a filter artefact attached to an invalid comparison,
-quoted three times before it was checked.
+is a different scene. It was a filter artefact attached to an invalid
+comparison, and it was quoted three times before it was checked.
+
+**That does not mean the cache's cost is unmeasured — it means this session
+measured it badly.** `docs/ACCELERATION.md` has a threshold sweep from
+2026-08-05 that is better controlled than anything above:
+
+| threshold | skipped | speedup | detail (lap var) | vs control |
+|---|---|---|---|---|
+| control | 0/20 | — | 0.00349 | — |
+| 0.05 | 0/20 | none | 0.00349 | **0%** |
+| 0.10 | 10/20 | 1.93× | 0.00293 | −16% |
+| 0.15 | 13/20 | 2.60× | 0.00250 | −28% |
+| 0.25 | 14/20 | 2.93× | 0.00197 | −44% |
+
+Three things make that stronger than the measurements in this document. It has
+a **zero-skip negative control** — at threshold 0.05 the cache was live and
+never fired, and the output came back bit-identical to the uncached run, which
+proves the block-0 split perturbs nothing by itself and that divergence comes
+only from actual skipping. It shows a **monotonic dose-response** across four
+points, which noise and recomposition do not produce. And its absolute values
+(0.0035, 0.0029) sit in the same range as the *native* measurements here
+(0.0021), not the downsampled ones (0.0068), so it was very likely measured at
+full resolution.
+
+**So the shipped claim of 16% stands, and it is the threshold axis.** The cap
+axis is a different question, and the threshold table gives it a useful prior:
+if detail cost tracks the number of skipped steps, then going from 9 skips to
+10 — which is all cap 5 does — should cost roughly a tenth of 16%, call it 1.6%.
+That is consistent with cap 5 clearing a viewing when the metrics had wrongly
+condemned it.
 
 **Do not run anything else on the GPU during a control sweep.** Test runs taken
 beside the first attempt moved its step time from 25 s to 29 s, larger than most
