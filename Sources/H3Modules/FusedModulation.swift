@@ -136,13 +136,47 @@ package enum FusedModulation {
         outputNames: ["out"],
         source: gateSource)
 
-    /// Set `H3_FUSED_MODULATION=0` to force the readable path at run time.
+    /// **Off by default: measured, and it did not clear its gate.**
     ///
-    /// Here so that a suspected numerical difference can be bisected on a real
-    /// render without a rebuild — the case where a differential unit test has
-    /// already passed and the disagreement is somewhere else.
+    /// Eight controlled renders at 864x480x124, 20 steps, one seed, one
+    /// machine, fusion switched inside a single binary so the comparison
+    /// isolated the kernel:
+    ///
+    /// | arm | mean s/step | median full step |
+    /// |---|---|---|
+    /// | `control-cached` (3 runs) | 33.23 | 58.84 |
+    /// | `fused-cached` (3 runs)   | 32.64 | 58.29 |
+    ///
+    /// **1.81% on wall clock, 0.94% on the steps the kernel actually touches**,
+    /// against a gate of 5%. The gain is real — the two sets of runs do not
+    /// overlap, and the full-step figure repeats to 0.1% — it is simply small.
+    ///
+    /// The arithmetic said so before the kernel was written, and doing it
+    /// afterwards is the lesson worth keeping: roughly fourteen `[S, hidden]`
+    /// tensor passes saved per block, 169 MB each, fifty blocks, is about
+    /// 118 GB — a few hundred milliseconds against a 58.8-second step. A step
+    /// at this shape is bound by attention and the large GEMMs, not by
+    /// modulation traffic. MLX also fuses elementwise chains of its own, so the
+    /// path being replaced was never as naive as the source reads.
+    ///
+    /// It is also **not a free swap**: the norm's reduction reassociates, and a
+    /// few ulps at block 0 propagate through fifty blocks and twenty steps into
+    /// a different render. Same quality, different pixels — which means
+    /// enabling it would need its own quality pass. For 1%, that is not a trade
+    /// worth making.
+    ///
+    /// Kept rather than deleted because the measurement is machine-specific:
+    /// the ratio of memory bandwidth to compute is what makes this small here,
+    /// and that ratio is not the same on every Apple part. `H3_FUSED_MODULATION=1`
+    /// turns it on; anyone who does should re-run the controls first.
+    ///
+    /// **Read by `DiTBlock`, not by the entry points below.** The kernels
+    /// answer "is this a shape I can do", the caller answers "should I". Wiring
+    /// the switch into the kernels made every differential test decline the
+    /// moment the default flipped, which would have left a disabled kernel
+    /// covered by a suite that silently tested nothing.
     package static let enabled: Bool =
-        ProcessInfo.processInfo.environment["H3_FUSED_MODULATION"] != "0"
+        ProcessInfo.processInfo.environment["H3_FUSED_MODULATION"] == "1"
 
     /// Fused `modScaleShift(norm(x), shift:scale:index:)`.
     ///
@@ -152,7 +186,6 @@ package enum FusedModulation {
     package static func modulatedRMSNorm(_ x: MLXArray, weight: MLXArray, eps: Float,
                                          shift: MLXArray, scale: MLXArray,
                                          index: ModulationIndex) -> MLXArray? {
-        guard enabled else { return nil }
         // The refiner's batched text path is three dimensional and a few hundred
         // rows; it is not worth a second kernel and it is not where the time is.
         guard x.ndim == 2, weight.ndim == 1 else { return nil }
@@ -182,7 +215,6 @@ package enum FusedModulation {
     /// Fused `modGate(x, gate:other:index:)`.
     package static func gatedResidual(_ x: MLXArray, gate: MLXArray, other: MLXArray,
                                       index: ModulationIndex) -> MLXArray? {
-        guard enabled else { return nil }
         guard x.ndim == 2, other.ndim == 2, gate.ndim == 2 else { return nil }
         let s = x.dim(0), h = x.dim(1)
         guard other.dim(0) == s, other.dim(1) == h, gate.dim(1) == h,

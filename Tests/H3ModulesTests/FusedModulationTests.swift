@@ -285,6 +285,9 @@ struct FusedModulationTests {
         let tokens = 96, hidden = 256, heads = 4, headDim = 64, ffn = 512, rowCount = 6
         func r(_ shape: [Int]) -> MLXArray { MLXRandom.normal(shape).asType(.float32) * 0.05 }
 
+        // `fuseModulation: true` explicitly. The default is off — it did not
+        // clear its gate — and a block built at the default would compare the
+        // readable path against itself and pass having tested nothing.
         let block = DiTBlock(
             norm1: H3RMSNorm(weight: r([hidden]), eps: 1e-6),
             norm2: H3RMSNorm(weight: r([hidden]), eps: 1e-6),
@@ -294,7 +297,8 @@ struct FusedModulationTests {
                                  heads: heads, headDim: headDim, eps: 1e-6),
             mlp: H3MLP(fc1: r([2 * ffn, hidden]), fc2: r([hidden, ffn])),
             adaln: AdalnProj(weight: r([6 * hidden * 3, 32]), bias: nil,
-                             expand: 6, modalities: 3, hidden: hidden))
+                             expand: 6, modalities: 3, hidden: hidden),
+            fuseModulation: true)
 
         let x = r([tokens, hidden])
         let tEmb = r([rowCount / 3, 32])
@@ -319,5 +323,19 @@ struct FusedModulationTests {
         let relRMS = MLX.sqrt(MLX.mean(d * d)).item(Float.self)
             / MLX.sqrt(MLX.mean(want.asType(.float32) * want.asType(.float32))).item(Float.self)
         #expect(relRMS < 1e-5, "block-level relative RMS \(relRMS)")
+        // And the fused block must not be the unfused one wearing a label: if
+        // these were bit-identical the test above would pass with the fusion
+        // switched off, which is how it read for one commit.
+        #expect(relRMS > 0, "the fused block produced the unfused result exactly, so the kernel is not being reached")
+    }
+
+    @Test("the shipping default is the readable path")
+    func defaultIsUnfused() {
+        // The gate was 5%; it measured 1.81% on wall clock and 0.94% on the
+        // steps it touches. Asserted rather than left to a doc comment, because
+        // a default that drifts back on would change every render's pixels for
+        // one percent.
+        #expect(FusedModulation.enabled == false
+                || ProcessInfo.processInfo.environment["H3_FUSED_MODULATION"] == "1")
     }
 }

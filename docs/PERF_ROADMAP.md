@@ -87,17 +87,62 @@ together.
 so a minute or more of every render belonged to nobody. Harmless until the
 numbers mattered.
 
-### Acceptance
+### The controls *(measured 2026-08-06)*
 
-Repeated control runs — `control-cached` and `control-dense`, same prompt, same
-seed, same shape — establish the timing variance every later claim has to clear.
+Eight renders, 864×480×124, 20 steps, seed 7, one prompt, one machine, one
+binary.
+
+```
+arm                             runs    s/step  full step   spread  speedup  reused
+control-dense                      2     59.39      59.21     1.4%    1.00x      0%
+control-cached                     3     33.23      58.84     1.1%    1.79x     45%
+fused-cached                       3     32.64      58.29     0.9%    1.82x     45%
+```
+
+**The cross-step cache is worth 1.79×** and that is the number every later
+proposal has to add to, not replace.
+
+**The instrument checks out.** A full step under the cache costs 58.84 s and a
+step under dense costs 59.21 s — the same work, agreeing to 0.6%, inside the
+1.4% control spread. The cache does not make steps cheaper; it makes fewer of
+them. If those two figures ever diverge, something is measuring the wrong thing.
+
+Repeat spread is 0.9–1.4%. **Any claimed gain below about 1.5% is not a gain.**
+
 **Do not run anything else on the GPU during a control sweep.** Test runs taken
-beside the first repeat moved its step time from 25 s to 29 s, which is larger
-than most of the gains this roadmap is chasing.
+beside the first attempt moved its step time from 25 s to 29 s, larger than most
+of the gains this roadmap is chasing, and that sweep was discarded.
 
 ---
 
-## 6B — Exact fusion *(implemented; speed not yet measured)*
+## 6B — Exact fusion *(measured; failed its gate; off by default)*
+
+**Verdict first: 1.81% on wall clock, 0.94% on the steps the kernel touches,
+against a 5% gate.** The gain is real — three fused runs versus three control
+runs with no overlap between the sets, and the full-step figure repeating to
+0.1% — it is simply small. `H3_FUSED_MODULATION=1` turns it on; the default is
+the readable MLX path.
+
+The arithmetic predicted this and was done afterwards, which is the lesson worth
+keeping. Roughly fourteen `[S, hidden]` tensor passes saved per block at 169 MB
+each, over fifty blocks, is about 118 GB — a few hundred milliseconds against a
+58.8-second step. **A step at this shape is bound by attention and the large
+GEMMs, not by modulation traffic.** MLX also fuses elementwise chains of its
+own, so the path being replaced was never as naive as the source reads.
+
+It is also not a free swap. The norm's reduction reassociates, so a few ulps at
+block 0 propagate through fifty blocks and twenty steps into a different render
+— same quality, different pixels. Enabling it would need its own quality pass,
+which for 1% is not a trade worth making.
+
+Kept rather than deleted because the measurement is machine-specific: the ratio
+of memory bandwidth to compute is what makes this small here, and that ratio is
+not the same on every Apple part. Anyone who turns it on should re-run the
+controls first.
+
+---
+
+### What was built
 
 `FusedModulation` folds RMSNorm, the per-token AdaLN gather and the modulation
 into one pass, and does the same for the gated residual.
@@ -136,14 +181,15 @@ operands of order one and its error is an ulp of *those*; dividing by the result
 would report thousands of ulps and mean nothing. Worst observed: 3.0 ulp fp32,
 0.6 ulp bf16.
 
-### Remaining gates
+### Gates
 
-- [ ] Median production-step improvement ≥ 5%, against a 6A control from the
-      same machine. Below that the custom kernel does not earn its maintenance
-      surface and should be reverted, not kept "for later".
-- [ ] No increase in peak memory.
-- [ ] CUDA tap conformance inside its established equivalence class.
-- [ ] Warnings-as-errors build, full suite green.
+- [x] No increase in peak memory — 87.2 GB on every arm, identical.
+- [x] Full suite green.
+- [ ] **Median production-step improvement ≥ 5% — FAILED at 0.94%.**
+
+The remaining gates (CUDA tap conformance) were not run: a kernel that is off by
+default and fails its speed gate does not need its conformance re-established.
+They become live again only if someone turns it on.
 
 Separately evaluable and not yet attempted: a fused Q/K RMSNorm plus split-half
 RoPE. Kept separate because the oracle already measured the unfused attention
@@ -188,11 +234,55 @@ Independent thresholds and independent vetoes. Not independent reuse.
 6. Every decision and threshold in the receipt — already true.
 7. The current constant threshold survives as a reproducible legacy profile.
 
-### Measure before designing the curve
+### What the controls actually show *(measured 2026-08-06, 3 runs)*
 
-"Early sigma allows aggressive reuse" is plausible and **unproven for this
-checkpoint's back-loaded schedule.** The 6A traces carry per-step sigma against
-all three deltas; read them before drawing a curve.
+```
+step  sigma   whole   video   audio   decision
+   1  0.996   0.216   0.237   0.120   full    videoAboveThreshold
+   2  0.991   0.137   0.147   0.112   full    videoAboveThreshold
+   3  0.986   0.115   0.124   0.096   full    videoAboveThreshold
+   4  0.980   0.096   0.101   0.079   reused
+   7  0.957   0.065   0.067   0.056   full    consecutiveCap
+  10  0.923   0.059   0.061   0.060   reused
+  11  0.908   0.062   0.064   0.065   full    consecutiveCap
+  15  0.800   0.087   0.090   0.108   full    consecutiveCap
+  16  0.750   0.106   0.109   0.120   full    audioAboveThreshold
+  18  0.571   0.159   0.163   0.196   full    audioAboveThreshold
+  19  0.387   0.250   0.255   0.246   full    cooldown
+```
+
+**"Early sigma allows aggressive reuse" is wrong for this checkpoint.** Steps
+1–3 carry the second-largest deltas of the whole render, 0.216 falling to 0.115.
+The curve is **U-shaped in step index** with its minimum around step 10 at
+0.059, rising at both ends. A monotone sigma curve would be fitted backwards.
+
+**Splitting whole-sequence from video buys almost nothing.** Video runs a
+consistent ~3% above whole-sequence and never disagrees with it about a
+decision — unsurprising once stated, since video is 95.1% of the rows. The
+video threshold is worth having for what it *excludes*, not for what it adds.
+
+**The audio stream crosses over, and that is the real finding.** Early it is far
+quieter than video (0.120 against 0.237 at step 1); late it is louder (0.196
+against 0.163 at step 18). The crossover is around step 9. So the per-stream
+probe earns its place at steps 16–18 and nowhere else — and it earns it three
+times per render, which is 15% of the steps.
+
+**From step 4 to step 15 the cache is running on the consecutive cap, not on
+its threshold.** The deltas in that window peak at 0.096 against a threshold of
+0.10, so the threshold never fires; every refusal there is `consecutiveCap`, at
+steps 7, 11 and 15 — exactly every fourth step. The tuning knob that governs
+the middle of the schedule is `maxConsecutiveSkips`, and nobody has swept it.
+
+### The experiment that follows from that
+
+Sweeping `maxConsecutiveSkips` upward is worth more than any sigma curve. Those
+three capped steps cost 3 × 58.8 s out of ~665 s of sampling: **removing them
+would be roughly 26% faster.** Unbounded reuse is the cliff the cap exists to
+prevent, so this is a quality question and not an arithmetic one — sweep 3 → 4,
+5, 6 and judge on rendered output, audio included.
+
+Design the thresholds *after* that, and shape them U-wise in step index rather
+than monotone in sigma.
 
 ### Promotion gate
 

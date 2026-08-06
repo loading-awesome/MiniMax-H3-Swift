@@ -70,6 +70,17 @@ struct SamplingTraceTests {
         #expect(abs(trace.medianReusedStepSeconds - 1.25) < 1e-9)
     }
 
+    @Test("a cache-free run reports every step as a full step")
+    func denseRunHasNoDecisionsButAllFullSteps() {
+        // A dense render records no decisions because there is no cache to make
+        // any. Reading that empty list as "no full steps" reported `nan` for
+        // the dense control — the one arm whose full-step cost a kernel change
+        // most needs to be measured against.
+        let dense = SamplingTrace(steps: [], stepSeconds: [60, 58, 59, 61])
+        #expect(dense.medianFullStepSeconds == 59.5)
+        #expect(dense.stepsSkipped == 0)
+    }
+
     @Test("only one CFG branch contributes to the per-population step cost")
     func branchesDoNotDoubleCountWallClock() {
         // A step's wall clock covers both forwards. Counting it once per branch

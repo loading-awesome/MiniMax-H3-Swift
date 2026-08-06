@@ -218,7 +218,13 @@ package struct SamplingTrace: Sendable, Codable, Equatable {
     /// shows up in the mean but not here came from skipping more, which is a
     /// quality trade and not a speed-up.
     package var medianFullStepSeconds: Double {
-        Self.median(secondsOf(.runFull))
+        // A cache-free render records no decisions, because there is no cache
+        // to make any — but every one of its steps ran the full stack. Reading
+        // the empty decision list as "no full steps" reported `nan` for the
+        // dense control, which is the one arm whose full-step cost a kernel
+        // change most needs to be measured against.
+        guard !steps.isEmpty else { return Self.median(stepSeconds) }
+        return Self.median(secondsOf(.runFull))
     }
 
     package var medianReusedStepSeconds: Double {

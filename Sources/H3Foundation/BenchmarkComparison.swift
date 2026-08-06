@@ -124,16 +124,29 @@ package struct BenchmarkComparison {
     /// The table, for a terminal.
     package var report: String {
         var out = "control: \(controlArm)\n\n"
-        out += String(format: "  %-30@ %4@ %9@ %9@ %7@ %8@ %7@ %8@\n",
-                      "arm" as NSString, "runs" as NSString, "s/step" as NSString,
-                      "full step" as NSString, "spread" as NSString, "speedup" as NSString,
-                      "reused" as NSString, "peak GB" as NSString)
+        // Padded by hand. `String(format:)` ignores a width specifier on `%@` —
+        // `%-30@` prints the string and no padding at all — so the first
+        // version of this table emitted an unaligned header over aligned
+        // columns, which is exactly as readable as no table.
+        func pad(_ s: String, _ width: Int, left: Bool = false) -> String {
+            let gap = max(0, width - s.count)
+            return left ? String(repeating: " ", count: gap) + s
+                        : s + String(repeating: " ", count: gap)
+        }
+        out += "  " + pad("arm", 30) + pad("runs", 6, left: true)
+             + pad("s/step", 10, left: true) + pad("full step", 11, left: true)
+             + pad("spread", 9, left: true) + pad("speedup", 9, left: true)
+             + pad("reused", 8, left: true) + pad("peak GB", 9, left: true) + "\n"
         for r in rows {
             let speed = r.speedup.map { String(format: "%.2fx", $0) } ?? "—"
-            out += String(format: "  %-30@ %4d %9.2f %9.2f %6.1f%% %8@ %6.0f%% %8.1f\n",
-                          r.arm as NSString, r.runs, r.meanStepSeconds, r.fullStepSeconds,
-                          r.repeatSpread * 100, speed as NSString,
-                          r.stepsSkippedFraction * 100, r.peakGB)
+            out += "  " + pad(r.arm, 30)
+                 + pad("\(r.runs)", 6, left: true)
+                 + pad(String(format: "%.2f", r.meanStepSeconds), 10, left: true)
+                 + pad(String(format: "%.2f", r.fullStepSeconds), 11, left: true)
+                 + pad(String(format: "%.1f%%", r.repeatSpread * 100), 9, left: true)
+                 + pad(speed, 9, left: true)
+                 + pad(String(format: "%.0f%%", r.stepsSkippedFraction * 100), 8, left: true)
+                 + pad(String(format: "%.1f", r.peakGB), 9, left: true) + "\n"
         }
         out += "\n  s/step is the mean — wall clock. `full step` is the median cost of the\n"
              + "  steps that ran the stack: a kernel win moves it, a looser cache does not.\n"
