@@ -352,20 +352,59 @@ So the priority list collapses. Items 3 and 4 are struck; the only untried
 work with a multiple in it is making the dense GEMMs faster, or doing them in
 fewer bits.
 
-### The one measurement that scopes items 5 and 6
+### Measured: the model is at MLX's ceiling, and the roadmap closes
 
-**16.0 TFLOP/s is what the model achieves. Nobody has measured what MLX can
-achieve on this machine at these shapes.** That single microbenchmark decides
-whether item 5 exists:
+`GEMMCeilingTests` (`H3_BIG=1 swift test --filter gemmCeiling`), isolated
+kernels at production shapes:
 
-* If a large bf16 GEMM reaches, say, 40 TFLOP/s while the model gets 16, the
-  gap is in shapes, layout and dispatch — item 5 is real and large.
-* If MLX also lands near 16, its GEMM *is* the ceiling, item 5 is dead too, and
-  only int8 or a hand-written kernel can move anything.
+| kernel | ms | TFLOP/s |
+|---|---:|---:|
+| qkv `[S,H]×[H,3I]` | 209.2 | 17.4 |
+| attention out `[S,I]×[I,H]` | 70.9 | 17.1 |
+| mlp fc1 `[S,H]×[H,2F]` | 279.9 | 17.3 |
+| mlp fc2 `[S,F]×[F,H]` | 155.5 | 15.6 |
+| attention `S=15731, 56×128` | 439.0 | 16.2 |
+| **square 8192³, clean best case** | 62.5 | **17.6** |
 
-It costs seconds of GPU time and it must run before either item is started.
-The mistake this whole section exists to prevent is building the kernel first
-and finding the ceiling afterwards.
+**The model achieves 16.0 TFLOP/s. MLX's own best case on a clean square GEMM
+is 17.6.** The model is running at 91% of the fastest rate this library reaches
+on this machine.
+
+And the kernels account for the whole forward:
+
+```
+per block   qkv 209.2 + out 70.9 + fc1 279.9 + fc2 155.5 + attention 439.0
+          = 1154.5 ms  x 50 blocks = 57.7 s   against a 60.0 s forward = 96.2%
+```
+
+**Everything that is not one of those five kernels — every RMSNorm, the AdaLN
+projection, all modulation and gathers, RoPE, the residuals, and every kernel
+launch — is 3.8% of a forward in total, 45 ms per block.** 6B measured 0.94%
+and addressed part of that envelope. It fits exactly, and it was never going to
+be more.
+
+So items 3, 4 and 5 are all **struck**:
+
+| item | why it is dead |
+|---|---|
+| 3. AdaLN schedule batching | inside the 3.8% envelope; 0.008% of FLOPs |
+| 4. Dense-block compilation | inside the same envelope; launches are part of the 45 ms |
+| 5. Weight layout, GEMM profiling | there is 9% between the model and MLX's isolated rate, not a multiple |
+
+**Only two things can now move this workload**, and neither is scheduling:
+
+1. **Fewer bits.** int8 or int4 matmul, if MLX's quantised path beats
+   17.6 TFLOP/s by enough to matter. That is the next measurement, and it is
+   another microbenchmark rather than a project.
+2. **Fewer FLOPs.** Sparse attention (38% of the forward — measured, rejected on
+   quality) or fewer steps (the cache — already shipped at 1.79×, and 6C is
+   about pushing it further).
+
+A third possibility exists and should be named rather than assumed away: a
+hand-written Metal GEMM that beats MLX's. That is a much larger undertaking
+than "canonical weight layout", with no evidence yet that the hardware has
+headroom MLX is leaving on the table, and it should not be started without
+first establishing what the hardware can actually do.
 
 ---
 
