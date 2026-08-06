@@ -29,6 +29,14 @@ package struct BenchmarkComparison {
         /// Nil when this arm could not be compared to the control.
         package let speedup: Double?
         package let refusals: [String]
+        /// Configuration keys that differ from the control's and are not part
+        /// of the named profile — environment overrides, resolved defaults.
+        ///
+        /// **Not a refusal.** Configuration is what an experiment varies, so
+        /// differing here must not block the comparison. It must be *stated*:
+        /// an arm that differs from the control in a knob nobody mentioned is
+        /// how a result gets attributed to the wrong cause.
+        package let configurationDrift: [String]
     }
 
     package let controlArm: String
@@ -68,6 +76,13 @@ package struct BenchmarkComparison {
 
             var speedup: Double?
             var refusals: [String] = []
+            var drift: [String] = []
+            if let base = controlRuns.first, let mine = runs.first, arm != controlName {
+                let a = mine.configuration.overrides, b = base.configuration.overrides
+                for key in Set(a.keys).union(b.keys).sorted() where a[key] != b[key] {
+                    drift.append("\(key): \(a[key] ?? "unset") vs control's \(b[key] ?? "unset")")
+                }
+            }
             if arm == controlName {
                 speedup = 1.0
             } else if let base = controlRuns.first, let mine = runs.first {
@@ -87,7 +102,8 @@ package struct BenchmarkComparison {
 
             rows.append(Row(arm: arm, runs: runs.count, medianStepSeconds: median,
                             repeatSpread: spread, stepsSkippedFraction: skipped,
-                            peakGB: peak, speedup: speedup, refusals: refusals))
+                            peakGB: peak, speedup: speedup, refusals: refusals,
+                            configurationDrift: drift))
         }
         self.rows = rows
         self.unusable = unusable
@@ -120,6 +136,13 @@ package struct BenchmarkComparison {
         for r in rows where !r.refusals.isEmpty {
             out += "\n  \(r.arm) could not be compared:\n"
             for reason in r.refusals { out += "    - \(reason)\n" }
+        }
+        // Printed for every arm that has it, including ones whose speed-up was
+        // computed. A number next to an unmentioned configuration difference is
+        // a result attributed to the wrong cause.
+        for r in rows where !r.configurationDrift.isEmpty {
+            out += "\n  \(r.arm) also differs from the control in:\n"
+            for d in r.configurationDrift { out += "    - \(d)\n" }
         }
         return out
     }

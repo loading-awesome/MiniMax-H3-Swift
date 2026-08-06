@@ -4,6 +4,7 @@
 import Foundation
 import H3Foundation
 import H3Hardware
+import H3Modules
 import H3Pipeline
 
 /// Writes the benchmark record beside the render, on every render.
@@ -104,8 +105,16 @@ enum BenchmarkEmitter {
     /// and leaving it in would make two identical configurations compare as
     /// different.
     static func environmentOverrides() -> [String: String] {
-        ProcessInfo.processInfo.environment
+        var out = ProcessInfo.processInfo.environment
             .filter { $0.key.hasPrefix("H3_") && $0.key != "H3_BENCH_ARM" }
+        // Switches that are **on by default** have to be recorded as resolved
+        // values, not just when somebody overrides them. An environment scrape
+        // alone records the exception and stays silent about the rule, so a run
+        // with fused modulation on and a run from before it existed would both
+        // show nothing here — and the fused path is a different computation, by
+        // a few ulps, from the one the controls were measured on.
+        out["resolved.fusedModulation"] = FusedModulation.enabled ? "on" : "off"
+        return out
     }
 
     /// Writes `<output>.h3-bench.json` and `<output>.h3-steps.csv`.

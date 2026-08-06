@@ -11,7 +11,8 @@ struct BenchmarkComparisonTests {
 
     private func record(_ arm: String, stepSeconds: [Double], cache: Double = 0,
                         seed: UInt64 = 7, machine: String = "Mac Studio M3 Ultra",
-                        skipped: Int = 0, at: TimeInterval = 0) -> BenchmarkRecord {
+                        skipped: Int = 0, at: TimeInterval = 0,
+                        overrides: [String: String] = [:]) -> BenchmarkRecord {
         let steps = (0 ..< max(skipped, 0)).map {
             StepTrace(step: $0, branch: .conditional, sigma: 1, wholeSequenceChange: 0.01,
                       videoChange: 0.01, audioChange: 0.01, decision: .reuse,
@@ -25,7 +26,7 @@ struct BenchmarkComparisonTests {
                             ditSizeBytes: 66),
             configuration: .init(qualityProfile: "balanced", attentionBackend: "sdpa",
                                  cacheThreshold: cache, cacheMaxConsecutiveSkips: 3,
-                                 cachePerStreamProbe: true),
+                                 cachePerStreamProbe: true, overrides: overrides),
             machine: .init(model: machine, cores: 32, physicalMemoryBytes: 275,
                            operatingSystem: "15.0", libraryVersion: "0.1.0-dev",
                            mlxSwiftVersion: "0.31.6"),
@@ -96,6 +97,26 @@ struct BenchmarkComparisonTests {
         ])
         #expect(c.rows.first { $0.arm == "cached" }?.speedup == nil)
         #expect(c.report.contains("machine:"))
+    }
+
+    @Test("a knob that differs from the control is stated, not treated as a refusal")
+    func configurationDriftIsReported() throws {
+        // Configuration is what an experiment varies, so this must not block
+        // the comparison — but an arm carrying an unmentioned difference is how
+        // a gain gets credited to the wrong change. The number and the caveat
+        // have to arrive together.
+        let c = BenchmarkComparison(records: [
+            record("dense", stepSeconds: [40], cache: 0,
+                   overrides: ["resolved.fusedModulation": "off"]),
+            record("fused", stepSeconds: [36], cache: 0,
+                   overrides: ["resolved.fusedModulation": "on", "H3_SOL_BETA": "1.2"])
+        ], control: "dense")
+        let row = try #require(c.rows.first { $0.arm == "fused" })
+        #expect(row.speedup != nil)              // still compared
+        #expect(row.refusals.isEmpty)            // and not refused
+        #expect(row.configurationDrift.count == 2)
+        #expect(c.report.contains("resolved.fusedModulation: on vs control's off"))
+        #expect(c.report.contains("H3_SOL_BETA: 1.2 vs control's unset"))
     }
 
     @Test("the reused fraction is pooled across every repeat and branch")

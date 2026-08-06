@@ -414,10 +414,27 @@ package struct DiTBlock {
                                context: AttentionContext? = nil) -> MLXArray {
         let m = adaln(tEmb)
         precondition(m.count == 6, "DiTBlock AdaLN must expand to 6, got \(m.count)")
-        let h1 = modScaleShift(norm1(x), shift: m[0], scale: m[1], index: index)
-        let x1 = modGate(x, gate: m[2],
-                         other: attn(h1, ropeTable: ropeTable, context: context), index: index)
-        let h2 = modScaleShift(norm2(x1), shift: m[3], scale: m[4], index: index)
-        return modGate(x1, gate: m[5], other: mlp(h2), index: index)
+
+        // Each of these four is a fused kernel with the readable expression as
+        // its fallback, and the fallback is not decorative: `FusedModulation`
+        // returns nil for the refiner's batched shape, for any dtype mix it was
+        // not measured on, and whenever `H3_FUSED_MODULATION=0`. The two paths
+        // are held to bit-identity by `FusedModulationTests`, so which one ran
+        // is a performance question and never a numerical one.
+        func norm(_ v: MLXArray, _ n: H3RMSNorm, _ shift: MLXArray,
+                  _ scale: MLXArray) -> MLXArray {
+            FusedModulation.modulatedRMSNorm(v, weight: n.weight, eps: n.eps,
+                                             shift: shift, scale: scale, index: index)
+                ?? modScaleShift(n(v), shift: shift, scale: scale, index: index)
+        }
+        func gated(_ v: MLXArray, _ gate: MLXArray, _ other: MLXArray) -> MLXArray {
+            FusedModulation.gatedResidual(v, gate: gate, other: other, index: index)
+                ?? modGate(v, gate: gate, other: other, index: index)
+        }
+
+        let h1 = norm(x, norm1, m[0], m[1])
+        let x1 = gated(x, m[2], attn(h1, ropeTable: ropeTable, context: context))
+        let h2 = norm(x1, norm2, m[3], m[4])
+        return gated(x1, m[5], mlp(h2))
     }
 }
