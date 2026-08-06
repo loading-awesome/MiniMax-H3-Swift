@@ -14,6 +14,28 @@ not play it inline.</sub>
 h3 render --prompt "a red kite over a beach at sunset" --out kite.mp4
 ```
 
+### Three more, from one command each
+
+Same settings, no flags — 864×480, 7 s, 20 steps, about 19 minutes apiece on a
+Mac Studio. **Every soundtrack below came out of the same forward pass as the
+picture**: the voices, the room they are in, and the score.
+
+<video src="https://github.com/loading-awesome/MiniMax-H3-Swift/raw/main/docs/media/race.mp4" controls muted playsinline width="100%"></video>
+
+<sub>**Two speakers.** Both characters, both voices and both engines from one
+prompt. [Download](docs/media/race.mp4)</sub>
+
+<video src="https://github.com/loading-awesome/MiniMax-H3-Swift/raw/main/docs/media/anime.mp4" controls muted playsinline width="100%"></video>
+
+<sub>**A different look entirely** — cel-shaded, with rain on the window and a
+piano under it, none of which is a filter over the first clip's world.
+[Download](docs/media/anime.mp4)</sub>
+
+<video src="https://github.com/loading-awesome/MiniMax-H3-Swift/raw/main/docs/media/scifi.mp4" controls muted playsinline width="100%"></video>
+
+<sub>**Dialogue against a score.** Two speakers over ship tone and strings, mixed
+in the same pass rather than laid over the top. [Download](docs/media/scifi.mp4)</sub>
+
 ---
 
 ## What this is
