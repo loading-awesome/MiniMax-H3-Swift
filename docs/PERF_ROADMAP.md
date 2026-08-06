@@ -282,6 +282,63 @@ exactly that reason.
 
 ---
 
+## Where the time actually goes — do this arithmetic first
+
+**6B was built before anyone worked out what it could possibly be worth.** It
+could not have exceeded about 1%, and the sum takes ten minutes. So here is
+that sum for everything left, from the measured control: 660.5 s of sampling
+over 20 steps with 9 reused, giving **60.0 s per full forward**, at cfg 1.0 so
+one forward per step.
+
+At S = 15,731, hidden 5,376, 50 blocks, inner 7,168, ffn 14,336:
+
+| per block | TFLOP | share of a forward |
+|---|---:|---:|
+| attention (QK^T and A·V) | 7.095 | **36.9%** |
+| mlp fc1 | 4.850 | 25.2% |
+| qkv projection | 3.637 | 18.9% |
+| mlp fc2 | 2.425 | 12.6% |
+| attention out projection | 1.212 | 6.3% |
+| AdaLN projection | 0.0016 | **0.008%** |
+
+**961 TFLOP per forward, achieved in 60.0 s — 16.0 TFLOP/s.**
+
+**The model is compute-bound, not bandwidth-bound.** Reading all 66.3 GB of
+weights once per forward is 83 ms at 800 GB/s: **0.1% of a step.** Every
+argument in this tree that reasons from memory traffic — including the one that
+motivated 6B — is reasoning about a rounding error.
+
+### What that does to the remaining items
+
+| item | ceiling | verdict |
+|---|---:|---|
+| 3. AdaLN schedule batching | ~0.05% | **dead.** The projection is 0.008% of FLOPs and its weight reads are 26 GB — 0.05% of a step. Precomputing all 20 steps saves a rounding error, and `AdalnProj` already measured its fp32 upcast at 0.2%. |
+| 4. MLX dense-block compilation | ~0.05% | **dead.** Roughly a thousand kernel launches per forward at ~30 µs is 30 ms against 60 s. |
+| 5. Canonical weight layout, GEMM profiling | up to 63% of FLOPs | **live.** This is the target. |
+| 6. Selective int8 matmul | same 63%, ~2× arithmetic rate | **live**, at a quality cost that needs the same measurement problem solved. |
+| (Sol-Attn, axial) | 36.9% of FLOPs | already measured, already rejected on quality |
+
+So the priority list collapses. Items 3 and 4 are struck; the only untried
+work with a multiple in it is making the dense GEMMs faster, or doing them in
+fewer bits.
+
+### The one measurement that scopes items 5 and 6
+
+**16.0 TFLOP/s is what the model achieves. Nobody has measured what MLX can
+achieve on this machine at these shapes.** That single microbenchmark decides
+whether item 5 exists:
+
+* If a large bf16 GEMM reaches, say, 40 TFLOP/s while the model gets 16, the
+  gap is in shapes, layout and dispatch — item 5 is real and large.
+* If MLX also lands near 16, its GEMM *is* the ceiling, item 5 is dead too, and
+  only int8 or a hand-written kernel can move anything.
+
+It costs seconds of GPU time and it must run before either item is started.
+The mistake this whole section exists to prevent is building the kernel first
+and finding the ceiling afterwards.
+
+---
+
 ## 6C — Consecutive-cap sweep *(speed measured; quality UNRESOLVED)*
 
 > ### Retraction
