@@ -42,10 +42,17 @@ import H3Foundation
 /// subtly wrong. This type is deliberately not shared: the sampler holds one per
 /// branch.
 ///
-/// **Never skip twice in a row without a ceiling.** Reuse is self-reinforcing:
-/// a skipped step does not update the probe, so the same comparison recurs and
-/// the sampler can coast to the end on one stale delta. `maxConsecutiveSkips`
-/// bounds it.
+/// **Never skip too many in a row without a ceiling — and be clear about what
+/// the ceiling protects.** This used to claim a skipped step leaves the probe
+/// unrefreshed so the same comparison recurs. It does not: block 0 runs on
+/// every step, skipped or not, and `previousProbe` is updated unconditionally.
+/// The comparison is fresh every time.
+///
+/// What ages is the **cached total residual**, which only a full step
+/// refreshes. So `maxConsecutiveSkips` bounds how many steps of trajectory one
+/// delta gets applied across — residual age — and that, not a recurring
+/// comparison, is the quantity to reason about when output starts warping.
+/// The distinction matters because the two suggest different fixes.
 ///
 /// **Never skip the first or last steps.** The first has no history. The last
 /// determines the output that is actually decoded, and a reused delta there
@@ -62,7 +69,15 @@ package final class H3StepCache {
     /// same rate.
     package let threshold: Double
 
-    /// Upper bound on consecutive reuses.
+    /// Upper bound on consecutive reuses — equivalently, the maximum age in
+    /// steps of the residual being re-applied.
+    ///
+    /// **Raising it does not simply buy that many more skipped steps.** The
+    /// counter resets at every refusal, so changing the cap moves the refresh
+    /// points rather than removing them. Replayed against the measured deltas,
+    /// caps 3 and 4 both yield nine reuses and identical wall clock; the
+    /// refreshes merely relocate from steps 7/11/15 to 8/13. See
+    /// `StepCachePolicyReplayTests`.
     package let maxConsecutiveSkips: Int
 
     /// Steps at the start and end of the schedule that always run in full.
@@ -191,6 +206,8 @@ package final class H3StepCache {
             // Only the per-stream arm hands the audio a vote; the whole-sequence
             // arm has to be genuinely blind to it for the A/B to mean anything.
             audioChange: perStreamProbe ? audioChange : nil,
+            // Advisory in every arm — video is measured and does not vote.
+            videoChange: videoChange,
             step: step, totalSteps: totalSteps,
             consecutiveSkips: consecutiveSkips,
             haveCachedResidual: cached != nil && cached?.shape == probe.shape)
@@ -199,6 +216,7 @@ package final class H3StepCache {
             step: step, branch: self.branch, sigma: sigma,
             wholeSequenceChange: wholeSequenceChange, videoChange: videoChange,
             audioChange: audioChange, decision: verdict.decision, reason: verdict.reason,
+            constraints: verdict.constraints, advisory: verdict.advisory,
             consecutiveSkipsBefore: consecutiveSkips))
 
         if verdict.decision == .reuse, let cached {

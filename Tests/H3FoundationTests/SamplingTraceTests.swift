@@ -120,7 +120,7 @@ struct SamplingTraceTests {
         // is skipping, which is a real configuration and not a healthy one.
         let trace = SamplingTrace(steps: [
             step(3, decision: .reuse, branch: .conditional),
-            step(3, decision: .runFull, reason: .videoAboveThreshold, branch: .unconditional)
+            step(3, decision: .runFull, reason: .wholeSequenceAboveThreshold, branch: .unconditional)
         ])
         #expect(trace.steps.count == 2)
         #expect(trace.stepsSkipped == 1 && trace.stepsRun == 1)
@@ -141,7 +141,7 @@ struct SamplingTraceTests {
         #expect(fields[3].isEmpty && fields[4].isEmpty && fields[5].isEmpty)
         #expect(fields[6] == "full")
         #expect(fields[7] == "noHistory")
-        #expect(fields[9] == "4.500000")
+        #expect(fields[11] == "4.500000")
         #expect(!trace.csv.contains("inf") && !trace.csv.contains("nan"))
     }
 
@@ -151,7 +151,7 @@ struct SamplingTraceTests {
         // purpose. A decision encoded as an unreadable case name, or a field
         // that fails to decode, makes the whole archive worthless.
         let trace = SamplingTrace(steps: [step(1), step(2, decision: .runFull,
-                                                reason: .videoAboveThreshold)],
+                                                reason: .wholeSequenceAboveThreshold)],
                                   stepSeconds: [1, 2, 3])
         let data = try JSONEncoder().encode(trace)
         #expect(String(decoding: data, as: UTF8.self).contains("\"reused\""))
@@ -273,13 +273,13 @@ struct StepCachePolicyReasonTests {
         // that only a per-stream probe casts, and it must be attributed to
         // audio or a sweep will read it as a video-driven refusal.
         #expect(reason(0.05, 0.9) == .audioAboveThreshold)
-        #expect(reason(0.9, 0.05) == .videoAboveThreshold)
+        #expect(reason(0.9, 0.05) == .wholeSequenceAboveThreshold)
         // The whole-sequence arm has no audio input at all, so every refusal
         // there is a video one by construction.
         let whole = StepCachePolicy(threshold: 0.5, perStream: false)
         #expect(whole.explain(wholeSequenceChange: 0.9, audioChange: 0.9, step: 5,
                               totalSteps: 20, consecutiveSkips: 0,
-                              haveCachedResidual: true).reason == .videoAboveThreshold)
+                              haveCachedResidual: true).reason == .wholeSequenceAboveThreshold)
     }
 
     @Test("non-finite is its own reason, not an above-threshold refusal")

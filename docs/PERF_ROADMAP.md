@@ -201,7 +201,28 @@ suspected difference on a real render without a rebuild.
 
 ---
 
-## 6C — Sigma-aware dual-stream cache policy *(not started)*
+## Priority after the controls
+
+The measured trace reorders what was planned. Sigma-curve work is **dropped**
+unless a later trace shows a threshold-controlled region worth fitting — the
+cache already identifies the useful middle window without one.
+
+```
+1. Consecutive-cap sweep: 4 -> 5 -> 6            <- 6C, below
+2. Full coherence gates on any faster arm
+3. AdaLN schedule batching
+4. MLX dense-block compilation
+5. Canonical weight layout and GEMM profiling
+6. Selective resident quantized matmul research
+```
+
+Items 3–6 are untried and, unlike 6B, are not bounded above by activation
+traffic — 6B measured 1% because a step at this shape is bound by attention and
+the large GEMMs, which is where 5 and 6 aim.
+
+---
+
+## 6C — Consecutive-cap sweep *(next)*
 
 Improve the existing cache **without changing its residual semantics.**
 
@@ -256,39 +277,99 @@ step  sigma   whole   video   audio   decision
 The curve is **U-shaped in step index** with its minimum around step 10 at
 0.059, rising at both ends. A monotone sigma curve would be fitted backwards.
 
-**Splitting whole-sequence from video buys almost nothing.** Video runs a
-consistent ~3% above whole-sequence and never disagrees with it about a
-decision — unsurprising once stated, since video is 95.1% of the rows. The
-video threshold is worth having for what it *excludes*, not for what it adds.
+**Splitting whole-sequence from video buys almost nothing — but not nothing.**
+Video runs a consistent ~3% above whole-sequence, unsurprising once stated,
+since video is 95.1% of the rows. It disagrees about a decision **exactly once**
+in twenty steps: at step 4, whole is 0.096 and admits reuse while video is 0.101
+and would refuse. That single crossing is the entire empirical case for giving
+the video probe a vote, and it points the wrong way — it costs a step rather
+than saving one. Keep collecting it; do not promote it without a separate
+quality argument.
 
-**The audio stream crosses over, and that is the real finding.** Early it is far
-quieter than video (0.120 against 0.237 at step 1); late it is louder (0.196
-against 0.163 at step 18). The crossover is around step 9. So the per-stream
-probe earns its place at steps 16–18 and nowhere else — and it earns it three
-times per render, which is 15% of the steps.
+**The audio stream crosses over.** Early it is far quieter than video (0.120
+against 0.237 at step 1); late it is louder (0.196 against 0.163 at step 18),
+crossing over around step 9.
+
+**But `audioAboveThreshold` in the headline does not mean audio vetoed
+anything.** At steps 16–18 the whole-sequence probe is *also* over threshold and
+would have forced a full step by itself; audio is reported only because it is
+the larger number. The step where audio is genuinely the sole objection is
+**15** — whole 0.087, audio 0.108 — and at the shipping cap of 3 that is
+invisible, because the cap fires there first. This is why the trace now records
+every active constraint rather than one headline.
 
 **From step 4 to step 15 the cache is running on the consecutive cap, not on
 its threshold.** The deltas in that window peak at 0.096 against a threshold of
 0.10, so the threshold never fires; every refusal there is `consecutiveCap`, at
-steps 7, 11 and 15 — exactly every fourth step. The tuning knob that governs
-the middle of the schedule is `maxConsecutiveSkips`, and nobody has swept it.
+steps 7, 11 and 15. The knob that governs the middle of the schedule is
+`maxConsecutiveSkips`, and nobody has swept it.
 
-### The experiment that follows from that
+### What raising the cap is actually worth
 
-Sweeping `maxConsecutiveSkips` upward is worth more than any sigma curve. Those
-three capped steps cost 3 × 58.8 s out of ~665 s of sampling: **removing them
-would be roughly 26% faster.** Unbounded reuse is the cliff the cap exists to
-prevent, so this is a quality question and not an arithmetic one — sweep 3 → 4,
-5, 6 and judge on rendered output, audio included.
+**Not what was first claimed.** The first reading said three capped steps could
+be removed for ~26%. That is wrong: the skip counter **resets at every refusal**,
+so a larger cap relocates the refresh points rather than deleting them. Replayed
+through the real policy against the measured deltas
+(`StepCachePolicyReplayTests`):
 
-Design the thresholds *after* that, and shape them U-wise in step index rather
-than monotone in sigma.
+| cap | reuses | sampling | vs cap 3 | refreshed by cap |
+|---:|---:|---:|---:|---|
+| 3 | 9 | 658.5 s | 1.00× | 7, 11, 15 |
+| 4 | 9 | 658.5 s | **1.00×** | 8, 13 |
+| 5 | 10 | 600.9 s | 1.10× | 9, 15 |
+| 6 | 10 | 600.9 s | 1.10× | 10 |
+| unbounded | 11 | 543.3 s | 1.21× | — |
+
+**Cap 4 is a refresh-placement experiment, not a speed experiment.** Same nine
+reuses, same wall clock, refreshes moved. It is worth running precisely because
+it isolates residual-age placement from step count.
+
+Caps 5 and 6 buy one step, about 9.6% of sampling. Unbounded buys 21%, not 26%,
+and carries the greatest stale-residual risk.
+
+**Unbounded is not unbounded.** With no cap the cache reuses steps 4–14 and is
+then stopped by the audio probe at step 15. Once the cap is relaxed, audio is
+the only thing standing between the cache and the late high-change region —
+which is the argument for keeping the per-stream probe, and it cannot be seen at
+cap 3 at all.
+
+These are offline projections against fixed deltas. Changing the cap changes the
+trajectory and therefore every subsequent delta, so **rendered arms remain the
+only authority**; the projection is for deciding which arms are worth an hour of
+GPU each.
+
+Design thresholds *after* that, and shape them U-wise in step index rather than
+monotone in sigma — if any threshold-controlled region turns out to be worth
+fitting at all. The current trace says the cache already finds the useful middle
+window on its own. **The unresolved question is not where to put a threshold; it
+is how old a reused full-stack residual can get before coherence breaks.**
+
+### Protocol
+
+Threshold stays at 0.10, per-stream probing on, fusion off. The only thing that
+varies is the cap.
+
+1. **Cap 4** — refresh placement at constant step count. Purely a coherence
+   probe; if it looks different from cap 3, residual *age* matters independently
+   of how many steps are skipped, which is the thing worth knowing.
+2. **Cap 5** — only if 4 is visually coherent.
+3. **Cap 6** — only if 5 is coherent *and* materially faster.
+4. **Unbounded** — only if 4→6 establish a safe trend. It is explicitly a
+   cliff-finding experiment and should be labelled as one.
+
+Reject an arm immediately on visible pulsing, geometry drift or warping. Those
+are what the Sol-Attn work found by watching output after every tensor metric
+said the render was fine.
 
 ### Promotion gate
 
-Faster than the current balanced profile, and no worse on detail, speech, audio
-spectrum, face stability or lip-sync within measured control variance. Faithful
-mode stays completely cache-free.
+**At least 5% end-to-end over the 1.79× cached control** — not over dense.
+Beating dense is not an achievement here; the cache already does it.
+
+Nothing is promoted from one prompt and one seed. A qualifying arm needs
+multiple seeds and: localized temporal acceleration, Laplacian detail, speech
+WER, audio spectral and envelope correlation, lip-sync margin, face and landmark
+stability, and blinded playback. Faithful mode stays completely cache-free.
 
 ---
 

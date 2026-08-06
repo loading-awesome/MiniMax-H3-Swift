@@ -49,12 +49,26 @@ package struct StepTrace: Sendable, Codable, Equatable {
     package let audioChange: Double
 
     package let decision: StepCachePolicy.Decision
+    /// The headline constraint. Convenient for a one-line summary and not
+    /// enough to tune on — see `constraints`.
     package let reason: StepCachePolicy.Reason
+    /// Every constraint that independently forced a full step.
+    ///
+    /// Recorded because the headline hides the interesting case: at step 15 of
+    /// the measured control both the cap and the audio probe object, the cap is
+    /// reported, and relaxing the cap is exactly the change that makes the
+    /// audio objection load-bearing. A sweep reading only the headline would
+    /// remove the audio probe just before it starts mattering.
+    package let constraints: [StepCachePolicy.Reason]
+    /// What a probe that does not vote would have said. Currently video only.
+    package let advisory: [StepCachePolicy.Reason]
     package let consecutiveSkipsBefore: Int
 
     package init(step: Int, branch: Branch, sigma: Double,
                 wholeSequenceChange: Double, videoChange: Double, audioChange: Double,
                 decision: StepCachePolicy.Decision, reason: StepCachePolicy.Reason,
+                constraints: [StepCachePolicy.Reason] = [],
+                advisory: [StepCachePolicy.Reason] = [],
                 consecutiveSkipsBefore: Int) {
         self.step = step
         self.branch = branch
@@ -64,6 +78,8 @@ package struct StepTrace: Sendable, Codable, Equatable {
         self.audioChange = audioChange
         self.decision = decision
         self.reason = reason
+        self.constraints = constraints
+        self.advisory = advisory
         self.consecutiveSkipsBefore = consecutiveSkipsBefore
     }
 
@@ -86,7 +102,7 @@ package struct StepTrace: Sendable, Codable, Equatable {
     /// useful sense.
     private enum CodingKeys: String, CodingKey {
         case step, branch, sigma, wholeSequenceChange, videoChange, audioChange
-        case decision, reason, consecutiveSkipsBefore
+        case decision, reason, constraints, advisory, consecutiveSkipsBefore
     }
 
     package init(from decoder: Decoder) throws {
@@ -102,6 +118,13 @@ package struct StepTrace: Sendable, Codable, Equatable {
         audioChange = try number(.audioChange)
         decision = try c.decode(StepCachePolicy.Decision.self, forKey: .decision)
         reason = try c.decode(StepCachePolicy.Reason.self, forKey: .reason)
+        // Absent in records written before the constraint list existed. Decoded
+        // as the headline alone rather than as empty: those records did have a
+        // binding constraint on every full step, and an empty list would read
+        // as "nothing objected", which is the opposite.
+        constraints = try c.decodeIfPresent([StepCachePolicy.Reason].self, forKey: .constraints)
+            ?? (reason == .belowThreshold ? [] : [reason])
+        advisory = try c.decodeIfPresent([StepCachePolicy.Reason].self, forKey: .advisory) ?? []
         consecutiveSkipsBefore = try c.decode(Int.self, forKey: .consecutiveSkipsBefore)
     }
 
@@ -118,6 +141,8 @@ package struct StepTrace: Sendable, Codable, Equatable {
         try put(audioChange, .audioChange)
         try c.encode(decision, forKey: .decision)
         try c.encode(reason, forKey: .reason)
+        try c.encode(constraints, forKey: .constraints)
+        try c.encode(advisory, forKey: .advisory)
         try c.encode(consecutiveSkipsBefore, forKey: .consecutiveSkipsBefore)
     }
 }
@@ -267,14 +292,18 @@ package struct SamplingTrace: Sendable, Codable, Equatable {
     /// in a spreadsheet as a zero would read as the quietest step of the render.
     package var csv: String {
         var out = "step,branch,sigma,whole_sequence_change,video_change,audio_change,"
-                + "decision,reason,consecutive_skips_before,step_seconds\n"
+                + "decision,reason,constraints,advisory,consecutive_skips_before,step_seconds\n"
         func num(_ x: Double) -> String { x.isFinite ? String(format: "%.6f", x) : "" }
         for t in steps {
             let secs = t.step < stepSeconds.count ? num(stepSeconds[t.step]) : ""
+            // Space-separated inside one field: a reader splitting on commas
+            // must not find a variable number of columns per row.
+            let cons = t.constraints.map(\.rawValue).joined(separator: " ")
+            let adv = t.advisory.map(\.rawValue).joined(separator: " ")
             out += "\(t.step),\(t.branch.rawValue),\(num(t.sigma)),"
                  + "\(num(t.wholeSequenceChange)),\(num(t.videoChange)),\(num(t.audioChange)),"
                  + "\(t.decision == .reuse ? "reused" : "full"),\(t.reason.rawValue),"
-                 + "\(t.consecutiveSkipsBefore),\(secs)\n"
+                 + "\(cons),\(adv),\(t.consecutiveSkipsBefore),\(secs)\n"
         }
         return out
     }
