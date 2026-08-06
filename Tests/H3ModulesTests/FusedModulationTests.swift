@@ -236,6 +236,45 @@ struct FusedModulationTests {
                                               index: f.idx) == nil)
     }
 
+    @Test("production shape dispatches and agrees",
+          .enabled(if: ProcessInfo.processInfo.environment["H3_BIG"] != nil))
+    func productionShape() throws {
+        // 15,731 tokens x 5,376 hidden — the real packed sequence at
+        // 864x480x124. The unit tests above run at 96 tokens, which exercises
+        // the arithmetic but not the dispatch: the norm launches 15,731
+        // threadgroups here and the gate launches 84.6 M threads in one grid
+        // dimension. Neither is exotic, and neither had been run before two
+        // hours of renders were about to depend on it.
+        //
+        //     H3_BIG=1 swift test --filter productionShape
+        let tokens = 15_731, hidden = 5_376
+        MLXRandom.seed(1)
+        let x = MLXRandom.normal([tokens, hidden]).asType(.bfloat16)
+        let w = MLXRandom.normal([hidden]).asType(.bfloat16)
+        let shift = MLXRandom.normal([9, hidden]).asType(.bfloat16)
+        let scale = MLXRandom.normal([9, hidden]).asType(.bfloat16)
+        let idx = index(tokens: tokens, rows: 9)
+
+        let got = try #require(FusedModulation.modulatedRMSNorm(
+            x, weight: w, eps: 1e-6, shift: shift, scale: scale, index: idx))
+        let want = modScaleShift(H3RMSNorm(weight: w, eps: 1e-6)(x),
+                                 shift: shift, scale: scale, index: idx)
+        MLX.eval(got, want)
+        let d = MLX.abs(got.asType(.float32) - want.asType(.float32))
+        let w32 = want.asType(.float32)
+        let rms = MLX.sqrt(MLX.mean(w32 * w32)).item(Float.self)
+        let worst = MLX.max(d / (MLX.abs(w32) + MLXArray(rms))).item(Float.self) / 7.9e-3
+        print("  norm at production shape: worst \(worst) ulp")
+        #expect(worst < 8)
+
+        let other = MLXRandom.normal([tokens, hidden]).asType(.bfloat16)
+        let gate = MLXRandom.normal([9, hidden]).asType(.bfloat16)
+        let gGot = try #require(FusedModulation.gatedResidual(
+            x, gate: gate, other: other, index: idx))
+        let gWant = modGate(x, gate: gate, other: other, index: idx)
+        #expect(identical(gGot, gWant))
+    }
+
     @Test("a whole block gives the same answer with the fusion as without")
     func blockLevelAgreement() throws {
         // The kernels are correct in isolation above. This checks they are
