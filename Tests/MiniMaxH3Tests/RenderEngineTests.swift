@@ -7,11 +7,29 @@ import Testing
 
 @Suite("enterprise render facade")
 struct RenderEngineTests {
-    @Test("faithful output is the default")
-    func faithfulDefault() {
+    /// The default is the cross-step cache, and it is an approximation.
+    ///
+    /// Reversed deliberately: the cache measures 1.79x for 16% less fine
+    /// detail, which is the trade almost everyone wants on a twenty-minute
+    /// render. What makes it safe is that the disclosure is independent of the
+    /// default — `isApproximate` is asserted here alongside it, because a
+    /// default that silently approximated would be the actual problem, not an
+    /// approximate default that says so.
+    @Test("cached output is the default, and it announces itself")
+    func cachedDefault() {
         let request = RenderRequest(prompt: "test", videoOutput: URL(fileURLWithPath: "/tmp/out.mp4"))
-        #expect(request.qualityProfile == .faithful)
+        #expect(request.qualityProfile == .balanced)
+        #expect(request.cacheThreshold == 0.10)
+        #expect(request.qualityProfile.isApproximate)
+    }
+
+    /// And exactness is still reachable, unchanged.
+    @Test("faithful remains available and exact")
+    func faithfulStillExact() {
+        let request = RenderRequest(prompt: "test", videoOutput: URL(fileURLWithPath: "/tmp/out.mp4"),
+                                    qualityProfile: .faithful)
         #expect(request.cacheThreshold == 0)
+        #expect(!request.qualityProfile.isApproximate)
     }
 
     @Test("the actor refuses a second admitted render")

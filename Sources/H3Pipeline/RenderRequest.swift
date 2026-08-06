@@ -21,9 +21,23 @@ import H3Recipes
 /// can switch on.
 public struct RenderRequest: Sendable {
 
-    /// Named, auditable numerical behavior. The default is the configuration
-    /// whose implementation parity was measured; faster profiles are explicit
-    /// approximations and are recorded in every render receipt.
+    /// Named, auditable numerical behavior.
+    ///
+    /// **The default is `balanced`, and it is an approximation.** That is a
+    /// deliberate reversal. It was `faithful` on the argument that a default
+    /// should be the configuration whose parity was measured — which is a good
+    /// argument, and it lost to the measurement: the cross-step cache is 1.79x
+    /// on this machine for 16% less fine detail, and nobody rendering a
+    /// twenty-minute clip wants to discover afterwards that a flag would have
+    /// made it eleven.
+    ///
+    /// What made the reversal safe is that the honesty machinery is separate
+    /// from the default. `isApproximate` is true here, so the banner says so on
+    /// every run and the render receipt records it. Somebody comparing two
+    /// renders months later can still see which was which — which was the real
+    /// concern, and it never depended on `faithful` being the default.
+    ///
+    /// `--quality faithful` is one flag away and remains exact.
     public enum QualityProfile: String, Codable, Sendable, CaseIterable {
         case faithful
         case balanced
@@ -92,8 +106,9 @@ public struct RenderRequest: Sendable {
     /// 0.10 is the measured knee, swept at 864x480x124x20 against an uncached
     /// control of the same prompt and seed: 1.93x faster for 16% less
     /// high-frequency detail. 0.15 buys 2.60x and costs 28%; 0.25 buys 2.93x and
-    /// costs 44%. Faithful output is the default; selecting this optimization
-    /// is an explicit quality decision.
+    /// costs 44%. This is what `balanced` selects, and `balanced` is the
+    /// default — turning it *off* is now the explicit decision, and
+    /// `--quality faithful` is how.
     public var cacheThreshold: Double
     public var cacheMaxSkips: Int
     /// Probe the whole packed sequence rather than per stream — what every other
@@ -142,7 +157,7 @@ public struct RenderRequest: Sendable {
                 referenceVideoSoundtracks: [URL?] = [],
                 referenceAudio: [URL] = [],
                 cfgScale: Double = 1.0,
-                qualityProfile: QualityProfile = .faithful,
+                qualityProfile: QualityProfile = .balanced,
                 cacheThreshold: Double? = nil,
                 cacheMaxSkips: Int = 3,
                 cacheWholeSequenceProbe: Bool = false,

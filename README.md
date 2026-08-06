@@ -217,22 +217,24 @@ h3 render --prompt "a red kite over a beach at sunset" --out kite.mp4
   making    text to video and audio
   size      1344 x 768, 5 s at 24 fps (124 frames)
   steps     20
-  quality   faithful — no approximation
+  quality   balanced — an approximation, cache threshold 0.1
   model     MiniMax-H3-FL2VA_bf16.safetensors
-  estimate  about 34m 11s of sampling
+  estimate  about 1h 16m of sampling
 
 [1/4] reading the prompt
 [2/4] sampling  ████████··············   8/20   61.2 s/step   12m 14s left
 ```
 
 The countdown is measured from **your** render rather than read from a table, so
-it settles after a couple of steps and then tracks reality.
+it settles after a couple of steps and then tracks reality. The one-line estimate
+above it does not yet know about the cache, so on the default profile it reads
+high until the countdown takes over.
 
 Two flags worth knowing straight away:
 
 ```bash
 h3 render --prompt "..." --out out.mp4 --dry-run           # what would this cost? (1 second)
-h3 render --prompt "..." --out out.mp4 --quality balanced  # roughly twice as fast
+h3 render --prompt "..." --out out.mp4 --quality faithful   # nothing approximated, ~2x slower
 ```
 
 ---
@@ -278,14 +280,24 @@ Measured on a Mac Studio (M3 Ultra) at 864×480, 5 seconds, 20 steps:
 
 | quality | time | what changes |
 |---|---|---|
-| `faithful` *(default)* | ~23 min | nothing is approximated |
-| `balanced` | ~13 min | reuses work between steps — **16% less fine detail** |
+| `balanced` *(default)* | ~13 min | reuses work between steps — **16% less fine detail** |
+| `faithful` | ~23 min | nothing is approximated |
 | `fast` | ~10 min | 28% less fine detail |
 
-`faithful` is the default deliberately. `balanced` is a genuinely good trade for
-drafts, and it is still an approximation — so it says so on every run and it is
-recorded in the render's receipt. Nobody should discover months later that their
-comparison was against a shortcut.
+**`balanced` is the default, and it is an approximation.** It reuses one step's
+work in the next when the step barely moved, which measured 1.8–1.9× faster for
+16% less fine detail. On a twenty-minute render that is the trade almost
+everybody wants, and finding out afterwards that a flag would have halved it is
+worse than the 16%.
+
+It says so on every run and it is recorded in the render's receipt, so nobody
+discovers months later that their comparison was against a shortcut. That
+disclosure is the part that matters, and it never depended on which profile was
+the default.
+
+```bash
+h3 render --prompt "..." --out out.mp4 --quality faithful   # nothing approximated
+```
 
 Larger costs more than proportionally: attention grows with the *square* of the
 sequence length, so doubling the resolution roughly quadruples the time.
