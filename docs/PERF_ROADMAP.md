@@ -97,17 +97,19 @@ binary.
 > high-frequency content. It was chosen for being the README's example, which
 > made it a convenient control and a poor probe.
 >
-> That conditions the speed figures and not only the quality ones. Reuse count
-> depends on how far the residual moves per step, so a calm scene qualifies
-> more steps than a busy one: **45% reuse and 1.79× are an easy-content result,
-> and were first reported as though they were general.** Expect both to fall on
-> demanding content.
+> The worry was that this conditions the speed figures too — reuse count
+> depends on how far the residual moves per step, so a calm scene should
+> qualify more steps than a busy one, making 45% and 1.79× easy-content
+> artefacts.
 >
-> Content-independent, and therefore still safe to quote: the replay model,
-> which takes deltas as input; the instrument itself; and the 6B fusion verdict,
-> which is a memory-traffic argument that does not care what is in the frame.
+> **Measured, and it does not.** A busy market street with a speaking subject
+> reused the same 9 steps at cap 3, with a median whole-sequence delta of 0.080
+> against the beach's 0.082 — step for step, the same U-shaped curve. The delta
+> trajectory is driven by the flow schedule, not by scene content, so the speed
+> figures here generalise.
 >
-> See *Detail-probe re-test* below.
+> The **quality** figures in this section do not, and one of them was wrong for
+> an unrelated reason. See the retraction under 6C.
 
 ```
 arm                             runs    s/step  full step   spread  speedup  reused
@@ -367,56 +369,76 @@ and finding the ceiling afterwards.
 
 ---
 
-## 6C — Consecutive-cap sweep *(speed measured; quality UNRESOLVED)*
+## 6C — Consecutive-cap sweep *(speed measured; quality open; cap 5 provisionally clear)*
 
-> ### Retraction
->
-> **This section previously reported that every cap arm lost more detail than
-> it gained in speed, and rejected all of them. That verdict was wrong.** It
-> rested on a measurement artefact, and correcting the artefact removes the
-> entire quality case against raising the cap.
->
-> `Tools/coherence_check.py` downsampled every frame to 216×120 — a quarter of
-> the linear resolution — and computed "detail" on that. An area-average is a
-> low-pass filter, so the figure was reading mid-frequency structure with the
-> fine detail already removed. Measured natively, the numbers reverse:
->
-> | arm | detail, downsampled | detail, native |
-> |---|---|---|
-> | cap-4 | 0.978 | **1.084** |
-> | cap-5 | 0.884 | **1.037** |
-> | cap-6 | 0.846 | **1.057** |
->
-> The headline "cap 5 costs 11.6% of detail" was +3.7% with the filter removed.
->
-> A second problem sits underneath the first and is not fixed by resolution:
-> **every cap setting changes the trajectory, so every arm renders a different
-> scene.** At native resolution the beach arms sit at dssim 0.0113–0.0140
-> against cap 3, above the ~0.01 point where a detail ratio is comparing
-> content rather than quality. The proof that this is real and not pedantry:
-> on the speaker probe the *dense* arm — no cache, no approximation, the best
-> render available by construction — scored **lower** detail than a cached one,
-> at both resolutions, at dssim 0.108.
->
-> So the quality question is open, and none of the automated measures currently
-> in this tree can close it.
+The cache has three levers: threshold, per-stream probe, consecutive cap. The
+6A trace showed the threshold does not control the middle of the schedule — from
+step 4 to 15 the deltas peak at 0.096 against a threshold of 0.10, so every
+refusal there is `consecutiveCap`. That made the cap the untested lever and this
+phase is about it.
 
-### What is measured, and holds
+Residual semantics are unchanged throughout. There is one cached residual for
+the whole packed stack, so **audio and video cannot skip independently**; what
+can be independent is the admission test, and already is — reuse requires both
+`whole < threshold` and `audio < threshold`.
+
+### Status
+
+| question | answer |
+|---|---|
+| Does cap 5 go faster? | **Yes — 6.5–10% end-to-end**, reproducibly, content-independent |
+| Does cap 5 cost quality? | **Unknown by measurement. Cleared a first viewing.** |
+| Do the automated metrics settle it? | **No**, and the reason is structural — see below |
+
+### The retraction
+
+**This section previously rejected every cap arm, reporting that they lost more
+detail than they gained in speed. That was wrong twice over.**
+
+*First*, `Tools/coherence_check.py` downsampled every frame to 216×120 and
+computed "detail" on that. An area-average is a low-pass filter, so the figure
+read mid-frequency structure with the fine detail already removed. Natively the
+numbers reverse:
+
+| arm | detail, downsampled | detail, native |
+|---|---|---|
+| cap-4 | 0.978 | **1.084** |
+| cap-5 | 0.884 | **1.037** |
+| cap-6 | 0.846 | **1.057** |
+
+"Cap 5 costs 11.6% of detail" is +3.7% with the filter off.
+
+*Second*, and not fixed by resolution: **every cap setting changes the
+trajectory, so every arm renders a different scene.** A detail ratio between two
+clips only means something while their compositions match, and past dssim ≈ 0.01
+they do not. The proof this is real rather than pedantic — on the speaker probe
+the **dense** arm, no cache and no approximation, scored *lower* detail than a
+cached one at dssim 0.108. The metric was reading which market stall was in shot.
+
+`coherence_check.py` now measures detail natively, keeps the downsampling for
+the temporal measures that need it, and prints dssim first with every ratio
+marked void above 0.01. A number with a footnote gets quoted without the
+footnote.
+
+### What is measured and holds
 
 ```
-arm      reuses   end-to-end vs cap 3      speed on the speaker probe
+arm      reuses   end-to-end vs cap 3      on the speaker probe
 cap-3         9   1.000x                   1.000x
 cap-4         9   1.016x  (inside noise)   —
 cap-5        10   1.098x                   1.065x
 cap-6        10   1.100x                   —
 ```
 
-**Cap 5 buys 6.5–10% end-to-end** depending on content, reproducibly. Whether
-it costs anything is not known.
-
 **Audio is unaffected** across every cap: spectral correlation 0.993–0.997,
-envelope above 0.99. That measure needs no matched scene and is therefore not
-subject to the confound above.
+envelope above 0.99. That measure needs no matched scene, so it is not subject
+to the confound above.
+
+**The delta curve is schedule-driven, not content-driven.** The speaker probe
+reused 9 steps at cap 3 with a median whole-sequence delta of 0.080, against the
+beach's 0.082, on completely different content. This is why the speed results
+generalise even though the quality ones do not — and it retires an earlier worry
+that 45% reuse and 1.79× were easy-content artefacts.
 
 ### The replay model was exact
 
@@ -429,263 +451,103 @@ Every rendered arm reproduced its projection, step for step:
 | 5 | 10 | 10 | 9, 15 | 9, 15 |
 | 6 | 10 | 10 | 10 | 10 |
 
-Also confirmed on new content: the speaker probe reused 9 steps at cap 3 and 10
-at cap 5, with a median whole-sequence delta of 0.080 against the beach's
-0.082. **The delta curve is driven by the flow schedule, not by scene content**,
-which is why reuse counts barely move between a calm beach and a busy market
-street — and why the speed results generalise even though the quality ones do
-not.
+So `StepCachePolicyReplayTests` can *screen* future policy proposals — worth
+about an hour of GPU per rejected idea. It says nothing about quality.
+
+Two things it established that a naive reading got wrong. **Raising the cap does
+not remove refusals, it moves them**: the counter resets at every refusal, so
+caps 3 and 4 do identical work with refreshes merely relocated, and the first
+estimate of "three capped steps removed, ~26%" was an upper bound that does not
+exist. And **unbounded is not unbounded** — with no cap the cache reuses steps
+4–14 and is then stopped by the audio probe at step 15. Once the cap is relaxed,
+the per-stream audio probe is the only thing between the cache and the late
+high-change region, which is invisible at cap 3 because the cap fires first.
 
 ### Cap 4 remains the interesting arm
 
-It does the **same amount of work** as cap 3 — nine reuses, refreshes merely
-relocated from 7/11/15 to 8/13 — so any difference between them is residual
-*age* alone, with step count held constant. That is the cleanest available
-handle on the question underneath all of this. Its dssim of 0.0096 is the only
-one in the set under the validity line, and at native resolution it shows no
-detail loss.
+It does the **same amount of work** as cap 3 — nine reuses, refreshes relocated
+from 7/11/15 to 8/13 — so any difference between them is residual *age* alone,
+with step count held constant. Its dssim of 0.0096 is the only one in the set
+under the validity line, and natively it shows no detail loss.
+
+### A prior from the threshold axis
+
+`docs/ACCELERATION.md` has a threshold sweep with a zero-skip negative control
+(the cache live but never firing returned bit-identical output) and a monotonic
+dose-response: 0%, −16%, −28%, −44% of detail as skipping rises 0/10/13/14 of 20.
+That is better controlled than anything measured here, and its shipped claim of
+**16% at the default threshold stands.**
+
+It also gives the cap axis a prior. If detail cost tracks the number of skipped
+steps, going from 9 skips to 10 — all cap 5 does — should cost about a tenth of
+16%, so roughly 1.6%. Consistent with cap 5 clearing a viewing after the metrics
+had wrongly condemned it.
 
 ### What would actually settle it
 
 Not another single-clip comparison. Every arm renders a different scene, so:
 
-1. **Distribution over seeds.** Several seeds per arm, comparing absolute
-   measures across the set rather than clip against clip. Scene variation
-   averages out; a systematic softening does not. `Tools/arm_compare.py` does
-   this and refuses to use any cross-clip ratio; with a handful of seeds it
-   reports the within-arm spread as the noise floor and labels any gap smaller
-   than it as "not a finding" rather than leaving that to the reader.
+1. **Distribution over seeds.** `Tools/arm_compare.py` measures each clip on its
+   own and asks whether the arms differ by more than the seeds within an arm do.
+   It never takes a ratio between two clips. With a handful of seeds it prints
+   the within-arm spread as the noise floor and labels a smaller gap "not a
+   finding" rather than leaving that to the reader.
 2. **Reference-free absolute measures.** Speech WER against the known prompt
    line, lip-sync margin, face and landmark stability. None need a matched
-   scene. Requires `openai-whisper`, which is not installed.
-3. **Blinded human A/B.** The only measure that has ever caught anything here
-   first — the Sol-Attn pulsing artefact was found by a viewer after every
-   tensor metric passed it, and cap 5 was cleared by eye after the metrics had
-   wrongly condemned it.
+   scene. Requires `openai-whisper`, not installed.
+3. **Blinded human A/B.** The only measure that has caught anything here first:
+   the Sol-Attn pulsing artefact was found by a viewer after every tensor metric
+   passed it, and cap 5 was cleared by eye after the metrics wrongly condemned it.
 
-### Stress set *(running)*
+### Stress set
 
-Cap 5 passed a first viewing on the speaker probe. Before acceptance, four axes
-chosen for where a *residual* cache should break — which is a statement about
-how fast the trajectory moves, not about how detailed the frame is:
+Cap 5 passed a first viewing. Before acceptance, four axes chosen for where a
+*residual* cache should break — which is about how fast the trajectory moves,
+not how detailed the frame is:
 
 | arm | what it stresses |
 |---|---|
-| `moto` | fast motion with a tracking camera. Every pixel changes every frame, so a reused residual has the least chance of still being right |
-| `talk` | close-up dialogue. The documented failure for this model — every published H3 cache degrades audio, and the speaker probe only had a voice at market distance |
+| `moto` | fast motion, tracking camera, background whipping past. Every pixel changes every frame, so a reused residual has the least chance of still being right |
+| `talk` | close-up dialogue. The documented failure for this model — every published H3 cache degrades audio — and the speaker probe only had a voice at market distance |
 | `moto40` | 40 steps instead of 20 |
-| `seed 42` | same configuration, different draw — separates a cap effect from a lucky seed |
+| `seed 42` | same configuration, different draw: separates a cap effect from a lucky seed |
 
-**The 40-step axis is subtler than it first looks**, and the intuition that
-"more steps lets the cache coast further" is only half right. A finer schedule
-moves the latent less per step, so *n* steps of residual age covers *less*
-trajectory — a fixed cap is more conservative at 40 steps, not less. But
-smaller deltas also fall under the threshold more often, so the cap binds more
-of the time and the skipped *fraction* rises. Which effect dominates is a
-measurement; the replay model can answer it from the 40-step deltas as soon as
-the cap-3 arm lands.
-
-### The replay model was exact
-
-Every rendered arm reproduced its projection, step for step:
-
-| cap | projected reuses | actual | projected refreshes | actual |
-|---|---|---|---|---|
-| 3 | 9 | 9 | 7, 11, 15 | 7, 11, 15 |
-| 4 | 9 | 9 | 8, 13 | 8, 13 |
-| 5 | 10 | 10 | 9, 15 | 9, 15 |
-| 6 | 10 | 10 | 10 | 10 |
-
-So the offline replay can be trusted to *screen* future policy proposals, which
-is worth about an hour of GPU per rejected idea. It says nothing about quality,
-which is the part that decided this.
-
-One correction to the prose that preceded the sweep: the sole-audio veto at step
-15 appears at caps **4 and 6**, not "first at cap 6". At cap 5 the counter
-happens to reach its ceiling at step 15 as well, so cap and audio object
-together there. It shows up wherever the cap does not coincidentally fire first.
-
-### Not run
-
-Unbounded reuse. The protocol gated it on caps 4–6 establishing a safe trend,
-and they establish the opposite. It would be a cliff-finding experiment with the
-cliff already located.
-
-### Detail-probe re-test *(running)*
-
-**The sweep above was run on a scene with almost no fine detail to lose**, which
-is a poor way to measure detail loss. Two probes chosen for what the beach
-lacked:
-
-| probe | what it adds |
-|---|---|
-| `foliage` | maximum high-frequency content — ferns, bark, dappled light — with motion through it |
-| `speaker` | a face, lip-sync, spoken dialogue and patterned fabric, on a scene that still carries texture |
-
-Arms: `dense`, `cap3`, `cap5` on foliage — dense to re-establish the detail
-ceiling on content that has one — and `cap3` vs `cap5` on speaker. Cap 5 because
-it is the only arm that cleared the speed gate; cap 4 bought nothing and cap 6
-tracked cap 5.
-
-Three questions this settles that the beach could not:
-
-1. **Does the cache still buy 1.79×** when the residual has more to move?
-2. **Is the cap cliff worse, or was it an artefact of a low-detail scene?**
-   Both directions are live: more detail means more to lose, but the Laplacian
-   on a near-featureless frame is also easy to move by a large relative fraction.
-3. **Does lip-sync or speech break before detail does** on a scene that has any?
-   The beach had no voice, so the audio gates were never really exercised.
-
----
-
-### The sweep as it was specified
-
-Improve the existing cache **without changing its residual semantics.**
-
-### The constraint that shapes everything
-
-There is one cached residual for the entire packed multimodal stack. Audio and
-video **cannot skip independently** — the reuse either happens for the whole
-stack or not at all. What can be independent is the *admission test*:
-
-```
-reuse only when
-    videoDelta < videoThreshold(sigma)
-    AND
-    audioDelta < audioThreshold(sigma)
-```
-
-Independent thresholds and independent vetoes. Not independent reuse.
-
-### Work
-
-1. Use the measured target-video range rather than the whole packed sequence.
-   6A records it already; 6C is where it gets a vote.
-2. Pass the real video sigma into the policy. `TimestepPlan.sigmaVideo` carries
-   it now.
-3. Separate `videoThreshold(sigma:)` and `audioThreshold(sigma:)`.
-4. Conservative hysteresis: a raw delta spike **always** forces a full step; an
-   EMA may confirm a skip but may never hide a spike. First-step, final-step,
-   history and consecutive-skip protections all survive unchanged.
-5. Stateful filtering stays out of the MLX-free scalar policy.
-6. Every decision and threshold in the receipt — already true.
-7. The current constant threshold survives as a reproducible legacy profile.
-
-### What the controls actually show *(measured 2026-08-06, 3 runs)*
-
-```
-step  sigma   whole   video   audio   decision
-   1  0.996   0.216   0.237   0.120   full    videoAboveThreshold
-   2  0.991   0.137   0.147   0.112   full    videoAboveThreshold
-   3  0.986   0.115   0.124   0.096   full    videoAboveThreshold
-   4  0.980   0.096   0.101   0.079   reused
-   7  0.957   0.065   0.067   0.056   full    consecutiveCap
-  10  0.923   0.059   0.061   0.060   reused
-  11  0.908   0.062   0.064   0.065   full    consecutiveCap
-  15  0.800   0.087   0.090   0.108   full    consecutiveCap
-  16  0.750   0.106   0.109   0.120   full    audioAboveThreshold
-  18  0.571   0.159   0.163   0.196   full    audioAboveThreshold
-  19  0.387   0.250   0.255   0.246   full    cooldown
-```
-
-**"Early sigma allows aggressive reuse" is wrong for this checkpoint.** Steps
-1–3 carry the second-largest deltas of the whole render, 0.216 falling to 0.115.
-The curve is **U-shaped in step index** with its minimum around step 10 at
-0.059, rising at both ends. A monotone sigma curve would be fitted backwards.
-
-**Splitting whole-sequence from video buys almost nothing — but not nothing.**
-Video runs a consistent ~3% above whole-sequence, unsurprising once stated,
-since video is 95.1% of the rows. It disagrees about a decision **exactly once**
-in twenty steps: at step 4, whole is 0.096 and admits reuse while video is 0.101
-and would refuse. That single crossing is the entire empirical case for giving
-the video probe a vote, and it points the wrong way — it costs a step rather
-than saving one. Keep collecting it; do not promote it without a separate
-quality argument.
-
-**The audio stream crosses over.** Early it is far quieter than video (0.120
-against 0.237 at step 1); late it is louder (0.196 against 0.163 at step 18),
-crossing over around step 9.
-
-**But `audioAboveThreshold` in the headline does not mean audio vetoed
-anything.** At steps 16–18 the whole-sequence probe is *also* over threshold and
-would have forced a full step by itself; audio is reported only because it is
-the larger number. The step where audio is genuinely the sole objection is
-**15** — whole 0.087, audio 0.108 — and at the shipping cap of 3 that is
-invisible, because the cap fires there first. This is why the trace now records
-every active constraint rather than one headline.
-
-**From step 4 to step 15 the cache is running on the consecutive cap, not on
-its threshold.** The deltas in that window peak at 0.096 against a threshold of
-0.10, so the threshold never fires; every refusal there is `consecutiveCap`, at
-steps 7, 11 and 15. The knob that governs the middle of the schedule is
-`maxConsecutiveSkips`, and nobody has swept it.
-
-### What raising the cap is actually worth
-
-**Not what was first claimed.** The first reading said three capped steps could
-be removed for ~26%. That is wrong: the skip counter **resets at every refusal**,
-so a larger cap relocates the refresh points rather than deleting them. Replayed
-through the real policy against the measured deltas
-(`StepCachePolicyReplayTests`):
-
-| cap | reuses | sampling | vs cap 3 | refreshed by cap |
-|---:|---:|---:|---:|---|
-| 3 | 9 | 658.5 s | 1.00× | 7, 11, 15 |
-| 4 | 9 | 658.5 s | **1.00×** | 8, 13 |
-| 5 | 10 | 600.9 s | 1.10× | 9, 15 |
-| 6 | 10 | 600.9 s | 1.10× | 10 |
-| unbounded | 11 | 543.3 s | 1.21× | — |
-
-**Cap 4 is a refresh-placement experiment, not a speed experiment.** Same nine
-reuses, same wall clock, refreshes moved. It is worth running precisely because
-it isolates residual-age placement from step count.
-
-Caps 5 and 6 buy one step, about 9.6% of sampling. Unbounded buys 21%, not 26%,
-and carries the greatest stale-residual risk.
-
-**Unbounded is not unbounded.** With no cap the cache reuses steps 4–14 and is
-then stopped by the audio probe at step 15. Once the cap is relaxed, audio is
-the only thing standing between the cache and the late high-change region —
-which is the argument for keeping the per-stream probe, and it cannot be seen at
-cap 3 at all.
-
-These are offline projections against fixed deltas. Changing the cap changes the
-trajectory and therefore every subsequent delta, so **rendered arms remain the
-only authority**; the projection is for deciding which arms are worth an hour of
-GPU each.
-
-Design thresholds *after* that, and shape them U-wise in step index rather than
-monotone in sigma — if any threshold-controlled region turns out to be worth
-fitting at all. The current trace says the cache already finds the useful middle
-window on its own. **The unresolved question is not where to put a threshold; it
-is how old a reused full-stack residual can get before coherence breaks.**
-
-### Protocol
-
-Threshold stays at 0.10, per-stream probing on, fusion off. The only thing that
-varies is the cap.
-
-1. **Cap 4** — refresh placement at constant step count. Purely a coherence
-   probe; if it looks different from cap 3, residual *age* matters independently
-   of how many steps are skipped, which is the thing worth knowing.
-2. **Cap 5** — only if 4 is visually coherent.
-3. **Cap 6** — only if 5 is coherent *and* materially faster.
-4. **Unbounded** — only if 4→6 establish a safe trend. It is explicitly a
-   cliff-finding experiment and should be labelled as one.
-
-Reject an arm immediately on visible pulsing, geometry drift or warping. Those
-are what the Sol-Attn work found by watching output after every tensor metric
-said the render was fine.
+**The 40-step axis is subtler than it looks**, and "more steps lets the cache
+coast further" is only half right. A finer schedule moves the latent less per
+step, so *n* steps of residual age covers *less* trajectory — a fixed cap is
+**more** conservative at 40 steps. But smaller deltas also fall under the
+threshold more often, so the cap binds more of the time and the skipped
+*fraction* rises. Which dominates is a measurement; the replay model answers it
+from the 40-step deltas once that arm lands.
 
 ### Promotion gate
 
-**At least 5% end-to-end over the 1.79× cached control** — not over dense.
-Beating dense is not an achievement here; the cache already does it.
+**At least 5% end-to-end over the cached control** — not over dense. Beating
+dense is not an achievement here; the cache already does it. Cap 5 clears this.
 
-Nothing is promoted from one prompt and one seed. A qualifying arm needs
-multiple seeds and: localized temporal acceleration, Laplacian detail, speech
-WER, audio spectral and envelope correlation, lip-sync margin, face and landmark
-stability, and blinded playback. Faithful mode stays completely cache-free.
+Nothing is promoted from one prompt and one seed. A qualifying arm needs multiple
+seeds, the stress axes above, and: localized temporal acceleration, Laplacian
+detail measured natively, speech WER, audio spectral and envelope correlation,
+lip-sync margin, face and landmark stability, and blinded playback. Faithful
+mode stays completely cache-free.
+
+Reject immediately on visible pulsing, geometry drift or warping — the failures
+that every tensor metric passed during the Sol-Attn work.
+
+### Not run
+
+Unbounded reuse. It remains a cliff-finding experiment, and the audio probe
+rather than the cap is what would stop it.
+
+### If the cap moves, the sigma work does not follow
+
+The original plan for this phase was a sigma-aware threshold curve. **Drop it
+unless a later trace shows a threshold-controlled region worth fitting.** The
+measured deltas are U-shaped in step index, not monotone in sigma, so a sigma
+curve would be fitted backwards; and the cache already finds the useful middle
+window without one. Splitting whole-sequence from video is likewise not worth
+promoting: video runs ~3% above whole-sequence and disagrees about a decision
+exactly once in twenty steps, at step 4, in the direction of doing *more* work.
 
 ---
 
