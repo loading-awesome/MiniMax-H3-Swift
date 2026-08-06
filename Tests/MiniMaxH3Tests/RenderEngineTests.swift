@@ -3,6 +3,7 @@
 
 import Foundation
 import Testing
+import H3Foundation
 @testable import MiniMaxH3
 
 @Suite("enterprise render facade")
@@ -95,6 +96,41 @@ struct RenderEngineTests {
         #expect(FileManager.default.fileExists(atPath: published.video.path))
         #expect(published.audio?.lastPathComponent == "final.recovery.wav")
         #expect(try Data(contentsOf: published.audio!) == Data("audio".utf8))
+    }
+
+    @Test("commit carries every field, not just the ones the initialiser takes")
+    func commitCarriesEveryField() throws {
+        // `commit` rebuilds the result to swap the staged URLs for published
+        // ones, so anything the initialiser does not accept has to be copied
+        // across by hand. Adding a field and forgetting that line compiles,
+        // passes every other test, and silently zeroes the field — which is
+        // exactly what happened to the benchmark trace: the record was assembled
+        // from a published result whose trace had been dropped on the way, and
+        // it would have written an empty `steps` array with no error anywhere.
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "h3-commit-test-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let request = RenderRequest(prompt: "test", videoOutput: root.appending(path: "final.mp4"))
+        let transaction = try OutputTransaction(jobID: UUID(), request: request)
+        try Data("video".utf8).write(to: transaction.stagedRequest.videoOutput)
+        try Data("audio".utf8).write(to: transaction.stagedRequest.audioOutput!)
+
+        var staged = RenderResult(video: transaction.stagedRequest.videoOutput,
+                                  audio: transaction.stagedRequest.audioOutput,
+                                  frameCount: 124, width: 864, height: 480, seconds: 5,
+                                  timings: .init(), cacheSummary: nil)
+        staged.trace = SamplingTrace(steps: [], stepSeconds: [40, 20, 20, 40])
+        staged.mlxPeakBytes = 53_000_000_000
+        staged.mlxActiveBytesAtEnd = 1_234
+        staged.attentionBackend = "sdpa"
+
+        let published = try transaction.commit(staged)
+        #expect(published.trace == staged.trace)
+        #expect(published.mlxPeakBytes == 53_000_000_000)
+        #expect(published.mlxActiveBytesAtEnd == 1_234)
+        #expect(published.attentionBackend == "sdpa")
     }
 
     @Test("a preflight failure writes a receipt without prompt contents")

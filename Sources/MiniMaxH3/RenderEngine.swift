@@ -491,11 +491,22 @@ final class OutputTransaction {
         // already published successfully.
         try promote(staged.video, to: finalVideo)
         discard()
-        return RenderResult(video: finalVideo, audio: publishedAudio,
-                            frameCount: staged.frameCount, width: staged.width,
-                            height: staged.height, seconds: staged.seconds,
-                            timings: staged.timings, cacheSummary: staged.cacheSummary,
-                            muxedAudio: staged.muxedAudio)
+        // Rebuilt rather than mutated because only the URLs change on publish —
+        // and every field the initialiser does not take has to be carried over
+        // by hand. That is a standing hazard: a field added to `RenderResult`
+        // and not added here is silently zero by the time anything reads it,
+        // with no build error and no failing test unless one asserts on the
+        // published value. `RenderEngineTests.commitCarriesEveryField` does.
+        var published = RenderResult(video: finalVideo, audio: publishedAudio,
+                                     frameCount: staged.frameCount, width: staged.width,
+                                     height: staged.height, seconds: staged.seconds,
+                                     timings: staged.timings, cacheSummary: staged.cacheSummary,
+                                     muxedAudio: staged.muxedAudio)
+        published.trace = staged.trace
+        published.mlxPeakBytes = staged.mlxPeakBytes
+        published.mlxActiveBytesAtEnd = staged.mlxActiveBytesAtEnd
+        published.attentionBackend = staged.attentionBackend
+        return published
     }
 
     func recoverAudio() throws -> URL? {
