@@ -364,16 +364,41 @@ detail loss.
 
 Not another single-clip comparison. Every arm renders a different scene, so:
 
-1. **Distribution over seeds.** Six or more seeds per arm, comparing mean
-   absolute detail across the set rather than clip against clip. Scene
-   variation averages out; a systematic softening does not. Roughly twelve
-   renders per pairwise question.
+1. **Distribution over seeds.** Several seeds per arm, comparing absolute
+   measures across the set rather than clip against clip. Scene variation
+   averages out; a systematic softening does not. `Tools/arm_compare.py` does
+   this and refuses to use any cross-clip ratio; with a handful of seeds it
+   reports the within-arm spread as the noise floor and labels any gap smaller
+   than it as "not a finding" rather than leaving that to the reader.
 2. **Reference-free absolute measures.** Speech WER against the known prompt
    line, lip-sync margin, face and landmark stability. None need a matched
    scene. Requires `openai-whisper`, which is not installed.
 3. **Blinded human A/B.** The only measure that has ever caught anything here
    first — the Sol-Attn pulsing artefact was found by a viewer after every
-   tensor metric passed it.
+   tensor metric passed it, and cap 5 was cleared by eye after the metrics had
+   wrongly condemned it.
+
+### Stress set *(running)*
+
+Cap 5 passed a first viewing on the speaker probe. Before acceptance, four axes
+chosen for where a *residual* cache should break — which is a statement about
+how fast the trajectory moves, not about how detailed the frame is:
+
+| arm | what it stresses |
+|---|---|
+| `moto` | fast motion with a tracking camera. Every pixel changes every frame, so a reused residual has the least chance of still being right |
+| `talk` | close-up dialogue. The documented failure for this model — every published H3 cache degrades audio, and the speaker probe only had a voice at market distance |
+| `moto40` | 40 steps instead of 20 |
+| `seed 42` | same configuration, different draw — separates a cap effect from a lucky seed |
+
+**The 40-step axis is subtler than it first looks**, and the intuition that
+"more steps lets the cache coast further" is only half right. A finer schedule
+moves the latent less per step, so *n* steps of residual age covers *less*
+trajectory — a fixed cap is more conservative at 40 steps, not less. But
+smaller deltas also fall under the threshold more often, so the cap binds more
+of the time and the skipped *fraction* rises. Which effect dominates is a
+measurement; the replay model can answer it from the 40-step deltas as soon as
+the cap-3 arm lands.
 
 ### The replay model was exact
 

@@ -78,6 +78,24 @@ package final class H3StepCache {
     /// caps 3 and 4 both yield nine reuses and identical wall clock; the
     /// refreshes merely relocate from steps 7/11/15 to 8/13. See
     /// `StepCachePolicyReplayTests`.
+    ///
+    /// **It counts steps, and a step is not a fixed amount of trajectory.**
+    /// This matters the moment anyone renders at other than the default 20
+    /// steps, and cuts in two directions at once:
+    ///
+    ///  * A finer schedule moves the latent less per step, so *n* steps of
+    ///    residual age covers less trajectory. In that sense a fixed cap gets
+    ///    **more** conservative as step count rises, not less.
+    ///  * But smaller per-step deltas also fall below the threshold more
+    ///    often, so more steps qualify for reuse and the cap becomes the
+    ///    binding constraint far more of the time. The **fraction** of the
+    ///    schedule that gets skipped rises.
+    ///
+    /// Which effect dominates is not something to reason out from here — the
+    /// deltas at 40 steps have to be measured and replayed, exactly as the
+    /// 20-step ones were. Recorded because the intuition "more steps means the
+    /// cache coasts further" is only half right, and the half that is wrong
+    /// points the other way.
     package let maxConsecutiveSkips: Int
 
     /// Steps at the start and end of the schedule that always run in full.
