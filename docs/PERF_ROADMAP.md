@@ -109,6 +109,34 @@ them. If those two figures ever diverge, something is measuring the wrong thing.
 
 Repeat spread is 0.9–1.4%. **Any claimed gain below about 1.5% is not a gain.**
 
+### Renders are not bit-reproducible, and that bounds every quality claim
+
+Three `control-cached` runs at the same seed and configuration produced three
+different mp4s. Decoding them separates what varies from what does not:
+
+| stream | result |
+|---|---|
+| audio | **bit-identical across all three** |
+| video | runs 2 and 3 identical to each other; run 1 differs |
+
+So the video path carries some run-to-run nondeterminism — plausibly MLX kernel
+or accumulation-order selection responding to machine state, since the seed,
+the configuration and the audio are all fixed. The practical consequence is a
+noise floor on every visual metric:
+
+```
+                        accel   detail   motion    dssim
+control-cached-2/3      0.979    0.995    0.973   0.0001   <- same config, noise
+fused-cached-1          1.000    1.003    0.998   0.0008
+control-dense-1         1.039    1.084    1.069   0.0089
+```
+
+**A quality difference below roughly 2% on `accel` or 0.5% on `detail` cannot
+be attributed to a configuration change.** Two useful calibrations fall out:
+dense carries 8.4% more high-frequency detail than cached, which is the cache's
+actual quality cost; and fused modulation sits at eight times the noise floor
+on `dssim` but within it on detail — a different render, not a worse one.
+
 **Do not run anything else on the GPU during a control sweep.** Test runs taken
 beside the first attempt moved its step time from 25 s to 29 s, larger than most
 of the gains this roadmap is chasing, and that sweep was discarded.
