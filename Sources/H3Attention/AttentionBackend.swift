@@ -198,8 +198,14 @@ package enum AttentionRegistry {
 
     /// Backends compiled into this build, most preferred first.
     ///
-    /// **Sol-Attn is not here yet, and the reason is specific rather than a
-    /// to-do.** The published implementation
+    /// **Sol-Attn is here, and it is deliberately second.** `auto` takes the
+    /// first available entry, so listing it after SDPA means dense stays the
+    /// default and `--attention sol` is an explicit request. It sits there
+    /// because it has not yet declared a *measured* equivalence class — see
+    /// `SolAttnBackend` — and this registry's whole reason for existing is that
+    /// a backend which cannot state its class must not be selected silently.
+    ///
+    /// The published implementation
     /// (`kijai/ComfyUI-SolAttn_triton`, arXiv 2607.24027) is a Triton kernel,
     /// and Triton does not target Metal — so this is a reimplementation against
     /// `MLXFast.metalKernel`, not a binding. What ports directly is the
@@ -223,7 +229,7 @@ package enum AttentionRegistry {
     /// FLOPs at our verified shape, so sparsification alone caps near 1.5x
     /// there — rising with sequence length, which is where it earns its place.
     /// See docs/SOL_ATTN.md.
-    static let available: [any H3AttentionBackend.Type] = [SDPABackend.self]
+    static let available: [any H3AttentionBackend.Type] = [SDPABackend.self, SolAttnBackend.self]
 
     package static func resolve(requested: String, machine: Machine,
                                ordering: TokenOrdering? = nil) throws -> Selection {

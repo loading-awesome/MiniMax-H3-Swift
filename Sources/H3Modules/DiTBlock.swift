@@ -173,31 +173,83 @@ package struct AttentionLayer {
     /// to exploit. Any equivalence class measured that way describes the worst
     /// possible input rather than this model.
     ///
-    /// Captured by global call ordinal, `step * numLayers + block`, because
-    /// `sdpa` is static and does not know which block invoked it.
+    /// Keyed on the **attention context**, not on a global call ordinal.
+    ///
+    /// An earlier version numbered captures by `step * numLayers + block`,
+    /// derived from a counter incremented on every call. That only holds while
+    /// the DiT block stack is the sole caller of `sdpa`, and it fails silently
+    /// when it is not: the refiner's batched text path goes through the same
+    /// function, so one extra call shifts every subsequent ordinal by one and
+    /// the capture is then labelled with a block it did not come from. Nothing
+    /// about the tensors would look wrong.
+    ///
+    /// `AttentionContext` already carries `blockIndex` and `scheduleProgress`,
+    /// which is what the label actually wants, so it is read from there. The
+    /// batched path passes no context and is therefore skipped for free.
+    ///
+    /// Driven by environment variables rather than a CLI flag, deliberately:
+    /// this is a diagnostic for characterising a sparse backend, not a feature,
+    /// and it should not add surface to `h3 render` or a dependency edge from
+    /// the CLI target to this one.
+    ///
+    ///     H3_CAPTURE_QKV=/some/dir H3_CAPTURE_BLOCKS=0,24,49 H3_CAPTURE_AFTER=0.25
     package final class QKVCapture: @unchecked Sendable {
         package var directory: String?
-        package var wantedOrdinals: Set<Int> = []
-        package var ordinal = 0
+        /// Block indices to capture, once each.
+        package var wantedBlocks: Set<Int> = []
+        /// Capture only at or after this point in the schedule. The early steps
+        /// are the dense warm-up and are not what a sparse backend will meet.
+        package var afterProgress: Double = 0.25
+        package var captured: [Int: Int] = [:]
+        /// How many times to capture each wanted block, at successive steps.
+        ///
+        /// More than one is what makes the *churn* question answerable: whether
+        /// the router picks the same blocks at step k and step k+1. A selection
+        /// that changes between adjacent steps changes the operator mid
+        /// trajectory, which is a candidate explanation for the temporal
+        /// artifact and cannot be tested from a single step's tensors.
+        package var repeats: Int = 1
         package var written: [String] = []
-        package init() {}
+
+        package init() {
+            let env = ProcessInfo.processInfo.environment
+            guard let dir = env["H3_CAPTURE_QKV"], !dir.isEmpty else { return }
+            directory = dir
+            wantedBlocks = Set((env["H3_CAPTURE_BLOCKS"] ?? "0,24,49")
+                .split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) })
+            if let a = env["H3_CAPTURE_AFTER"], let d = Double(a) { afterProgress = d }
+            if let r = env["H3_CAPTURE_REPEAT"], let n = Int(r) { repeats = max(1, n) }
+        }
     }
     package static let qkvCapture = QKVCapture()
 
-    static func maybeCapture(_ qh: MLXArray, _ kh: MLXArray, _ vh: MLXArray) {
-        let n = qkvCapture.ordinal
-        qkvCapture.ordinal += 1
-        guard let dir = qkvCapture.directory, qkvCapture.wantedOrdinals.contains(n) else { return }
+    static func maybeCapture(_ qh: MLXArray, _ kh: MLXArray, _ vh: MLXArray,
+                             _ context: AttentionContext?) {
+        guard let dir = qkvCapture.directory, let context else { return }
+        let seen = qkvCapture.captured[context.blockIndex, default: 0]
+        guard qkvCapture.wantedBlocks.contains(context.blockIndex),
+              seen < qkvCapture.repeats,
+              context.scheduleProgress >= qkvCapture.afterProgress else { return }
+        qkvCapture.captured[context.blockIndex] = seen + 1
+
         // [1, heads, S, d] -> [S, heads, d], the layout the Triton kernel takes
-        // as BTHD with the batch axis added back on the other side.
+        // as BTHD with the batch axis added back on the other side. Kept
+        // identical to the previous format so anything that read the old
+        // captures still reads these.
         func pack(_ x: MLXArray) -> MLXArray { x[0].transposed(1, 0, 2) }
-        let path = "\(dir)/qkv_call\(String(format: "%04d", n)).safetensors"
+        let path = "\(dir)/qkv_block\(String(format: "%02d", context.blockIndex))"
+                 + "_p\(String(format: "%.2f", context.scheduleProgress)).safetensors"
         do {
-            try MLX.save(arrays: ["q": pack(qh), "k": pack(kh), "v": pack(vh)], url: URL(fileURLWithPath: path))
+            try MLX.save(arrays: ["q": pack(qh), "k": pack(kh), "v": pack(vh)],
+                         url: URL(fileURLWithPath: path))
             qkvCapture.written.append(path)
-            FileHandle.standardError.write(Data("  captured call \(n) -> \(path)\n".utf8))
+            let note = "  captured block \(context.blockIndex) at progress "
+                     + String(format: "%.2f", context.scheduleProgress)
+                     + ", S=\(context.sequenceLength) -> \(path)\n"
+            FileHandle.standardError.write(Data(note.utf8))
         } catch {
-            FileHandle.standardError.write(Data("  capture failed at \(n): \(error)\n".utf8))
+            let note = "  capture failed at block \(context.blockIndex): \(error)\n"
+            FileHandle.standardError.write(Data(note.utf8))
         }
     }
 
@@ -249,7 +301,7 @@ package struct AttentionLayer {
         let vh = hasBatch ? v.transposed(0, 2, 1, 3).asType(at) : v.transposed(1, 0, 2).expandedDimensions(axis: 0).asType(at)
         
         if proxyProbe.enabled { Self.recordProxy(qh, kh) }
-        if qkvCapture.directory != nil { Self.maybeCapture(qh, kh, vh) }
+        if qkvCapture.directory != nil { Self.maybeCapture(qh, kh, vh, context) }
 
         let scale = 1.0 / Float(headDim).squareRoot()
 

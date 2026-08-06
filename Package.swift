@@ -91,7 +91,10 @@ let package = Package(
         // removing it changed nothing, and the real cause is that SwiftPM never
         // builds MLX's Metal kernels at all.
         .testTarget(name: "H3AttentionTests",
-                    dependencies: ["H3Attention", .product(name: "MLX", package: "mlx-swift")]),
+                    dependencies: ["H3Attention", "H3Hardware",
+                                   .product(name: "MLX", package: "mlx-swift"),
+                                   .product(name: "MLXFast", package: "mlx-swift"),
+                                   .product(name: "MLXRandom", package: "mlx-swift")]),
         .testTarget(name: "H3ModulesTests",
                     dependencies: ["H3Modules", "H3Attention", "H3Hardware",
                                    .product(name: "MLX", package: "mlx-swift")]),
