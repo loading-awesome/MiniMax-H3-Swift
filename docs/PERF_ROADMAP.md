@@ -143,16 +143,21 @@ noise floor on every visual metric:
 
 ```
                         accel   detail   motion    dssim
-control-cached-2/3      0.979    0.995    0.973   0.0001   <- same config, noise
-fused-cached-1          1.000    1.003    0.998   0.0008
-control-dense-1         1.039    1.084    1.069   0.0089
+control-cached-2/3      0.979    0.991    0.973   0.0003   <- same config, noise
+fused-cached-1          1.000    1.024    0.998   0.0017
+control-dense-1         1.039    1.013    1.069   0.0138   <- different scene
 ```
 
-**A quality difference below roughly 2% on `accel` or 0.5% on `detail` cannot
-be attributed to a configuration change.** Two useful calibrations fall out:
-dense carries 8.4% more high-frequency detail than cached, which is the cache's
-actual quality cost; and fused modulation sits at eight times the noise floor
-on `dssim` but within it on detail — a different render, not a worse one.
+**A quality difference below roughly 2% on `accel` or 1% on `detail` cannot be
+attributed to a configuration change.**
+
+**And note what is missing from that table.** It once carried a third
+calibration — "dense carries 8.4% more high-frequency detail than cached, which
+is the cache's actual quality cost". That number was 1.084 measured on
+downsampled frames; natively it is 1.013, and dense sits at dssim 0.0138, which
+is a different scene. **So the cache's quality cost has never actually been
+measured here.** It was a filter artefact attached to an invalid comparison,
+quoted three times before it was checked.
 
 **Do not run anything else on the GPU during a control sweep.** Test runs taken
 beside the first attempt moved its step time from 25 s to 29 s, larger than most
@@ -253,9 +258,9 @@ unless a later trace shows a threshold-controlled region worth fitting — the
 cache already identifies the useful middle window without one.
 
 ```
-1. Consecutive-cap sweep: 4 -> 5 -> 6            DONE — all arms rejected
-2. Full coherence gates on any faster arm        n/a, nothing qualified
-3. AdaLN schedule batching                       <- next
+1. Consecutive-cap sweep: 4 -> 5 -> 6            speed done; quality UNRESOLVED
+2. A quality method that survives recomposition  <- blocking 1
+3. AdaLN schedule batching
 4. MLX dense-block compilation
 5. Canonical weight layout and GEMM profiling
 6. Selective resident quantized matmul research
@@ -265,65 +270,110 @@ Items 3–6 are untried and, unlike 6B, are not bounded above by activation
 traffic — 6B measured 1% because a step at this shape is bound by attention and
 the large GEMMs, which is where 5 and 6 aim.
 
-**Two of the three cache levers are now measured and both are already at their
-best setting.** The threshold does not control the middle of the schedule and
-the cap cannot be relaxed without paying more in detail than it returns in
-speed. What remains for the cache is not a tuning knob; it would have to be a
-different cache — one that refreshes the residual partially, or per stream,
-rather than all-or-nothing. That is a design, not a sweep, and it is not
-obviously worth it against a 1.79× baseline.
+**Cap 5 is a live 6.5–10% that cannot currently be accepted or rejected**,
+because no measure in this tree can compare two renders that depict different
+scenes. That is now the blocking problem for the cache, and it blocks any
+future cache work too — every change to this policy moves the trajectory.
 
-So the remaining honest headroom is in items 3–6, which are about the GEMMs and
-the attention that actually dominate a step.
+Items 3–6 are not blocked by it. A kernel that computes the same arithmetic
+faster leaves the trajectory alone, so it can be validated by the equivalence
+classes and taps this tree already has. 6B was settled in an afternoon for
+exactly that reason.
 
 ---
 
-## 6C — Consecutive-cap sweep *(measured; all arms rejected; cap stays at 3)*
+## 6C — Consecutive-cap sweep *(speed measured; quality UNRESOLVED)*
 
-**Verdict: raising the cap loses more detail than it gains speed, at every
-setting tried.** The shipping cap of 3 is where it should be.
+> ### Retraction
+>
+> **This section previously reported that every cap arm lost more detail than
+> it gained in speed, and rejected all of them. That verdict was wrong.** It
+> rested on a measurement artefact, and correcting the artefact removes the
+> entire quality case against raising the cap.
+>
+> `Tools/coherence_check.py` downsampled every frame to 216×120 — a quarter of
+> the linear resolution — and computed "detail" on that. An area-average is a
+> low-pass filter, so the figure was reading mid-frequency structure with the
+> fine detail already removed. Measured natively, the numbers reverse:
+>
+> | arm | detail, downsampled | detail, native |
+> |---|---|---|
+> | cap-4 | 0.978 | **1.084** |
+> | cap-5 | 0.884 | **1.037** |
+> | cap-6 | 0.846 | **1.057** |
+>
+> The headline "cap 5 costs 11.6% of detail" was +3.7% with the filter removed.
+>
+> A second problem sits underneath the first and is not fixed by resolution:
+> **every cap setting changes the trajectory, so every arm renders a different
+> scene.** At native resolution the beach arms sit at dssim 0.0113–0.0140
+> against cap 3, above the ~0.01 point where a detail ratio is comparing
+> content rather than quality. The proof that this is real and not pedantry:
+> on the speaker probe the *dense* arm — no cache, no approximation, the best
+> render available by construction — scored **lower** detail than a cached one,
+> at both resolutions, at dssim 0.108.
+>
+> So the quality question is open, and none of the automated measures currently
+> in this tree can close it.
+
+### What is measured, and holds
 
 ```
-arm                  speed   detail   accel   trade
-cap-3 (shipping)    1.000x    1.000   1.000   baseline
-cap-4               1.016x    0.978   1.031   +1.6% speed for -2.2% detail
-cap-5               1.098x    0.884   1.031   +9.8% speed for -11.6% detail
-cap-6               1.100x    0.846   1.021   +10.0% speed for -15.4% detail
-
-for scale, the cache itself buys +79% speed for -8.9% detail
+arm      reuses   end-to-end vs cap 3      speed on the speaker probe
+cap-3         9   1.000x                   1.000x
+cap-4         9   1.016x  (inside noise)   —
+cap-5        10   1.098x                   1.065x
+cap-6        10   1.100x                   —
 ```
 
-Speed is end-to-end against `cap-3-recheck`; detail and accel are relative,
-from `Tools/coherence_check.py`, on a 0.5% noise floor.
+**Cap 5 buys 6.5–10% end-to-end** depending on content, reproducibly. Whether
+it costs anything is not known.
 
-**The failure mode is softening, not warping.** Acceleration barely moves
-(1.02–1.03) and the pulse band stays clean, so every temporal measure says
-these renders are fine. They are not — caps 5 and 6 have lost 12% and 15% of
-their high-frequency detail. This is exactly the trap the blur guard exists
-for, and ranking on temporal stability alone would have promoted cap 6 as the
-steadiest arm in the set.
+**Audio is unaffected** across every cap: spectral correlation 0.993–0.997,
+envelope above 0.99. That measure needs no matched scene and is therefore not
+subject to the confound above.
 
-**Audio is not the constraint.** Spectral correlation stays at 0.993–0.997 and
-envelope correlation above 0.99 across every cap. For once the picture degrades
-first.
+### The replay model was exact
 
-### The answer to the question that was actually open
+Every rendered arm reproduced its projection, step for step:
 
-*How old can a reused full-stack residual get before coherence breaks?*
-The cliff is between allowing **four** and allowing **five** consecutive
-reuses:
+| cap | projected reuses | actual | projected refreshes | actual |
+|---|---|---|---|---|
+| 3 | 9 | 9 | 7, 11, 15 | 7, 11, 15 |
+| 4 | 9 | 9 | 8, 13 | 8, 13 |
+| 5 | 10 | 10 | 9, 15 | 9, 15 |
+| 6 | 10 | 10 | 10 | 10 |
 
-| step from → to | marginal detail cost |
-|---|---|
-| cap 3 → 4 | −2.2% |
-| cap 4 → 5 | −9.4% |
-| cap 5 → 6 | −3.8% |
+Also confirmed on new content: the speaker probe reused 9 steps at cap 3 and 10
+at cap 5, with a median whole-sequence delta of 0.080 against the beach's
+0.082. **The delta curve is driven by the flow schedule, not by scene content**,
+which is why reuse counts barely move between a calm beach and a busy market
+street — and why the speed results generalise even though the quality ones do
+not.
 
-Cap 4 is the clean experiment and the informative one: **it does the same
-amount of work as cap 3** — nine reuses, refreshes merely relocated from
-7/11/15 to 8/13 — and still loses 2.2% of detail for a speed change inside the
-noise. Residual *age* therefore costs something on its own, independently of
-how many steps get skipped. There is no free placement.
+### Cap 4 remains the interesting arm
+
+It does the **same amount of work** as cap 3 — nine reuses, refreshes merely
+relocated from 7/11/15 to 8/13 — so any difference between them is residual
+*age* alone, with step count held constant. That is the cleanest available
+handle on the question underneath all of this. Its dssim of 0.0096 is the only
+one in the set under the validity line, and at native resolution it shows no
+detail loss.
+
+### What would actually settle it
+
+Not another single-clip comparison. Every arm renders a different scene, so:
+
+1. **Distribution over seeds.** Six or more seeds per arm, comparing mean
+   absolute detail across the set rather than clip against clip. Scene
+   variation averages out; a systematic softening does not. Roughly twelve
+   renders per pairwise question.
+2. **Reference-free absolute measures.** Speech WER against the known prompt
+   line, lip-sync margin, face and landmark stability. None need a matched
+   scene. Requires `openai-whisper`, which is not installed.
+3. **Blinded human A/B.** The only measure that has ever caught anything here
+   first — the Sol-Attn pulsing artefact was found by a viewer after every
+   tensor metric passed it.
 
 ### The replay model was exact
 

@@ -18,9 +18,21 @@ What each column is:
             what pulsing and warping look like. Reported relative to the
             reference clip.
 
-  detail    Median Laplacian variance per frame — high-frequency content.
-            **The blur guard.** A clip that improves on `accel` while dropping
-            here has not become steadier, it has become softer.
+  detail    Median Laplacian variance per frame **at native resolution** —
+            high-frequency content. The blur guard: a clip that improves on
+            `accel` while dropping here has not become steadier, it has become
+            softer. Measured natively because measuring it on a downsampled
+            copy low-passes away the thing being measured, and did — see
+            `frames`.
+
+  dssim     Also, and first: **if this exceeds about 0.01 the detail ratio
+            beside it means nothing.** Two cache settings produce different
+            trajectories and therefore different scenes, and comparing the
+            Laplacian variance of two different scenes compares their content.
+            The tell that this is real: on one probe the *dense* arm — no
+            cache, no approximation, and by construction the best available —
+            scored lower detail than a cached one, at both resolutions, with
+            dssim 0.108.
 
   pulse     Fraction of frame-pair energy in the 1.5-10 Hz band of the
             per-frame mean luminance. The band matters: an earlier version of
@@ -41,12 +53,36 @@ import subprocess, sys, json
 import numpy as np
 
 
-def frames(path, width=216, height=120):
-    """Greyscale frames, downsampled. Downsampling is deliberate: the artifacts
-    being hunted are regional, and full resolution mostly adds sensor-level
-    noise to every measure."""
-    cmd = ["ffmpeg", "-v", "error", "-i", path,
-           "-vf", f"scale={width}:{height}", "-pix_fmt", "gray",
+def frames(path, width=None, height=None):
+    """Greyscale frames. Native resolution unless a size is given.
+
+    **The two families of measure need different resolutions, and conflating
+    them produced a wrong answer.** This function downsampled to 216x120 for
+    everything, on the reasoning that the artifacts being hunted are regional
+    and full resolution adds noise. That is correct for the temporal measures
+    and exactly backwards for the detail one: an area-average to a quarter of
+    the linear resolution is a low-pass filter, so the "detail" figure was
+    reading mid-frequency structure with the fine detail already removed.
+
+    It reversed a result. On the beach probe, cap 5 measured 0.884 against
+    cap 3 downsampled — an 11.6% detail loss, which is what a configuration was
+    rejected on — and 1.037 at native resolution. Opposite sign.
+
+    So detail is measured natively and the temporal measures keep their
+    downsampling, which they need: at native resolution frame-to-frame
+    differences are dominated by per-pixel generation noise rather than by the
+    regional motion the artifacts live in.
+    """
+    if width and height:
+        vf = ["-vf", f"scale={width}:{height}"]
+    else:
+        vf = []
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", path],
+            capture_output=True, text=True, check=True).stdout.strip()
+        width, height = (int(v) for v in probe.split("x"))
+    cmd = ["ffmpeg", "-v", "error", "-i", path, *vf, "-pix_fmt", "gray",
            "-f", "rawvideo", "-"]
     raw = subprocess.run(cmd, capture_output=True, check=True).stdout
     n = len(raw) // (width * height)
@@ -61,7 +97,11 @@ def laplacian_variance(f):
 
 
 def measure(path, fps=24.0):
-    f = frames(path)
+    # Detail natively; motion, acceleration and pulse on the downsampled copy.
+    native = frames(path)
+    detail = float(np.median([laplacian_variance(x) for x in native]))
+
+    f = frames(path, 216, 120)
     d1 = np.abs(np.diff(f, axis=0)).mean(axis=(1, 2))
     d2 = np.abs(np.diff(f, n=2, axis=0)).mean(axis=(1, 2))
     mean_luma = f.mean(axis=(1, 2))
@@ -76,7 +116,7 @@ def measure(path, fps=24.0):
     return dict(frames=len(f),
                 motion=float(np.median(d1)),
                 accel=float(np.median(d2)),
-                detail=float(np.median([laplacian_variance(x) for x in f])),
+                detail=detail,
                 pulse=pulse)
 
 
@@ -112,15 +152,21 @@ def main():
     for path in sys.argv[2:]:
         m = measure(path)
         name = path.split("/")[-1].replace(".mp4", "")
+        d = dssim(ref, path)
+        # The ratios are printed as unusable rather than printed and caveated.
+        # A number with a footnote gets quoted without the footnote.
+        flag = "" if d < 0.01 else "   <- different scene, ratios void"
         print(f"{name:<20}"
               f"{m['accel'] / base['accel']:>9.3f}"
               f"{m['detail'] / base['detail']:>9.3f}"
               f"{m['motion'] / base['motion']:>9.3f}"
               f"{m['pulse']:>9.4f}"
-              f"{dssim(ref, path):>8.4f}")
-    print("\n  accel above ~1.1 with detail at or below 1.0 is the warping signature.")
+              f"{d:>8.4f}{flag}")
+    print("\n  Read dssim first. Above ~0.01 the arms rendered different scenes and")
+    print("  every ratio on that row is comparing content, not quality.")
+    print("  Below it: accel above ~1.1 with detail at or below 1.0 is warping;")
     print("  detail below ~0.95 is blur, whatever the temporal numbers say.")
-    print("  neither substitutes for watching the clip.")
+    print("  Neither substitutes for watching the clip.")
     return 0
 
 

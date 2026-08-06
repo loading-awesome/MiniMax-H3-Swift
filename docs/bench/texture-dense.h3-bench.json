@@ -1,0 +1,78 @@
+{
+  "arm" : "texture-dense",
+  "configuration" : {
+    "attentionBackend" : "sdpa",
+    "cacheMaxConsecutiveSkips" : 3,
+    "cachePerStreamProbe" : true,
+    "cacheThreshold" : 0,
+    "overrides" : {
+      "resolved.fusedModulation" : "off"
+    },
+    "qualityProfile" : "faithful"
+  },
+  "identity" : {
+    "cfgScale" : 1,
+    "ditSizeBytes" : 66280486944,
+    "height" : 480,
+    "promptDigest" : "a04cede49fdf6a178b59f8d21ec2fa92631513403e093fa8024094a91d6fa09e",
+    "seconds" : 5,
+    "seed" : 7,
+    "steps" : 20,
+    "width" : 864
+  },
+  "machine" : {
+    "cores" : 28,
+    "libraryVersion" : "0.1.0-dev",
+    "mlxSwiftVersion" : "0.31.6",
+    "model" : "Apple M3 Ultra (Mac15,14), 275 GB unified memory, 28 cores",
+    "operatingSystem" : "Version 26.5.2 (Build 25F84)",
+    "physicalMemoryBytes" : 274877906944
+  },
+  "memory" : {
+    "mlxActiveBytesAtEnd" : 85064181908,
+    "mlxPeakBytes" : 87211921532
+  },
+  "phaseSeconds" : {
+    "audio_decode" : 0.6572279930114746,
+    "condition_encoding" : 2.193450927734375e-05,
+    "model_load" : 0.0034461021423339844,
+    "mux" : 0.2514920234680176,
+    "pixel_pack" : 0.08022499084472656,
+    "sampling" : 1203.3082320690155,
+    "text_conditioning" : 10.796698927879333,
+    "total" : 1291.1125090122223,
+    "video_decode" : 76.01516497135162
+  },
+  "quality" : {
+
+  },
+  "recordedAt" : "2026-08-06T21:13:00Z",
+  "schemaVersion" : 1,
+  "trace" : {
+    "stepSeconds" : [
+      61.325981974601746,
+      60.03695797920227,
+      59.99945294857025,
+      59.96885299682617,
+      59.96325695514679,
+      60.008386969566345,
+      60.16734993457794,
+      60.11679697036743,
+      60.1098849773407,
+      60.13331091403961,
+      60.18772494792938,
+      60.093239068984985,
+      60.095996022224426,
+      60.146734952926636,
+      60.12955904006958,
+      60.05456507205963,
+      60.15161907672882,
+      60.10360789299011,
+      60.303073048591614,
+      60.21007299423218
+    ],
+    "steps" : [
+
+    ]
+  }
+}
