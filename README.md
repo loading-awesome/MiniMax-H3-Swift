@@ -3,24 +3,20 @@
 Type a sentence, get a video **with the sound already in it**. No GPU rental, no
 Python environment, no node graph. One command, on your Mac.
 
-[![Two drivers at a stoplight](demo-media/stoplight.jpg)](demo-media/stoplight.mp4)
+[![A drag race](demo-media/race.jpg)](demo-media/race.mp4)
 
-<sub>**Two drivers at a stoplight.** 864×480, 7 s, 20 steps. The dialogue, the
-engine noise and the music were generated *together with the picture* — nothing
-was dubbed on afterwards. Click any still to get the clip; GitHub will not play
+<sub>**A drag race.** 864×480, 7 s, 20 steps. Two speakers — the dialogue, both
+engines and the music were generated *together with the picture*, nothing was
+dubbed on afterwards. Click any still to get the clip; GitHub will not play
 video inline in a README.</sub>
 
 ```bash
 h3 render --prompt "a red kite over a beach at sunset" --out kite.mp4
 ```
 
-### Three more, one command each
+### Two more, one command each
 
 No flags — 864×480, 7 s, 20 steps, about 19 minutes apiece on a Mac Studio.
-
-[![A drag race](demo-media/race.jpg)](demo-media/race.mp4)
-
-<sub>**A drag race.** Two speakers, both voices and both engines from one prompt.</sub>
 
 [![An anime girl at her computer](demo-media/anime.jpg)](demo-media/anime.mp4)
 
