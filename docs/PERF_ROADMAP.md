@@ -387,9 +387,47 @@ So items 3, 4 and 5 are all **struck**:
 
 | item | why it is dead |
 |---|---|
-| 3. AdaLN schedule batching | inside the 3.8% envelope; 0.008% of FLOPs |
-| 4. Dense-block compilation | inside the same envelope; launches are part of the 45 ms |
+| 3. AdaLN schedule batching | **measured 0.37%** of a full step, not estimated |
+| 4. Dense-block compilation | **measured 0.28%** of a full step at the block, in the only shippable form |
 | 5. Weight layout, GEMM profiling | there is 9% between the model and MLX's isolated rate, not a multiple |
+
+### Items 3 and 4 were struck on an estimate and are now struck on a measurement
+
+The first pass costed item 4 as kernel-launch overhead alone — about a thousand
+dispatches at ~30 µs against a 60 s forward, so 0.05% — and that was the wrong
+instrument. Compilation also removes intermediate materialisation and gives the
+optimiser visibility across the attention and MLP boundaries, and a launch count
+sees neither. Measured at the unit that matters, full block latency at
+production width (`CompiledBlockTests`, `H3_BIG=1`):
+
+| configuration | per block | vs plain | of a full step |
+|---|---:|---:|---:|
+| plain | 1243.7 ms | — | — |
+| compiled, `tEmb` captured as a constant | 1213.0 ms | 1.021× | 2.09% |
+| **compiled, `tEmb` as a runtime input** | **1240.4 ms** | **1.003×** | **0.28%** |
+| compiled, two blocks chained | 1222.0 ms/block | 1.015× | 1.52% |
+
+**Only the third row can ship.** `tEmb` is derived from sigma and changes at
+every sampler step, so folding it in as a constant measures a configuration
+nobody can render with — the same mistake that produced 6B. The 2.09% is the
+compiler deleting work that has to happen at run time.
+
+Chaining two blocks is no better than one, so the block is already the largest
+useful compiled region: the residual add at the block boundary is not costing
+anything a wider graph would recover.
+
+Compilation is also **not bit-identical** — relative RMS 2.3e-4 per block,
+compounding over fifty blocks and twenty steps into a different render. At 0.28%
+that is not a trade worth making even if the maintenance cost is one line.
+
+Two useful things fell out of it. The synthetic block at production width
+measures 1243.7 ms, and 50 × that is 62.2 s against the 60.0 s forward measured
+in the controls — **an independent confirmation of the 96.2% kernel accounting**
+from a completely different direction. And the 1.8% gap between the two compiled
+rows prompted a direct measurement of the AdaLN projection, which is **4.4 ms
+per block with the fp32 upcast on, 0.37% of a step** — so item 3 is worth about
+a third of one percent, not the 0.008% its FLOP count suggested and not the 1.8%
+the gap suggested. FLOPs were the wrong unit; so was the gap.
 
 **Only two things can now move this workload**, and neither is scheduling:
 
