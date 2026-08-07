@@ -1,0 +1,425 @@
+{
+  "arm" : "speaker-cap3",
+  "configuration" : {
+    "attentionBackend" : "sdpa",
+    "cacheMaxConsecutiveSkips" : 3,
+    "cachePerStreamProbe" : true,
+    "cacheThreshold" : 0.1,
+    "overrides" : {
+      "resolved.fusedModulation" : "off"
+    },
+    "qualityProfile" : "balanced"
+  },
+  "identity" : {
+    "cfgScale" : 1,
+    "ditSizeBytes" : 66280486944,
+    "height" : 480,
+    "promptDigest" : "50ae846440db599e28f70b242b82066a697284c3eb9831b821df028b0bac4390",
+    "seconds" : 5,
+    "seed" : 7,
+    "steps" : 20,
+    "width" : 864
+  },
+  "machine" : {
+    "cores" : 28,
+    "libraryVersion" : "0.1.0-dev",
+    "mlxSwiftVersion" : "0.31.6",
+    "model" : "Apple M3 Ultra (Mac15,14), 275 GB unified memory, 28 cores",
+    "operatingSystem" : "Version 26.5.2 (Build 25F84)",
+    "physicalMemoryBytes" : 274877906944
+  },
+  "memory" : {
+    "mlxActiveBytesAtEnd" : 85064280784,
+    "mlxPeakBytes" : 87212020408
+  },
+  "phaseSeconds" : {
+    "audio_decode" : 0.6469360589981079,
+    "condition_encoding" : 2.5987625122070312e-05,
+    "model_load" : 0.0035719871520996094,
+    "mux" : 0.28145909309387207,
+    "pixel_pack" : 0.07966494560241699,
+    "sampling" : 663.6969209909439,
+    "text_conditioning" : 2.632875084877014,
+    "total" : 743.3998501300812,
+    "video_decode" : 76.05839598178864
+  },
+  "quality" : {
+
+  },
+  "recordedAt" : "2026-08-06T19:24:54Z",
+  "schemaVersion" : 1,
+  "trace" : {
+    "stepSeconds" : [
+      60.30263602733612,
+      59.96453309059143,
+      59.50261700153351,
+      59.12639808654785,
+      1.2499089241027832,
+      1.2414470911026,
+      1.2375940084457397,
+      58.8011679649353,
+      1.212378978729248,
+      1.2085449695587158,
+      1.2177170515060425,
+      58.752830028533936,
+      1.223344087600708,
+      1.2221699953079224,
+      1.2368910312652588,
+      58.800171971321106,
+      58.88297390937805,
+      59.468132972717285,
+      59.812254905700684,
+      59.23099398612976
+    ],
+    "steps" : [
+      {
+        "advisory" : [
+
+        ],
+        "audioChange" : null,
+        "branch" : "conditional",
+        "consecutiveSkipsBefore" : 0,
+        "constraints" : [
+          "noHistory",
+          "warmup",
+          "nonFinite"
+        ],
+        "decision" : "full",
+        "reason" : "noHistory",
+        "sigma" : 1,
+        "step" : 0,
+        "videoChange" : null,
+        "wholeSequenceChange" : null
+      },
+      {
+        "advisory" : [
+          "videoRowsAboveThreshold"
+        ],
+        "audioChange" : 0.11863426119089127,
+        "branch" : "conditional",
+        "consecutiveSkipsBefore" : 0,
+        "constraints" : [
+          "wholeSequenceAboveThreshold",
+          "audioAboveThreshold"
+        ],
+        "decision" : "full",
+        "reason" : "wholeSequenceAboveThreshold",
+        "sigma" : 0.9956331849098206,
+        "step" : 1,
+        "videoChange" : 0.20805369317531586,
+        "wholeSequenceChange" : 0.17196132242679596
+      },
+      {
+        "advisory" : [
+          "videoRowsAboveThreshold"
+        ],
+        "audioChange" : 0.1080097109079361,
+        "branch" : "conditional",
+        "consecutiveSkipsBefore" : 0,
+        "constraints" : [
+          "wholeSequenceAboveThreshold",
+          "audioAboveThreshold"
+        ],
+        "decision" : "full",
+        "reason" : "wholeSequenceAboveThreshold",
+        "sigma" : 0.9908257126808167,
+        "step" : 2,
+        "videoChange" : 0.1758064478635788,
+        "wholeSequenceChange" : 0.1478494554758072
+      },
+      {
+        "advisory" : [
+          "videoRowsAboveThreshold"
+        ],
+        "audioChange" : 0.09610553085803986,
+        "branch" : "conditional",
+        "consecutiveSkipsBefore" : 0,
+        "constraints" : [
+          "wholeSequenceAboveThreshold"
+        ],
+        "decision" : "full",
+        "reason" : "wholeSequenceAboveThreshold",
+        "sigma" : 0.9855072498321533,
+        "step" : 3,
+        "videoChange" : 0.15414109826087952,
+        "wholeSequenceChange" : 0.13212434947490692
+      },
+      {
+        "advisory" : [
+          "videoRowsAboveThreshold"
+        ],
+        "audioChange" : 0.08095855265855789,
+        "branch" : "conditional",
+        "consecutiveSkipsBefore" : 0,
+        "constraints" : [
+
+        ],
+        "decision" : "reused",
+        "reason" : "belowThreshold",
+        "sigma" : 0.9795918464660645,
+        "step" : 4,
+        "videoChange" : 0.10392441600561142,
+        "wholeSequenceChange" : 0.09096534550189972
+      },
+      {
+        "advisory" : [
+
+        ],
+        "audioChange" : 0.07407407462596893,
+        "branch" : "conditional",
+        "consecutiveSkipsBefore" : 1,
+        "constraints" : [
+
+        ],
+        "decision" : "reused",
+        "reason" : "belowThreshold",
+        "sigma" : 0.9729729890823364,
+        "step" : 5,
+        "videoChange" : 0.09097222238779068,
+        "wholeSequenceChange" : 0.07954545319080353
+      },
+      {
+        "advisory" : [
+
+        ],
+        "audioChange" : 0.0672043040394783,
+        "branch" : "conditional",
+        "consecutiveSkipsBefore" : 2,
+        "constraints" : [
+
+        ],
+        "decision" : "reused",
+        "reason" : "belowThreshold",
+        "sigma" : 0.9655172228813171,
+        "step" : 6,
+        "videoChange" : 0.07887700200080872,
+        "wholeSequenceChange" : 0.06998848170042038
+      },
+      {
+        "advisory" : [
+
+        ],
+        "audioChange" : 0.05740489065647125,
+        "branch" : "conditional",
+        "consecutiveSkipsBefore" : 3,
+        "constraints" : [
+          "consecutiveCap"
+        ],
+        "decision" : "full",
+        "reason" : "consecutiveCap",
+        "sigma" : 0.9570552110671997,
+        "step" : 7,
+        "videoChange" : 0.0714743584394455,
+        "wholeSequenceChange" : 0.06474215537309647
+      },
+      {
+        "advisory" : [
+
+        ],
+        "audioChange" : 0.05872252583503723,
+        "branch" : "conditional",
+        "consecutiveSkipsBefore" : 0,
+        "constraints" : [
+
+        ],
+        "decision" : "reused",
+        "reason" : "belowThreshold",
+        "sigma" : 0.9473684430122375,
+        "step" : 8,
+        "videoChange" : 0.06716418266296387,
+        "wholeSequenceChange" : 0.06167763099074364
+      },
+      {
+        "advisory" : [
+
+        ],
+        "audioChange" : 0.0590277761220932,
+        "branch" : "conditional",
+        "consecutiveSkipsBefore" : 1,
+        "constraints" : [
+
+        ],
+        "decision" : "reused",
+        "reason" : "belowThreshold",
+        "sigma" : 0.936170220375061,
+        "step" : 9,
+        "videoChange" : 0.06491545587778091,
+        "wholeSequenceChange" : 0.0598175972700119
+      },
+      {
+        "advisory" : [
+
+        ],
+        "audioChange" : 0.059691011905670166,
+        "branch" : "conditional",
+        "consecutiveSkipsBefore" : 2,
+        "constraints" : [
+
+        ],
+        "decision" : "reused",
+        "reason" : "belowThreshold",
+        "sigma" : 0.9230769276618958,
+        "step" : 10,
+        "videoChange" : 0.0625,
+        "wholeSequenceChange" : 0.05700836703181267
+      },
+      {
+        "advisory" : [
+
+        ],
+        "audioChange" : 0.06461864709854126,
+        "branch" : "conditional",
+        "consecutiveSkipsBefore" : 3,
+        "constraints" : [
+          "consecutiveCap"
+        ],
+        "decision" : "full",
+        "reason" : "consecutiveCap",
+        "sigma" : 0.9075630307197571,
+        "step" : 11,
+        "videoChange" : 0.06479357928037643,
+        "wholeSequenceChange" : 0.059938523918390274
+      },
+      {
+        "advisory" : [
+
+        ],
+        "audioChange" : 0.06964285671710968,
+        "branch" : "conditional",
+        "consecutiveSkipsBefore" : 0,
+        "constraints" : [
+
+        ],
+        "decision" : "reused",
+        "reason" : "belowThreshold",
+        "sigma" : 0.8888888955116272,
+        "step" : 12,
+        "videoChange" : 0.06972222030162811,
+        "wholeSequenceChange" : 0.0647590383887291
+      },
+      {
+        "advisory" : [
+
+        ],
+        "audioChange" : 0.07225433737039566,
+        "branch" : "conditional",
+        "consecutiveSkipsBefore" : 1,
+        "constraints" : [
+
+        ],
+        "decision" : "reused",
+        "reason" : "belowThreshold",
+        "sigma" : 0.8659793734550476,
+        "step" : 13,
+        "videoChange" : 0.06791125237941742,
+        "wholeSequenceChange" : 0.06298828125
+      },
+      {
+        "advisory" : [
+
+        ],
+        "audioChange" : 0.08442982286214828,
+        "branch" : "conditional",
+        "consecutiveSkipsBefore" : 2,
+        "constraints" : [
+
+        ],
+        "decision" : "reused",
+        "reason" : "belowThreshold",
+        "sigma" : 0.8372092843055725,
+        "step" : 14,
+        "videoChange" : 0.07457983493804932,
+        "wholeSequenceChange" : 0.06965649127960205
+      },
+      {
+        "advisory" : [
+
+        ],
+        "audioChange" : 0.09941520541906357,
+        "branch" : "conditional",
+        "consecutiveSkipsBefore" : 3,
+        "constraints" : [
+          "consecutiveCap"
+        ],
+        "decision" : "full",
+        "reason" : "consecutiveCap",
+        "sigma" : 0.800000011920929,
+        "step" : 15,
+        "videoChange" : 0.08689024299383163,
+        "wholeSequenceChange" : 0.08069030195474625
+      },
+      {
+        "advisory" : [
+          "videoRowsAboveThreshold"
+        ],
+        "audioChange" : 0.11038012057542801,
+        "branch" : "conditional",
+        "consecutiveSkipsBefore" : 0,
+        "constraints" : [
+          "audioAboveThreshold"
+        ],
+        "decision" : "full",
+        "reason" : "audioAboveThreshold",
+        "sigma" : 0.75,
+        "step" : 16,
+        "videoChange" : 0.1044117659330368,
+        "wholeSequenceChange" : 0.0966726616024971
+      },
+      {
+        "advisory" : [
+          "videoRowsAboveThreshold"
+        ],
+        "audioChange" : 0.14181286096572876,
+        "branch" : "conditional",
+        "consecutiveSkipsBefore" : 0,
+        "constraints" : [
+          "wholeSequenceAboveThreshold",
+          "audioAboveThreshold"
+        ],
+        "decision" : "full",
+        "reason" : "audioAboveThreshold",
+        "sigma" : 0.6792452931404114,
+        "step" : 17,
+        "videoChange" : 0.129699245095253,
+        "wholeSequenceChange" : 0.1189655140042305
+      },
+      {
+        "advisory" : [
+          "videoRowsAboveThreshold"
+        ],
+        "audioChange" : 0.19005848467350006,
+        "branch" : "conditional",
+        "consecutiveSkipsBefore" : 0,
+        "constraints" : [
+          "wholeSequenceAboveThreshold",
+          "audioAboveThreshold"
+        ],
+        "decision" : "full",
+        "reason" : "audioAboveThreshold",
+        "sigma" : 0.5714285969734192,
+        "step" : 18,
+        "videoChange" : 0.16400709748268127,
+        "wholeSequenceChange" : 0.15213815867900848
+      },
+      {
+        "advisory" : [
+          "videoRowsAboveThreshold"
+        ],
+        "audioChange" : 0.24273255467414856,
+        "branch" : "conditional",
+        "consecutiveSkipsBefore" : 0,
+        "constraints" : [
+          "cooldown",
+          "wholeSequenceAboveThreshold",
+          "audioAboveThreshold"
+        ],
+        "decision" : "full",
+        "reason" : "cooldown",
+        "sigma" : 0.3870967626571655,
+        "step" : 19,
+        "videoChange" : 0.23366013169288635,
+        "wholeSequenceChange" : 0.22085890173912048
+      }
+    ]
+  }
+}

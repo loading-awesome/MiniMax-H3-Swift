@@ -42,10 +42,17 @@ import H3Foundation
 /// subtly wrong. This type is deliberately not shared: the sampler holds one per
 /// branch.
 ///
-/// **Never skip twice in a row without a ceiling.** Reuse is self-reinforcing:
-/// a skipped step does not update the probe, so the same comparison recurs and
-/// the sampler can coast to the end on one stale delta. `maxConsecutiveSkips`
-/// bounds it.
+/// **Never skip too many in a row without a ceiling — and be clear about what
+/// the ceiling protects.** This used to claim a skipped step leaves the probe
+/// unrefreshed so the same comparison recurs. It does not: block 0 runs on
+/// every step, skipped or not, and `previousProbe` is updated unconditionally.
+/// The comparison is fresh every time.
+///
+/// What ages is the **cached total residual**, which only a full step
+/// refreshes. So `maxConsecutiveSkips` bounds how many steps of trajectory one
+/// delta gets applied across — residual age — and that, not a recurring
+/// comparison, is the quantity to reason about when output starts warping.
+/// The distinction matters because the two suggest different fixes.
 ///
 /// **Never skip the first or last steps.** The first has no history. The last
 /// determines the output that is actually decoded, and a reused delta there
@@ -62,7 +69,33 @@ package final class H3StepCache {
     /// same rate.
     package let threshold: Double
 
-    /// Upper bound on consecutive reuses.
+    /// Upper bound on consecutive reuses — equivalently, the maximum age in
+    /// steps of the residual being re-applied.
+    ///
+    /// **Raising it does not simply buy that many more skipped steps.** The
+    /// counter resets at every refusal, so changing the cap moves the refresh
+    /// points rather than removing them. Replayed against the measured deltas,
+    /// caps 3 and 4 both yield nine reuses and identical wall clock; the
+    /// refreshes merely relocate from steps 7/11/15 to 8/13. See
+    /// `StepCachePolicyReplayTests`.
+    ///
+    /// **It counts steps, and a step is not a fixed amount of trajectory.**
+    /// This matters the moment anyone renders at other than the default 20
+    /// steps, and cuts in two directions at once:
+    ///
+    ///  * A finer schedule moves the latent less per step, so *n* steps of
+    ///    residual age covers less trajectory. In that sense a fixed cap gets
+    ///    **more** conservative as step count rises, not less.
+    ///  * But smaller per-step deltas also fall below the threshold more
+    ///    often, so more steps qualify for reuse and the cap becomes the
+    ///    binding constraint far more of the time. The **fraction** of the
+    ///    schedule that gets skipped rises.
+    ///
+    /// Which effect dominates is not something to reason out from here — the
+    /// deltas at 40 steps have to be measured and replayed, exactly as the
+    /// 20-step ones were. Recorded because the intuition "more steps means the
+    /// cache coasts further" is only half right, and the half that is wrong
+    /// points the other way.
     package let maxConsecutiveSkips: Int
 
     /// Steps at the start and end of the schedule that always run in full.
@@ -75,16 +108,16 @@ package final class H3StepCache {
 
     package private(set) var stepsRun = 0
     package private(set) var stepsSkipped = 0
-    /// The measured relative change at each step, for tuning the threshold
-    /// against something other than intuition.
-    package private(set) var observedChange: [Double] = []
-    /// The audio stream's own relative change, recorded separately so a sweep
-    /// can see whether the two streams actually move together.
-    package private(set) var observedAudioChange: [Double] = []
-    /// The whole-sequence change — what every other cache implementation
-    /// measures. Recorded so the two can be compared directly rather than
-    /// argued about.
-    package private(set) var observedVideoChange: [Double] = []
+
+    /// Every step's measurement and decision, in order.
+    ///
+    /// **Three deltas are recorded and only two are consulted.** The decision
+    /// still gates on `max(wholeSequence, audio)`, exactly as before; the
+    /// target-video rows are measured alongside and used by nothing. That is
+    /// deliberate — an instrument that changes the thing it measures is worth
+    /// nothing as a control, so the video figure is gathered first and given a
+    /// vote only once there is a baseline to judge the change against.
+    package private(set) var trace = SamplingTrace()
 
     /// When false, the probe is the mean over the **whole packed sequence** —
     /// what every published cache for this model does. Kept as an option
@@ -93,9 +126,17 @@ package final class H3StepCache {
     /// does not split it.
     package let perStreamProbe: Bool
 
-    package init(threshold: Double, maxConsecutiveSkips: Int = 3,
+    /// Which CFG forward this cache serves. Held here rather than passed per
+    /// call because a cache instance belongs to exactly one branch for its whole
+    /// life — that is the invariant the type exists to enforce — and a
+    /// per-call argument would be one more place for the two to be crossed.
+    package let branch: StepTrace.Branch
+
+    package init(threshold: Double, maxConsecutiveSkips: Int = 5,
                 warmupSteps: Int = 1, cooldownSteps: Int = 1,
-                perStreamProbe: Bool = true) {
+                perStreamProbe: Bool = true,
+                branch: StepTrace.Branch = .conditional) {
+        self.branch = branch
         self.perStreamProbe = perStreamProbe
         self.threshold = threshold
         self.maxConsecutiveSkips = maxConsecutiveSkips
@@ -116,10 +157,16 @@ package final class H3StepCache {
     /// - Parameters:
     ///   - probe: block 0's residual, `h_after_block0 - h_in`.
     ///   - audioRange: rows of the packed sequence carrying the target audio.
+    ///   - videoRange: rows carrying the target video. Measured and recorded,
+    ///     not yet voted on — see `trace`.
     ///   - step: 0-based sampler step.
     ///   - totalSteps: how many steps this render has.
+    ///   - sigma: the video sigma being integrated, for the trace.
+    ///   - branch: which CFG forward this is.
     package func decide(probe: MLXArray, audioRange: Range<Int>?,
-                       step: Int, totalSteps: Int) -> Decision {
+                       videoRange: Range<Int>? = nil,
+                       step: Int, totalSteps: Int,
+                       sigma: Double = .nan) -> Decision {
         defer { previousProbe = probe }
 
         /// Relative L1 change over a slice. Mean absolute rather than RMS
@@ -150,21 +197,18 @@ package final class H3StepCache {
         // audio stream's needs visible to the decision. Whether it is *enough*
         // is a measurement, not a claim — `speech_check.py` gives WER on the
         // rendered waveform, which is the only honest way to settle it.
-        var change = Double.infinity
+        var wholeSequenceChange = Double.infinity
         var audioChange = Double.infinity
+        var videoChange = Double.infinity
         if let prev = previousProbe, prev.shape == probe.shape {
-            if perStreamProbe, let audioRange, audioRange.upperBound <= probe.dim(0),
-               !audioRange.isEmpty {
-                let videoLike = relativeChange(probe, prev)
-                audioChange = relativeChange(probe[audioRange], prev[audioRange])
-                observedVideoChange.append(videoLike)
-                change = Swift.max(videoLike, audioChange)
-            } else {
-                change = relativeChange(probe, prev)
+            wholeSequenceChange = relativeChange(probe, prev)
+            func slice(_ r: Range<Int>?) -> Double {
+                guard let r, !r.isEmpty, r.upperBound <= probe.dim(0) else { return .infinity }
+                return relativeChange(probe[r], prev[r])
             }
+            audioChange = slice(audioRange)
+            videoChange = slice(videoRange)
         }
-        observedChange.append(change)
-        observedAudioChange.append(audioChange)
 
         // Every rule lives in H3Foundation.StepCachePolicy, which has no MLX
         // dependency and is therefore tested in microseconds without a GPU.
@@ -175,14 +219,25 @@ package final class H3StepCache {
                                      cooldownSteps: cooldownSteps,
                                      perStream: perStreamProbe)
         let cached = cachedTotalResidual
-        let decision = policy.decide(
-            wholeSequenceChange: perStreamProbe ? (observedVideoChange.last ?? change) : change,
+        let verdict = policy.explain(
+            wholeSequenceChange: wholeSequenceChange,
+            // Only the per-stream arm hands the audio a vote; the whole-sequence
+            // arm has to be genuinely blind to it for the A/B to mean anything.
             audioChange: perStreamProbe ? audioChange : nil,
+            // Advisory in every arm — video is measured and does not vote.
+            videoChange: videoChange,
             step: step, totalSteps: totalSteps,
             consecutiveSkips: consecutiveSkips,
             haveCachedResidual: cached != nil && cached?.shape == probe.shape)
 
-        if decision == .reuse, let cached {
+        trace.steps.append(StepTrace(
+            step: step, branch: self.branch, sigma: sigma,
+            wholeSequenceChange: wholeSequenceChange, videoChange: videoChange,
+            audioChange: audioChange, decision: verdict.decision, reason: verdict.reason,
+            constraints: verdict.constraints, advisory: verdict.advisory,
+            consecutiveSkipsBefore: consecutiveSkips))
+
+        if verdict.decision == .reuse, let cached {
             consecutiveSkips += 1
             stepsSkipped += 1
             return .reuse(cached)
@@ -206,17 +261,6 @@ package final class H3StepCache {
     }
 
     package var summary: String {
-        let total = stepsRun + stepsSkipped
-        guard total > 0 else { return "step cache: unused" }
-        let pct = 100.0 * Double(stepsSkipped) / Double(total)
-        func median(_ xs: [Double]) -> Double {
-            let f = xs.filter { $0.isFinite }.sorted()
-            return f.isEmpty ? 0 : f[f.count / 2]
-        }
-        return String(format: "step cache [%@]: %d/%d steps skipped (%.0f%%), threshold %.3f, "
-                      + "median change %.3f = max(whole-sequence %.3f, audio-only %.3f)",
-                      (perStreamProbe ? "per-stream" : "whole-sequence") as NSString,
-                      stepsSkipped, total, pct, threshold, median(observedChange),
-                      median(observedVideoChange), median(observedAudioChange))
+        trace.summary(threshold: threshold, perStreamProbe: perStreamProbe)
     }
 }

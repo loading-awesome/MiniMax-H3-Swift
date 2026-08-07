@@ -160,9 +160,11 @@ package enum PipelineRuntime {
 
         // ---- 3. sampling
         mark(.sampling, "loading the DiT", completed: 0, total: request.steps)
+        phase = Date()
         let weights = try H3Weights(url: checkpoints.dit)
         let model = try H3Transformer(weights: weights, computeDType: .bfloat16,
                                       backend: selection.backend)
+        timings.modelLoad = Date().timeIntervalSince(phase)
         reportMemory("after the DiT load", log: log)
 
         phase = Date()
@@ -240,11 +242,21 @@ package enum PipelineRuntime {
         if let summary = sampled.cacheSummary { log("  " + summary) }
         reportMemory("final", log: log)
 
-        return RenderResult(video: request.videoOutput, audio: request.audioOutput,
-                            frameCount: t, width: fw, height: fh,
-                            seconds: Double(t) / Double(H3Video.fps),
-                            timings: timings, cacheSummary: sampled.cacheSummary,
-                            muxedAudio: muxedAudio)
+        var result = RenderResult(video: request.videoOutput, audio: request.audioOutput,
+                                  frameCount: t, width: fw, height: fh,
+                                  seconds: Double(t) / Double(H3Video.fps),
+                                  timings: timings, cacheSummary: sampled.cacheSummary,
+                                  muxedAudio: muxedAudio)
+        result.trace = sampled.trace
+        result.attentionBackend = selection.identifier
+        // Read here, at the end, because `Memory.peakMemory` is a high-water
+        // mark for the process and the pipeline's `clearCache()` calls between
+        // phases free buffers without lowering it. Sampling is the peak in every
+        // configuration measured, but that is a finding to keep checking rather
+        // than a fact to bake into where the reading is taken.
+        result.mlxPeakBytes = UInt64(Memory.peakMemory)
+        result.mlxActiveBytesAtEnd = UInt64(Memory.activeMemory)
+        return result
     }
 
     /// `[1, 2, L]` to two channel arrays.

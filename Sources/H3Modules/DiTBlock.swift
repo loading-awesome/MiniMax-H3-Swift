@@ -399,14 +399,22 @@ package struct DiTBlock {
     package let attn: AttentionLayer
     package let mlp: H3MLP
     package let adaln: AdalnProj
+    /// Whether to use the fused modulation kernels. Defaults to the measured
+    /// answer, and is a property rather than a direct read of the global so a
+    /// test can exercise the fused path while the default is off — otherwise
+    /// the block-level differential test compares the readable path to itself
+    /// and passes having checked nothing.
+    package let fuseModulation: Bool
 
     package init(norm1: H3RMSNorm, norm2: H3RMSNorm, attn: AttentionLayer,
-                mlp: H3MLP, adaln: AdalnProj) {
+                mlp: H3MLP, adaln: AdalnProj,
+                fuseModulation: Bool = FusedModulation.enabled) {
         self.norm1 = norm1
         self.norm2 = norm2
         self.attn = attn
         self.mlp = mlp
         self.adaln = adaln
+        self.fuseModulation = fuseModulation
     }
 
     package func callAsFunction(_ x: MLXArray, tEmb: MLXArray, index: ModulationIndex,
@@ -414,10 +422,36 @@ package struct DiTBlock {
                                context: AttentionContext? = nil) -> MLXArray {
         let m = adaln(tEmb)
         precondition(m.count == 6, "DiTBlock AdaLN must expand to 6, got \(m.count)")
-        let h1 = modScaleShift(norm1(x), shift: m[0], scale: m[1], index: index)
-        let x1 = modGate(x, gate: m[2],
-                         other: attn(h1, ropeTable: ropeTable, context: context), index: index)
-        let h2 = modScaleShift(norm2(x1), shift: m[3], scale: m[4], index: index)
-        return modGate(x1, gate: m[5], other: mlp(h2), index: index)
+
+        // **The readable expression is the default path**, and the fused kernel
+        // is opt-in behind `H3_FUSED_MODULATION=1`. It measured 1.81% on wall
+        // clock and 0.94% on the steps it touches, against a 5% gate — see
+        // `FusedModulation` for the eight-render measurement and why the
+        // arithmetic predicted it.
+        //
+        // The kernels also decline on their own for the refiner's batched
+        // shape and for any dtype mix they were not measured on, so this is two
+        // independent reasons to fall back rather than one.
+        let fuse = fuseModulation
+        func norm(_ v: MLXArray, _ n: H3RMSNorm, _ shift: MLXArray,
+                  _ scale: MLXArray) -> MLXArray {
+            if fuse, let fused = FusedModulation.modulatedRMSNorm(
+                v, weight: n.weight, eps: n.eps, shift: shift, scale: scale, index: index) {
+                return fused
+            }
+            return modScaleShift(n(v), shift: shift, scale: scale, index: index)
+        }
+        func gated(_ v: MLXArray, _ gate: MLXArray, _ other: MLXArray) -> MLXArray {
+            if fuse, let fused = FusedModulation.gatedResidual(
+                v, gate: gate, other: other, index: index) {
+                return fused
+            }
+            return modGate(v, gate: gate, other: other, index: index)
+        }
+
+        let h1 = norm(x, norm1, m[0], m[1])
+        let x1 = gated(x, m[2], attn(h1, ropeTable: ropeTable, context: context))
+        let h2 = norm(x1, norm2, m[3], m[4])
+        return gated(x1, m[5], mlp(h2))
     }
 }

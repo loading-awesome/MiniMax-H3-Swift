@@ -12,7 +12,10 @@ import Foundation
 @Suite("step cache policy")
 struct StepCachePolicyTests {
 
-    static let p = StepCachePolicy(threshold: 0.5)
+    // Cap stated rather than inherited: the shipping default moved from 3 to 5
+    // on 2026-08-06, and a test of the cap that silently follows the default
+    // stops testing the cap.
+    static let p = StepCachePolicy(threshold: 0.5, maxConsecutiveSkips: 3)
     /// A change well under the threshold, so only the structural rules can
     /// force a full step.
     static let quiet = 0.01

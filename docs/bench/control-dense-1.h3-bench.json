@@ -1,0 +1,79 @@
+{
+  "arm" : "control-dense",
+  "configuration" : {
+    "attentionBackend" : "sdpa",
+    "cacheMaxConsecutiveSkips" : 3,
+    "cachePerStreamProbe" : true,
+    "cacheThreshold" : 0,
+    "overrides" : {
+      "H3_FUSED_MODULATION" : "0",
+      "resolved.fusedModulation" : "off"
+    },
+    "qualityProfile" : "faithful"
+  },
+  "identity" : {
+    "cfgScale" : 1,
+    "ditSizeBytes" : 66280486944,
+    "height" : 480,
+    "promptDigest" : "9e4c9d824200e2876d363f958d86bdc76d065bf881afb93f1757d1dc88ff17e7",
+    "seconds" : 5,
+    "seed" : 7,
+    "steps" : 20,
+    "width" : 864
+  },
+  "machine" : {
+    "cores" : 28,
+    "libraryVersion" : "0.1.0-dev",
+    "mlxSwiftVersion" : "0.31.6",
+    "model" : "Apple M3 Ultra (Mac15,14), 275 GB unified memory, 28 cores",
+    "operatingSystem" : "Version 26.5.2 (Build 25F84)",
+    "physicalMemoryBytes" : 274877906944
+  },
+  "memory" : {
+    "mlxActiveBytesAtEnd" : 85063790896,
+    "mlxPeakBytes" : 87211530520
+  },
+  "phaseSeconds" : {
+    "audio_decode" : 0.6714560985565186,
+    "condition_encoding" : 2.300739288330078e-05,
+    "model_load" : 0.0031130313873291016,
+    "mux" : 0.2766619920730591,
+    "pixel_pack" : 0.08494699001312256,
+    "sampling" : 1195.927770972252,
+    "text_conditioning" : 12.295063972473145,
+    "total" : 1284.969211101532,
+    "video_decode" : 75.71017503738403
+  },
+  "quality" : {
+
+  },
+  "recordedAt" : "2026-08-06T17:06:14Z",
+  "schemaVersion" : 1,
+  "trace" : {
+    "stepSeconds" : [
+      61.19268596172333,
+      58.90620303153992,
+      59.145063996315,
+      59.85264694690704,
+      59.397884011268616,
+      58.79869592189789,
+      60.17949604988098,
+      61.69135797023773,
+      61.49092102050781,
+      61.16391396522522,
+      60.97395896911621,
+      61.537866950035095,
+      61.04049289226532,
+      59.52572798728943,
+      58.77542293071747,
+      58.402329087257385,
+      58.35344707965851,
+      58.343549966812134,
+      58.54069101810455,
+      58.61405396461487
+    ],
+    "steps" : [
+
+    ]
+  }
+}

@@ -19,6 +19,12 @@ enum SamplingLoop {
         let video: MLXArray
         let audio: MLXArray
         let cacheSummary: String?
+        /// Every step's measurement, decision and wall clock. Present whether or
+        /// not the cache ran — a dense control has no decisions to record but
+        /// still has the step times a cached arm has to be compared against,
+        /// and a control that produced no machine-readable record would have to
+        /// be re-run by hand every time something wanted to check it.
+        let trace: SamplingTrace
     }
 
     /// - Parameter onStep: called after each completed step, and the only place
@@ -48,12 +54,14 @@ enum SamplingLoop {
         let cache = request.cacheThreshold > 0
             ? H3StepCache(threshold: request.cacheThreshold,
                           maxConsecutiveSkips: request.cacheMaxSkips,
-                          perStreamProbe: !request.cacheWholeSequenceProbe)
+                          perStreamProbe: !request.cacheWholeSequenceProbe,
+                          branch: .conditional)
             : nil
         let negativeCache = (request.cacheThreshold > 0 && request.cfgScale > 1.0)
             ? H3StepCache(threshold: request.cacheThreshold,
                           maxConsecutiveSkips: request.cacheMaxSkips,
-                          perStreamProbe: !request.cacheWholeSequenceProbe)
+                          perStreamProbe: !request.cacheWholeSequenceProbe,
+                          branch: .unconditional)
             : nil
 
         if let cache {
@@ -61,7 +69,7 @@ enum SamplingLoop {
             // by default is one people forget is running when they compare two
             // renders.
             log(String(format: "  cross-step cache: ON at threshold %.3f — an APPROXIMATION. "
-                       + "Measured at 0.10: 1.93x faster for 16%% less high-frequency detail. "
+                       + "Measured at 0.10: 1.9x faster for 16%% less high-frequency detail. "
                        + "Set the threshold to 0 for a faithful render.", cache.threshold))
             log("    probe \(cache.perStreamProbe ? "per-stream" : "whole-sequence"), at most "
                 + "\(cache.maxConsecutiveSkips) consecutive reuses, first and last steps "
@@ -88,7 +96,9 @@ enum SamplingLoop {
         let videoSampler = Sampler()
         let audioSampler = Sampler()
 
+        var stepSeconds: [Double] = []
         for i in 0 ..< request.steps {
+            let stepBegan = Date()
             if cancellation?.isCancelled == true {
                 throw RenderCancelled(phase: .sampling,
                                       detail: "after \(i) of \(request.steps) step(s)")
@@ -119,10 +129,27 @@ enum SamplingLoop {
             currentAudio = audioSampler.step(x: currentAudio, denoised: audioDenoised,
                                              sigma: sigma, sigmaNext: sigmaNext,
                                              prevSigma: prevSigma)
+            // The clock stops **after** this eval, and that placement is the
+            // whole reason the timings mean anything. MLX is lazy: the sampler
+            // step above builds a graph and returns, so a clock stopped before
+            // the eval measures graph construction and hands the arithmetic to
+            // whichever later line happens to force it. Under a cache that is
+            // not a small error — a skipped step builds almost no graph, so the
+            // configuration doing less work would appear to have moved its cost
+            // somewhere else rather than saved it.
             eval(currentVideo, currentAudio)
+            stepSeconds.append(Date().timeIntervalSince(stepBegan))
             onStep(i + 1, request.steps)
         }
 
-        return Output(video: currentVideo, audio: currentAudio, cacheSummary: cache?.summary)
+        // Both branches' traces, kept as separate rows rather than merged. Under
+        // CFG the two forwards hold separate caches and can disagree about
+        // every step; a merged view would average that away.
+        var trace = SamplingTrace(steps: (cache?.trace.steps ?? []) + (negativeCache?.trace.steps ?? []),
+                                  stepSeconds: stepSeconds)
+        trace.steps.sort { ($0.step, $0.branch.rawValue) < ($1.step, $1.branch.rawValue) }
+
+        return Output(video: currentVideo, audio: currentAudio,
+                      cacheSummary: cache?.summary, trace: trace)
     }
 }

@@ -73,6 +73,11 @@ package struct TimestepPlan: Sendable, Equatable {
     private let segRowMap: [SegmentKind: Int]
     /// `d(sigma_a)/d(sigma_v)`, which the audio velocity must be scaled by.
     package let audioSlope: Float
+    /// The video sigma this plan was built from, retained rather than recovered.
+    /// `values` holds timesteps, and several distinct sigmas map to the same
+    /// deduplicated timestep set, so the plan cannot be run backwards to the
+    /// sigma that produced it.
+    package let sigmaVideo: Float
 
     package init(sigmaVideo: Double,
                 segments: [PackedSegment] = [],
@@ -114,6 +119,7 @@ package struct TimestepPlan: Sendable, Equatable {
 
         self.segRowMap = rowMap
         self.audioSlope = SigmaMap.slope(sv, from: fv, to: fa)
+        self.sigmaVideo = sv
     }
 
     package func row(for kind: SegmentKind) -> Int {

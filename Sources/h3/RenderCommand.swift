@@ -91,7 +91,7 @@ struct RenderCommand: AsyncParsableCommand {
     var cacheThreshold: Double?
 
     @Option(help: "most consecutive cached steps before a full one is forced")
-    var cacheMaxSkips: Int = 3
+    var cacheMaxSkips: Int = 5
 
     @Flag(help: "probe the whole packed sequence instead of per stream")
     var cacheWholeSequenceProbe = false

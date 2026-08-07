@@ -137,11 +137,29 @@ struct RenderReporter {
         print("  where the time went")
         for (name, seconds) in [("prompt", t.textConditioning),
                                 ("conditioning", t.conditionEncoding),
+                                ("model load", t.modelLoad),
                                 ("sampling", t.sampling),
                                 ("decode", t.audioDecode + t.videoDecode),
                                 ("write", t.pixelPack + t.mux)] where seconds > 0.05 {
             let share = wall > 0 ? seconds / wall * 100 : 0
             print(String(format: "    %-14@%8.1fs  %2.0f%%", name as NSString, seconds, share))
+        }
+        // The comparable figure. Wall clock includes a checkpoint load whose
+        // cost depends on what the page cache happened to be holding, so two
+        // runs of the same configuration can differ by a minute for reasons
+        // that have nothing to do with either.
+        let perStep = result.trace.meanStepSeconds
+        if perStep.isFinite, perStep > 0 {
+            print(String(format: "    %-14@%8.2fs  mean, the figure to compare on",
+                         "per step" as NSString, perStep))
+            // Both numbers, because they answer different questions: how long
+            // the render took, and how expensive a step that actually ran the
+            // stack was. A cache changes the first, a kernel changes the second.
+            let full = result.trace.medianFullStepSeconds
+            if full.isFinite, full > 0, result.trace.stepsSkipped > 0 {
+                print(String(format: "    %-14@%8.2fs  median of the %d steps that ran the stack",
+                             "full step" as NSString, full, result.trace.stepsRun))
+            }
         }
         if let summary = result.cacheSummary { print("\n  \(summary)") }
     }

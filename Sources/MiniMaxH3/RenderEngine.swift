@@ -220,6 +220,18 @@ private enum RenderOperation {
             if !result.muxedAudio {
                 receipt.warnings.append("audio mux failed; recovery WAV retained")
             }
+
+            // The benchmark record, written beside the video on every render.
+            // See `BenchmarkEmitter` for why this is not opt-in.
+            let arm = BenchmarkEmitter.armName(request: request, result: result)
+            let benchmark = BenchmarkEmitter.record(
+                arm: arm, request: request, result: result,
+                checkpoints: receipt.checkpoints, machine: machine, dimensions: dimensions)
+            receipt.warnings.append(
+                contentsOf: BenchmarkEmitter.write(benchmark, besideVideo: result.video))
+            receipt.benchmarkArm = arm
+            receipt.secondsPerStep = result.trace.meanStepSeconds.isFinite
+                ? result.trace.meanStepSeconds : nil
             try write(receipt, to: receiptURL)
             logger.info("render completed job=\(jobID.uuidString, privacy: .public)")
             return result
@@ -257,14 +269,10 @@ private enum RenderOperation {
     }
 
     private static func timings(_ value: RenderResult.Timings) -> [String: TimeInterval] {
-        ["text_conditioning": value.textConditioning,
-         "condition_encoding": value.conditionEncoding,
-         "sampling": value.sampling,
-         "audio_decode": value.audioDecode,
-         "video_decode": value.videoDecode,
-         "pixel_pack": value.pixelPack,
-         "mux": value.mux,
-         "total": value.total]
+        // One source for the phase names, shared with the benchmark record, so
+        // the two files beside a render cannot disagree about what a phase is
+        // called or which phases exist.
+        value.asDictionary
     }
 
     private static func outputRecords(_ result: RenderResult) -> [RenderReceipt.Output] {
@@ -483,11 +491,22 @@ final class OutputTransaction {
         // already published successfully.
         try promote(staged.video, to: finalVideo)
         discard()
-        return RenderResult(video: finalVideo, audio: publishedAudio,
-                            frameCount: staged.frameCount, width: staged.width,
-                            height: staged.height, seconds: staged.seconds,
-                            timings: staged.timings, cacheSummary: staged.cacheSummary,
-                            muxedAudio: staged.muxedAudio)
+        // Rebuilt rather than mutated because only the URLs change on publish —
+        // and every field the initialiser does not take has to be carried over
+        // by hand. That is a standing hazard: a field added to `RenderResult`
+        // and not added here is silently zero by the time anything reads it,
+        // with no build error and no failing test unless one asserts on the
+        // published value. `RenderEngineTests.commitCarriesEveryField` does.
+        var published = RenderResult(video: finalVideo, audio: publishedAudio,
+                                     frameCount: staged.frameCount, width: staged.width,
+                                     height: staged.height, seconds: staged.seconds,
+                                     timings: staged.timings, cacheSummary: staged.cacheSummary,
+                                     muxedAudio: staged.muxedAudio)
+        published.trace = staged.trace
+        published.mlxPeakBytes = staged.mlxPeakBytes
+        published.mlxActiveBytesAtEnd = staged.mlxActiveBytesAtEnd
+        published.attentionBackend = staged.attentionBackend
+        return published
     }
 
     func recoverAudio() throws -> URL? {

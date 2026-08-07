@@ -110,6 +110,33 @@ public struct RenderRequest: Sendable {
     /// default — turning it *off* is now the explicit decision, and
     /// `--quality faithful` is how.
     public var cacheThreshold: Double
+    /// How many steps in a row may reuse the cached residual — equivalently,
+    /// the maximum age of the residual being re-applied.
+    ///
+    /// **5, raised from 3 on 2026-08-06 after a measured sweep.** It buys
+    /// 8.4–9.5% end-to-end at the default 20 steps and **24.5% at 40**, where
+    /// the finer schedule puts more steps under the threshold and the cap
+    /// becomes what governs the render: the skipped fraction goes from 45% to
+    /// 68% at cap 3 and 75% at cap 5.
+    ///
+    /// **Raising it does not buy that many more skipped steps.** The counter
+    /// resets at every refusal, so a larger cap relocates the refresh points
+    /// rather than deleting them — caps 3 and 4 do identical work, refreshes
+    /// merely moving from steps 7/11/15 to 8/13. 5 is where one extra reuse
+    /// actually appears. See `StepCachePolicyReplayTests`.
+    ///
+    /// The reuse structure is the same on a calm beach, fast motion with a
+    /// tracking camera, close-up dialogue and a second seed — 9 reuses at cap 3
+    /// and 10 at cap 5, refused at the same steps every time. The delta curve
+    /// is driven by the flow schedule, not by scene content.
+    ///
+    /// **Accepted on viewing, not on a metric**, and that is not a shortcut.
+    /// Every cap setting changes the sampling trajectory, so every setting
+    /// renders a *different scene* rather than a degraded version of the same
+    /// one — measured at structural dissimilarity 0.017 to 0.265 between arms.
+    /// A detail ratio across that gap compares content. The distribution
+    /// fallback does not rescue it either: detail varies 25–28% between seeds,
+    /// so resolving a 2% effect would need on the order of a hundred renders.
     public var cacheMaxSkips: Int
     /// Probe the whole packed sequence rather than per stream — what every other
     /// published cache for this model does, kept so the two can be compared.
@@ -159,7 +186,7 @@ public struct RenderRequest: Sendable {
                 cfgScale: Double = 1.0,
                 qualityProfile: QualityProfile = .balanced,
                 cacheThreshold: Double? = nil,
-                cacheMaxSkips: Int = 3,
+                cacheMaxSkips: Int = 5,
                 cacheWholeSequenceProbe: Bool = false,
                 conditioningNoise: URL? = nil,
                 attentionBackend: String = "auto",
