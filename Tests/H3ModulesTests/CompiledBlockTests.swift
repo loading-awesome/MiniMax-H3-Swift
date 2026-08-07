@@ -86,10 +86,7 @@ struct CompiledBlockTests {
 
         let plain = { f.block(f.x, tEmb: f.tEmb, index: f.index, ropeTable: f.rope) }
 
-        // Weights, tEmb, the modulation rows and the RoPE table are all captured
-        // as constants: they do not change across the fifty calls of a forward
-        // or across the steps of a render. Only the hidden state varies, which
-        // is what makes the block worth compiling once and calling repeatedly.
+        // The weights, modulation rows and RoPE table are captured constants.
         // **`tEmb` is an input, not a capture.** It is derived from sigma and
         // therefore changes at every sampler step, so compiling it in as a
         // constant would measure a configuration that cannot ship — which is
@@ -112,8 +109,9 @@ struct CompiledBlockTests {
         let identical = MLX.all(a .== b).item(Bool.self)
         print("\n  math: relative RMS \(rel), bit-identical: \(identical)")
 
-        let plainMs = Self.time(5, plain) * 1000
-        let compiledMs = Self.time(5, compiledCall) * 1000
+        let measured = BenchmarkSupport.interleaved(first: plain, second: compiledCall)
+        let plainMs = measured.first * 1000
+        let compiledMs = measured.second * 1000
         print(String(format: "  per block   plain %.1f ms   compiled %.1f ms   %.3fx",
                      plainMs, compiledMs, plainMs / compiledMs))
         print(String(format: "  x%d blocks  plain %.2f s    compiled %.2f s    "
@@ -136,10 +134,10 @@ struct CompiledBlockTests {
     ///
     /// **Found by accident, and it revives an item that was struck.** Compiling
     /// a block with `tEmb` captured as a constant measured 2.09% of a full
-    /// step; with `tEmb` as a real input — the only shippable form, since it is
-    /// derived from sigma and changes every step — it measures 0.28%. The
-    /// difference is the compiler folding away the AdaLN projection, and that
-    /// gap is worth more than the compilation was.
+    /// step; an initial non-interleaved run with `tEmb` as a real input — the
+    /// only shippable form — measured 0.28%. That unstable comparison prompted
+    /// the direct measurement below; the final compiler decision uses the
+    /// interleaved benchmark above instead.
     ///
     /// It cannot be folded at compile time, but it can be precomputed: `tEmb`
     /// takes exactly `steps` distinct values in a render, all of them known
@@ -184,21 +182,31 @@ struct CompiledBlockTests {
 
         let plain = {
             let h = a.block(a.x, tEmb: a.tEmb, index: a.index, ropeTable: a.rope)
-            return b.block(h, tEmb: b.tEmb, index: b.index, ropeTable: b.rope)
+            return b.block(h, tEmb: a.tEmb, index: b.index, ropeTable: b.rope)
         }
         let compiled = MLX.compile { (arrays: [MLXArray]) -> [MLXArray] in
-            let h = a.block(arrays[0], tEmb: a.tEmb, index: a.index, ropeTable: a.rope)
-            return [b.block(h, tEmb: b.tEmb, index: b.index, ropeTable: b.rope)]
+            let h = a.block(arrays[0], tEmb: arrays[1], index: a.index, ropeTable: a.rope)
+            return [b.block(h, tEmb: arrays[1], index: b.index, ropeTable: b.rope)]
         }
-        let compiledCall = { compiled([a.x])[0] }
+        let compiledCall = { compiled([a.x, a.tEmb])[0] }
 
-        let plainMs = Self.time(4, plain) * 1000
-        let compiledMs = Self.time(4, compiledCall) * 1000
+        let expected = plain(), actual = compiledCall()
+        MLX.eval(expected, actual)
+        let delta = expected.asType(.float32) - actual.asType(.float32)
+        let rel = MLX.sqrt(MLX.mean(delta * delta)).item(Float.self)
+            / MLX.sqrt(MLX.mean(expected.asType(.float32)
+                * expected.asType(.float32))).item(Float.self)
+
+        let measured = BenchmarkSupport.interleaved(first: plain, second: compiledCall)
+        let plainMs = measured.first * 1000
+        let compiledMs = measured.second * 1000
         print(String(format: "\n  two blocks  plain %.1f ms   compiled %.1f ms   %.3fx",
                      plainMs, compiledMs, plainMs / compiledMs))
         print(String(format: "  per block   plain %.1f ms   compiled %.1f ms   "
-                     + "%.2f%% of a full step\n",
+                     + "%.2f%% of a full step",
                      plainMs / 2, compiledMs / 2,
                      100 * (plainMs - compiledMs) / 2 * 50 / 1000 / 60.0))
+        print("  math: relative RMS \(rel)\n")
+        #expect(rel < 1e-3, "two-block compilation must stay inside the block oracle")
     }
 }

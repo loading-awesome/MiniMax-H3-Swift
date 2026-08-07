@@ -96,6 +96,50 @@ struct GEMMCeilingTests {
                      60_000.0 / 50.0))
     }
 
+    /// Does checkpoint-native `[N,K]` storage leave GEMM performance on the
+    /// table compared with materialising the compute-facing `[K,N]` layout?
+    /// Production calls `matmul(x, weight.T)` everywhere in the DiT. The ceiling
+    /// test above used an already contiguous `[K,N]` operand, so it could not
+    /// close the canonical-layout roadmap item by itself.
+    @Test(.enabled(if: ProcessInfo.processInfo.environment["H3_BIG"] != nil))
+    func weightLayout() {
+        let cfg = H3Config()
+        let s = 15_731
+        let shapes: [(String, Int, Int, Int)] = [
+            ("qkv", s, cfg.hiddenSize, 3 * cfg.innerDim),
+            ("attention out", s, cfg.innerDim, cfg.hiddenSize),
+            ("mlp fc1", s, cfg.hiddenSize, 2 * cfg.ffnHidden),
+            ("mlp fc2", s, cfg.ffnHidden, cfg.hiddenSize)
+        ]
+
+        print("\n  checkpoint-native [N,K].T against materialised [K,N]")
+        print("  shape                   native ms  canonical ms  canonical x   rel RMS")
+        for (name, m, k, n) in shapes {
+            let x = MLXRandom.normal([m, k]).asType(.bfloat16)
+            let checkpointWeight = MLXRandom.normal([n, k]).asType(.bfloat16)
+            let canonicalWeight = checkpointWeight.T.contiguous()
+            MLX.eval(x, checkpointWeight, canonicalWeight)
+
+            let native = { MLX.matmul(x, checkpointWeight.T) }
+            let canonical = { MLX.matmul(x, canonicalWeight) }
+            let expected = native(), actual = canonical()
+            MLX.eval(expected, actual)
+            let delta = expected.asType(.float32) - actual.asType(.float32)
+            let rel = MLX.sqrt(MLX.mean(delta * delta)).item(Float.self)
+                / MLX.sqrt(MLX.mean(expected.asType(.float32)
+                    * expected.asType(.float32))).item(Float.self)
+
+            let measured = BenchmarkSupport.interleaved(first: native, second: canonical)
+            print(String(format: "  %@ %10.1f %13.1f %11.3fx   %.3e",
+                         (name as NSString).padding(toLength: 18, withPad: " ",
+                                                    startingAt: 0),
+                         measured.first * 1000, measured.second * 1000,
+                         measured.first / measured.second, rel))
+            #expect(rel < 1e-6, "physical weight layout must not change GEMM output")
+        }
+        print("")
+    }
+
     /// What a quantised weight path would be worth, purely as a number.
     ///
     /// **Not a proposal.** Quantising the weights is a lossy change to the

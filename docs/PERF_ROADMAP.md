@@ -388,8 +388,8 @@ So items 3, 4 and 5 are all **struck**:
 | item | why it is dead |
 |---|---|
 | 3. AdaLN schedule batching | **measured 0.37%** of a full step, not estimated |
-| 4. Dense-block compilation | **measured 0.28%** of a full step at the block, in the only shippable form |
-| 5. Weight layout, GEMM profiling | there is 9% between the model and MLX's isolated rate, not a multiple |
+| 4. Dense-block compilation | **0.54%** for one block and **1.15%** for two, interleaved medians |
+| 5. Weight layout, GEMM profiling | exact and real, but **3.0–3.1% of a full step**, below the 5% gate |
 
 ### Items 3 and 4 were struck on an estimate and are now struck on a measurement
 
@@ -402,32 +402,54 @@ production width (`CompiledBlockTests`, `H3_BIG=1`):
 
 | configuration | per block | vs plain | of a full step |
 |---|---:|---:|---:|
-| plain | 1243.7 ms | — | — |
-| compiled, `tEmb` captured as a constant | 1213.0 ms | 1.021× | 2.09% |
-| **compiled, `tEmb` as a runtime input** | **1240.4 ms** | **1.003×** | **0.28%** |
-| compiled, two blocks chained | 1222.0 ms/block | 1.015× | 1.52% |
+| plain, one block | 1258.8 ms | — | — |
+| **compiled, runtime `tEmb`, one block** | **1252.3 ms** | **1.005×** | **0.54%** |
+| plain, two blocks | 1278.2 ms/block | — | — |
+| **compiled, runtime `tEmb`, two blocks** | **1264.4 ms/block** | **1.011×** | **1.15%** |
 
-**Only the third row can ship.** `tEmb` is derived from sigma and changes at
-every sampler step, so folding it in as a constant measures a configuration
-nobody can render with — the same mistake that produced 6B. The 2.09% is the
-compiler deleting work that has to happen at run time.
+Both compiled arms pass `tEmb` as a real input shared by every block, exactly as
+the production stack does. Measurements alternate ABBA/BAAB and report the
+median of ten samples per arm; this replaced the plain-then-compiled timer after
+that timer produced a 6.98% ordering outlier. Widening from one to two blocks
+adds 0.61 percentage points, inside the 1.4% control noise floor. There is no
+measured cross-boundary opportunity worth compiling a larger stack for.
 
-Chaining two blocks is no better than one, so the block is already the largest
-useful compiled region: the residual add at the block boundary is not costing
-anything a wider graph would recover.
-
-Compilation is also **not bit-identical** — relative RMS 2.3e-4 per block,
-compounding over fifty blocks and twenty steps into a different render. At 0.28%
-that is not a trade worth making even if the maintenance cost is one line.
+Compilation is also **not bit-identical** — relative RMS is 2.35e-4 for one
+block and 3.28e-4 for two, compounding over fifty blocks and twenty steps into a
+different render. At 0.54–1.15% that is not a trade worth making.
 
 Two useful things fell out of it. The synthetic block at production width
-measures 1243.7 ms, and 50 × that is 62.2 s against the 60.0 s forward measured
+measures 1258.8 ms, and 50 × that is 62.9 s against the 60.0 s forward measured
 in the controls — **an independent confirmation of the 96.2% kernel accounting**
 from a completely different direction. And the 1.8% gap between the two compiled
 rows prompted a direct measurement of the AdaLN projection, which is **4.4 ms
 per block with the fp32 upcast on, 0.37% of a step** — so item 3 is worth about
 a third of one percent, not the 0.008% its FLOP count suggested and not the 1.8%
 the gap suggested. FLOPs were the wrong unit; so was the gap.
+
+### Canonical weight layout — real, exact, below the gate
+
+The first GEMM ceiling used an already contiguous `[K,N]` right operand, while
+the checkpoint and every production DiT projection store `[N,K]` and call
+`matmul(x, weight.T)`. `weightLayout` measures those two physical layouts on
+identical values, with the same interleaved-median protocol:
+
+| projection | checkpoint `[N,K].T` | materialised `[K,N]` | speedup |
+|---|---:|---:|---:|
+| QKV | 221.3 ms | 212.5 ms | 1.042× |
+| attention out | 74.9 ms | 72.3 ms | 1.036× |
+| MLP fc1 | 295.5 ms | 284.8 ms | 1.038× |
+| MLP fc2 | 169.5 ms | 154.2 ms | 1.099× |
+
+Every output is bit-identical (`rel_rms = 0`). Two complete runs put the saving
+at 36.1–37.4 ms per block, **4.9–5.0% of GEMM time**. Attention is unchanged,
+so that becomes 1.81–1.87 s across fifty blocks, **3.0–3.1% of a 60.0 s full
+step** and about 20 seconds over the eleven full steps in a cached twenty-step
+render. It is a real optimization, but it fails the roadmap's 5%
+production-step gate. The
+loader and memory-lifecycle complexity of replacing 66 GB of resident weights
+is not justified for a sub-gate result, so production weights stay
+checkpoint-native.
 
 **Fewer bits does not work here either — measured.** MLX's quantised matmul at
 production shapes:
@@ -468,8 +490,8 @@ Every lever has now been measured rather than estimated:
 | consecutive cap 3 → 5 | **shipped**, 8.4–9.5% at 20 steps, 24.5% at 40 |
 | fused modulation | 0.94% — off by default |
 | AdaLN schedule batching | 0.37% — struck |
-| dense-block compilation | 0.28% — struck |
-| weight layout / GEMM tuning | model is at 91% of MLX's isolated rate — struck |
+| dense-block compilation | 0.54–1.15% — struck |
+| weight layout / GEMM tuning | exact 3.0–3.1% full-step gain, below gate — struck |
 | int8 / int4 matmul | 1.2% — struck |
 | Sol-Attn sparse attention | rejected on quality |
 | axial-union topology | rejected on accuracy in 6D, no kernel written |
