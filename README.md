@@ -16,7 +16,8 @@ h3 render --prompt "a red kite over a beach at sunset" --out kite.mp4
 
 ### Two more, one command each
 
-No flags — 864×480, 7 s, 20 steps, about 19 minutes apiece on a Mac Studio.
+No flags — 864×480, 7 s, 20 steps, about 19 minutes apiece on a Mac Studio
+when they were rendered. The default has since got faster; see below.
 
 [![An anime girl at her computer](demo-media/anime.jpg)](demo-media/anime.mp4)
 
@@ -292,19 +293,23 @@ Measured on a Mac Studio (M3 Ultra) at 864×480, 5 seconds, 20 steps:
 
 | quality | time | what changes |
 |---|---|---|
-| `balanced` *(default)* | ~11.5 min | reuses work between steps — **16% less fine detail** |
-| `faithful` | ~23 min | nothing is approximated |
+| `balanced` *(default)* | **11.4–11.8 min** | reuses work between steps — **16% less fine detail** |
+| `faithful` | **21.1–21.5 min** | nothing is approximated |
 | `fast` | ~9 min | 28% less fine detail |
 
+Ranges are the spread across five different prompts, not a single run.
+
 **`balanced` is the default, and it is an approximation.** It reuses one step's
-work in the next when the step barely moved, which measured 1.8–1.9× faster for
+work in the next when the step barely moved, which measures **1.85× faster** for
 16% less fine detail. On a twenty-minute render that is the trade almost
 everybody wants, and finding out afterwards that a flag would have halved it is
 worse than the 16%.
 
-At more steps the trade gets better, not worse: at 40 steps the cache skips 75%
-of them and `balanced` is about 25% faster again, because a finer schedule moves
-the latent less per step and more steps qualify for reuse.
+**Asking for more steps is close to free.** Doubling to 40 steps takes 12.2
+minutes against 11.7 for 20 — about 4% more wall clock for twice the sampling.
+A finer schedule moves the latent less per step, so more steps fall below the
+reuse threshold and the cache absorbs almost all of the extra work: it skips 75%
+of them at 40 steps against 50% at 20.
 
 It says so on every run and it is recorded in the render's receipt, so nobody
 discovers months later that their comparison was against a shortcut. That

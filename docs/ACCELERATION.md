@@ -36,6 +36,16 @@ wherever the trajectory has actually reached.
 **0.10 is the default**, because the trade turns bad immediately after: 0.15 to
 0.25 buys 13% more speed and costs another 16% of high-frequency detail.
 
+> **These wall-clock figures were measured with `maxConsecutiveSkips` at 3,
+> which was the default until 2026-08-06 and is now 5.** The threshold column,
+> the detail column and the audio columns are unaffected — they are properties
+> of the threshold, and the zero-skip control at 0.05 still anchors them. The
+> *times* are not: at the current cap a 20-step 864×480×124 render takes
+> 11.4–11.8 minutes rather than the ~12 minutes implied here. See
+> `docs/PERF_ROADMAP.md` §6C for the cap measurement, and note that its quality
+> effect could not be resolved by any metric in this tree and was accepted on
+> viewing.
+
 The 0.05 row is worth keeping even though it skipped nothing. The observed
 change never fell below the threshold, so the cache was present and never fired
 — and the output came back at envelope **1.000**, spectral **1.000**: bit

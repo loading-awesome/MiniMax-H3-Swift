@@ -285,7 +285,8 @@ fourth moments above, is earning its place here.
 so **~1.25x end to end** — independently reproducing NVIDIA's stated 1.25x for
 H3 from a different direction.
 
-Against the cross-step cache already shipped at **1.93x with no kernel at all**,
+Against the cross-step cache already shipped at **1.93x with no kernel at all**
+(1.85x end-to-end at the current default cap of 5),
 that keeps Sol-Attn third on the list.
 
 ### Reproducing this
