@@ -58,16 +58,19 @@ public struct RenderRequest: Sendable {
     public enum QualityProfile: String, Codable, Sendable, CaseIterable {
         case faithful
         case balanced
-        case custom
 
         public var cacheThreshold: Double {
             switch self {
             case .faithful: 0
             case .balanced: 0.10
-            case .custom: 0
             }
         }
 
+        /// Whether this *profile* approximates. **Not the same question as
+        /// whether a render does** — `cacheThreshold` can be overridden past
+        /// the profile, so the render's truth is
+        /// ``RenderRequest/usesApproximateSampling``, which reads the threshold
+        /// actually in force. Anything reporting to a user must use that one.
         public var isApproximate: Bool { self == .balanced }
     }
 
@@ -224,7 +227,7 @@ public struct RenderRequest: Sendable {
         self.referenceVideoSoundtracks = referenceVideoSoundtracks
         self.referenceAudio = referenceAudio
         self.cfgScale = cfgScale
-        self.qualityProfile = cacheThreshold == nil ? qualityProfile : .custom
+        self.qualityProfile = qualityProfile
         self.cacheThreshold = cacheThreshold ?? qualityProfile.cacheThreshold
         self.cacheMaxSkips = cacheMaxSkips
         self.cacheWholeSequenceProbe = cacheWholeSequenceProbe

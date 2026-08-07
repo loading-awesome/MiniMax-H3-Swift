@@ -58,9 +58,15 @@ struct RenderReporter {
         row("size", "\(width) x \(height), \(request.seconds) s at \(fps) fps "
                   + "(\(frameCount) frames)")
         row("steps", "\(request.steps)")
-        row("quality", request.qualityProfile.isApproximate
-            ? "\(request.qualityProfile.rawValue) — an approximation, "
-              + "cache threshold \(request.cacheThreshold)"
+        // Read from the threshold in force, not from the profile's own nature.
+        // `--cache-threshold 0.15` used to resolve the profile to `custom`,
+        // whose `isApproximate` was false, so this line printed "no
+        // approximation" over a render that was approximating. The receipt was
+        // right the whole time because it reads `usesApproximateSampling`; only
+        // the thing a person actually sees was wrong.
+        row("quality", request.usesApproximateSampling
+            ? "\(request.qualityProfile.rawValue), cache threshold "
+              + "\(request.cacheThreshold) — an APPROXIMATION"
             : "\(request.qualityProfile.rawValue) — no approximation")
         row("model", checkpoint)
         if request.cfgScale > 1 {
