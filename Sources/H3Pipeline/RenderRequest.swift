@@ -38,24 +38,37 @@ public struct RenderRequest: Sendable {
     /// concern, and it never depended on `faithful` being the default.
     ///
     /// `--quality faithful` is one flag away and remains exact.
+    /// **There was a `fast` profile at threshold 0.15 and it has been removed.**
+    ///
+    /// It was added in a commit about packaging and a README, it was referenced
+    /// nowhere but its own threshold table, it had no tests, and nobody ever
+    /// watched a render made with it. The threshold sweep in
+    /// `docs/ACCELERATION.md` puts 0.15 at **28% less high-frequency detail**
+    /// against `balanced`'s 16% — so it was a named, recommended-looking option
+    /// that degraded output by nearly twice the default, on no evidence.
+    ///
+    /// Raising `cacheMaxSkips` from 3 to 5 made that worse without anyone
+    /// noticing: at the new cap, 0.15 skips more steps than the 13 of 20 the
+    /// sweep measured, so its quality had drifted further from the figure being
+    /// published for it.
+    ///
+    /// Nothing is lost. `--cache-threshold 0.15` still does exactly the same
+    /// thing, and reports the profile as `custom` — which is what an
+    /// unvalidated setting should be called.
     public enum QualityProfile: String, Codable, Sendable, CaseIterable {
         case faithful
         case balanced
-        case fast
         case custom
 
         public var cacheThreshold: Double {
             switch self {
             case .faithful: 0
             case .balanced: 0.10
-            case .fast: 0.15
             case .custom: 0
             }
         }
 
-        public var isApproximate: Bool {
-            self == .balanced || self == .fast
-        }
+        public var isApproximate: Bool { self == .balanced }
     }
 
     // MARK: what to render

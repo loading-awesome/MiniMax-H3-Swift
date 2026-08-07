@@ -84,7 +84,7 @@ struct RenderCommand: AsyncParsableCommand {
     @Option(help: "guidance scale; 1.0 turns guidance off")
     var cfgScale: Double = 1.0
 
-    @Option(help: "quality profile: faithful, balanced, or fast")
+    @Option(help: "quality profile: faithful or balanced; --cache-threshold for anything else")
     var quality: RenderRequest.QualityProfile = .balanced
 
     @Option(help: "advanced cache override; makes the quality profile custom")

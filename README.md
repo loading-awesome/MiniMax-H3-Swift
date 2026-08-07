@@ -295,9 +295,11 @@ Measured on a Mac Studio (M3 Ultra) at 864×480, 5 seconds, 20 steps:
 |---|---|---|
 | `balanced` *(default)* | **11.4–11.8 min** | reuses work between steps — **16% less fine detail** |
 | `faithful` | **21.1–21.5 min** | nothing is approximated |
-| `fast` | ~9 min | 28% less fine detail |
 
-Ranges are the spread across five different prompts, not a single run.
+Ranges are the spread across five different prompts, not a single run. There
+were three profiles until a `fast` one was removed: it had never been rendered,
+watched or tested, and cost nearly twice `balanced`'s detail. `--cache-threshold`
+still reaches any setting you want, and marks the render `custom` when you do.
 
 **`balanced` is the default, and it is an approximation.** It reuses one step's
 work in the next when the step barely moved, which measures **1.85× faster** for
