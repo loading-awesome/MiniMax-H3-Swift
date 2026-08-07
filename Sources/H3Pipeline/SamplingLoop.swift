@@ -69,7 +69,7 @@ enum SamplingLoop {
             // by default is one people forget is running when they compare two
             // renders.
             log(String(format: "  cross-step cache: ON at threshold %.3f — an APPROXIMATION. "
-                       + "Measured at 0.10: 1.93x faster for 16%% less high-frequency detail. "
+                       + "Measured at 0.10: 1.9x faster for 16%% less high-frequency detail. "
                        + "Set the threshold to 0 for a faithful render.", cache.threshold))
             log("    probe \(cache.perStreamProbe ? "per-stream" : "whole-sequence"), at most "
                 + "\(cache.maxConsecutiveSkips) consecutive reuses, first and last steps "

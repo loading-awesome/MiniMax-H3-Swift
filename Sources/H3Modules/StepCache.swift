@@ -132,7 +132,7 @@ package final class H3StepCache {
     /// per-call argument would be one more place for the two to be crossed.
     package let branch: StepTrace.Branch
 
-    package init(threshold: Double, maxConsecutiveSkips: Int = 3,
+    package init(threshold: Double, maxConsecutiveSkips: Int = 5,
                 warmupSteps: Int = 1, cooldownSteps: Int = 1,
                 perStreamProbe: Bool = true,
                 branch: StepTrace.Branch = .conditional) {

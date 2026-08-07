@@ -219,7 +219,7 @@ struct SamplingTraceTests {
 @Suite("step cache policy reasons")
 struct StepCachePolicyReasonTests {
 
-    static let p = StepCachePolicy(threshold: 0.5)
+    static let p = StepCachePolicy(threshold: 0.5, maxConsecutiveSkips: 3)
 
     @Test("explain never disagrees with decide")
     func explainAgreesWithDecide() {

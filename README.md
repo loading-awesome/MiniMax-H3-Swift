@@ -292,15 +292,19 @@ Measured on a Mac Studio (M3 Ultra) at 864×480, 5 seconds, 20 steps:
 
 | quality | time | what changes |
 |---|---|---|
-| `balanced` *(default)* | ~13 min | reuses work between steps — **16% less fine detail** |
+| `balanced` *(default)* | ~11.5 min | reuses work between steps — **16% less fine detail** |
 | `faithful` | ~23 min | nothing is approximated |
-| `fast` | ~10 min | 28% less fine detail |
+| `fast` | ~9 min | 28% less fine detail |
 
 **`balanced` is the default, and it is an approximation.** It reuses one step's
 work in the next when the step barely moved, which measured 1.8–1.9× faster for
 16% less fine detail. On a twenty-minute render that is the trade almost
 everybody wants, and finding out afterwards that a flag would have halved it is
 worse than the 16%.
+
+At more steps the trade gets better, not worse: at 40 steps the cache skips 75%
+of them and `balanced` is about 25% faster again, because a finer schedule moves
+the latent less per step and more steps qualify for reuse.
 
 It says so on every run and it is recorded in the render's receipt, so nobody
 discovers months later that their comparison was against a shortcut. That

@@ -408,7 +408,7 @@ first establishing what the hardware can actually do.
 
 ---
 
-## 6C — Consecutive-cap sweep *(speed measured; quality open; cap 5 provisionally clear)*
+## 6C — Consecutive-cap sweep *(ACCEPTED — cap 5 is the default from 2026-08-06)*
 
 The cache has three levers: threshold, per-stream probe, consecutive cap. The
 6A trace showed the threshold does not control the middle of the schedule — from
@@ -425,9 +425,16 @@ can be independent is the admission test, and already is — reuse requires both
 
 | question | answer |
 |---|---|
-| Does cap 5 go faster? | **Yes — 6.5–10% end-to-end**, reproducibly, content-independent |
-| Does cap 5 cost quality? | **Unknown by measurement. Cleared a first viewing.** |
-| Do the automated metrics settle it? | **No**, and the reason is structural — see below |
+| Does cap 5 go faster? | **Yes — 8.4–9.5% at 20 steps, 24.5% at 40**, on every probe and seed |
+| Does cap 5 cost quality? | **Not visibly**, across fast motion, close-up dialogue, 40 steps and a second seed |
+| Do the automated metrics settle it? | **No.** The reason is structural, and it is not going to be fixed — see below |
+| Shipped? | **Yes.** `cacheMaxSkips` default 3 → 5 |
+
+**Accepted on viewing.** That is the honest description and not a lapse: the
+measurement section below establishes that no automated comparison available
+here can resolve an effect of this size, and the one metric that wrongly
+condemned cap 5 was an artefact. The clips were watched at every stress axis
+and cap 5 was clear at all of them.
 
 ### The retraction
 

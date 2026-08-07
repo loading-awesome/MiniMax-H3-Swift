@@ -44,7 +44,7 @@ package struct StepCachePolicy: Sendable, Equatable {
     /// under identical conditions rather than argued about.
     package let perStream: Bool
 
-    package init(threshold: Double, maxConsecutiveSkips: Int = 3,
+    package init(threshold: Double, maxConsecutiveSkips: Int = 5,
                 warmupSteps: Int = 1, cooldownSteps: Int = 1,
                 perStream: Bool = true) {
         self.threshold = threshold
