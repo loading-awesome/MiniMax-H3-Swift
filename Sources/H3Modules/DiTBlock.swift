@@ -399,22 +399,14 @@ package struct DiTBlock {
     package let attn: AttentionLayer
     package let mlp: H3MLP
     package let adaln: AdalnProj
-    /// Whether to use the fused modulation kernels. Defaults to the measured
-    /// answer, and is a property rather than a direct read of the global so a
-    /// test can exercise the fused path while the default is off — otherwise
-    /// the block-level differential test compares the readable path to itself
-    /// and passes having checked nothing.
-    package let fuseModulation: Bool
 
     package init(norm1: H3RMSNorm, norm2: H3RMSNorm, attn: AttentionLayer,
-                mlp: H3MLP, adaln: AdalnProj,
-                fuseModulation: Bool = FusedModulation.enabled) {
+                mlp: H3MLP, adaln: AdalnProj) {
         self.norm1 = norm1
         self.norm2 = norm2
         self.attn = attn
         self.mlp = mlp
         self.adaln = adaln
-        self.fuseModulation = fuseModulation
     }
 
     package func callAsFunction(_ x: MLXArray, tEmb: MLXArray, index: ModulationIndex,
@@ -423,30 +415,18 @@ package struct DiTBlock {
         let m = adaln(tEmb)
         precondition(m.count == 6, "DiTBlock AdaLN must expand to 6, got \(m.count)")
 
-        // **The readable expression is the default path**, and the fused kernel
-        // is opt-in behind `H3_FUSED_MODULATION=1`. It measured 1.81% on wall
-        // clock and 0.94% on the steps it touches, against a 5% gate — see
-        // `FusedModulation` for the eight-render measurement and why the
-        // arithmetic predicted it.
-        //
-        // The kernels also decline on their own for the refiner's batched
-        // shape and for any dtype mix they were not measured on, so this is two
-        // independent reasons to fall back rather than one.
-        let fuse = fuseModulation
+        // Hand-written fused kernels for these four sites measured 0.94% and
+        // have been removed. The GEMM accounting that came after them explains
+        // why they could not have been more: five kernels are essentially all
+        // of a forward, and everything else — these norms, the AdaLN
+        // projection, the gathers, RoPE, the residuals — shares a couple of
+        // percent between them.
         func norm(_ v: MLXArray, _ n: H3RMSNorm, _ shift: MLXArray,
                   _ scale: MLXArray) -> MLXArray {
-            if fuse, let fused = FusedModulation.modulatedRMSNorm(
-                v, weight: n.weight, eps: n.eps, shift: shift, scale: scale, index: index) {
-                return fused
-            }
-            return modScaleShift(n(v), shift: shift, scale: scale, index: index)
+            modScaleShift(n(v), shift: shift, scale: scale, index: index)
         }
         func gated(_ v: MLXArray, _ gate: MLXArray, _ other: MLXArray) -> MLXArray {
-            if fuse, let fused = FusedModulation.gatedResidual(
-                v, gate: gate, other: other, index: index) {
-                return fused
-            }
-            return modGate(v, gate: gate, other: other, index: index)
+            modGate(v, gate: gate, other: other, index: index)
         }
 
         let h1 = norm(x, norm1, m[0], m[1])

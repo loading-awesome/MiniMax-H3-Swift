@@ -1,4 +1,7 @@
 #!/bin/zsh
+# ARCHIVED. Kept as the record of what produced the .h3-bench.json files
+# beside it. Does not run today: the cache flags it passes were removed
+# once their sweeps finished and their answers became constants.
 # Phase 6A controls plus the Phase 6B arm.
 #
 # Same prompt, same seed, same shape throughout; the configuration is the only

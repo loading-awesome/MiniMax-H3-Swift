@@ -1,4 +1,7 @@
 #!/bin/zsh
+# ARCHIVED. Kept as the record of what produced the .h3-bench.json files
+# beside it. Does not run today: the cache flags it passes were removed
+# once their sweeps finished and their answers became constants.
 # A probe that is high-detail AND compositionally constrained.
 #
 # The previous two probes each failed in opposite directions and neither could

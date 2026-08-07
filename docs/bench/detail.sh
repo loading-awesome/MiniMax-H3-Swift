@@ -1,4 +1,7 @@
 #!/bin/zsh
+# ARCHIVED. Kept as the record of what produced the .h3-bench.json files
+# beside it. Does not run today: the cache flags it passes were removed
+# once their sweeps finished and their answers became constants.
 # Re-testing the cache conclusions on content that actually has fine detail.
 #
 # Every number before this came from "a red kite over a beach at sunset" —

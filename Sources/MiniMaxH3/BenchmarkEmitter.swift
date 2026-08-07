@@ -55,8 +55,8 @@ enum BenchmarkEmitter {
                 qualityProfile: request.qualityProfile.rawValue,
                 attentionBackend: result.attentionBackend,
                 cacheThreshold: request.cacheThreshold,
-                cacheMaxConsecutiveSkips: request.cacheMaxSkips,
-                cachePerStreamProbe: !request.cacheWholeSequenceProbe,
+                cacheMaxConsecutiveSkips: RenderRequest.cacheMaxSkips,
+                cachePerStreamProbe: true,
                 overrides: environmentOverrides()),
             machine: .init(
                 model: machine.summary,
@@ -85,9 +85,6 @@ enum BenchmarkEmitter {
         parts.append(request.cacheThreshold > 0
                      ? String(format: "cached-%.3f", request.cacheThreshold)
                      : "dense")
-        if request.cacheThreshold > 0 {
-            parts.append(request.cacheWholeSequenceProbe ? "wholeseq" : "perstream")
-        }
         parts.append(result.attentionBackend)
         return parts.joined(separator: "-")
     }
@@ -107,13 +104,6 @@ enum BenchmarkEmitter {
     static func environmentOverrides() -> [String: String] {
         var out = ProcessInfo.processInfo.environment
             .filter { $0.key.hasPrefix("H3_") && $0.key != "H3_BENCH_ARM" }
-        // Switches that are **on by default** have to be recorded as resolved
-        // values, not just when somebody overrides them. An environment scrape
-        // alone records the exception and stays silent about the rule, so a run
-        // with fused modulation on and a run from before it existed would both
-        // show nothing here — and the fused path is a different computation, by
-        // a few ulps, from the one the controls were measured on.
-        out["resolved.fusedModulation"] = FusedModulation.enabled ? "on" : "off"
         return out
     }
 

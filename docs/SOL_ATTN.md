@@ -1,3 +1,18 @@
+> ## Removed 2026-08-06
+>
+> **The Sol-Attn backend, its Metal kernel, its routing and its five test files
+> are gone from the tree.** This document is kept because it is the evidence
+> for why, and because the measurement technique in §8 and §11 outlived the
+> method it was measuring.
+>
+> The short version: it reached relative RMS 0.29 against dense and produced
+> visible temporal pulsing that no tensor metric caught — found by a viewer,
+> not by a number. The deterministic axial topology built later to avoid that
+> failure was *less* accurate at comparable density (§6D of
+> `docs/PERF_ROADMAP.md`), and no kernel was written for it. Attention is 36.9%
+> of a forward, so the prize was real; nothing measured here got close enough
+> to claim it.
+
 # Sol-Attn on Metal — what it is, and what it is worth
 
 Sources, in order of authority:

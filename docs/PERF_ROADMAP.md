@@ -865,3 +865,42 @@ artifact that no tensor metric caught and a viewer found in seconds.
 
 Behind dense in the registry. No productization work. If it starts affecting the
 production graph, it moves to a research target.
+
+---
+
+## Disposition, 2026-08-06
+
+**Every lever put in for a sweep has been backed out and its answer hard-coded.**
+A knob that exists to settle a question is scaffolding once the question is
+settled, and leaving it costs more than the code: `fast` was a shipped profile
+whose quality drifted the moment `cacheMaxSkips` moved underneath it, because
+nobody was watching an option nobody used.
+
+| removed | answer now hard-coded |
+|---|---|
+| `--cache-threshold` | 0.10 via `balanced`, 0 via `faithful` |
+| `--cache-max-skips` | `RenderRequest.cacheMaxSkips = 5` |
+| `--cache-whole-sequence-probe` | per-stream, always |
+| `--quality fast`, `--quality custom` | gone; `faithful` or `balanced` |
+| `H3_SOL_*` (7 variables) | Sol-Attn removed |
+| `H3_FUSED_MODULATION` | fused modulation removed |
+| `--attention-backend sol` | registry is SDPA only |
+
+Deleted with them: `SolAttn{Backend,Metal,Reference,Routing}.swift` and five
+test files, `FusedModulation.swift` and its tests — about 2,400 lines whose only
+remaining purpose was to be reachable by a flag.
+
+**Kept, and why.** `H3_CAPTURE_*` is the only way to get real q/k/v out of a
+render, and every attention measurement in this document depended on it.
+`H3_BENCH_ARM` and the benchmark records are 6A's deliverable, not a lever. The
+`H3AttentionBackend` seam stays with SDPA as its only implementation: it is what
+let two sparse methods be measured without touching the production path, and
+re-adding it later is more work than leaving it. `AxialTopology` and
+`AxialReference` stay as test-only infrastructure — they are the oracle any
+future topology proposal is measured against, and they have no lever, no
+registry entry and no production surface.
+
+`docs/SOL_ATTN.md` is kept with a removal notice on top: the code is gone, the
+evidence for why is not. The scripts under `docs/bench/` are marked archived —
+they record what produced the JSON beside them and will not run today, because
+the flags they pass no longer exist.

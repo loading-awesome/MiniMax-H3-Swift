@@ -84,17 +84,11 @@ struct RenderCommand: AsyncParsableCommand {
     @Option(help: "guidance scale; 1.0 turns guidance off")
     var cfgScale: Double = 1.0
 
-    @Option(help: "quality profile: faithful or balanced; --cache-threshold for anything else")
+    @Option(help: "quality profile: faithful or balanced")
     var quality: RenderRequest.QualityProfile = .balanced
 
-    @Option(help: "advanced cache override; makes the quality profile custom")
-    var cacheThreshold: Double?
 
-    @Option(help: "most consecutive cached steps before a full one is forced")
-    var cacheMaxSkips: Int = 5
 
-    @Flag(help: "probe the whole packed sequence instead of per stream")
-    var cacheWholeSequenceProbe = false
 
     @Option(help: "recorded conditioning noise, for a render inside the parity contract")
     var conditioningNoise: String?
@@ -149,8 +143,6 @@ struct RenderCommand: AsyncParsableCommand {
             referenceAudio: referenceAudio.map(URL.init(fileURLWithPath:)),
             cfgScale: cfgScale,
             qualityProfile: quality,
-            cacheThreshold: cacheThreshold, cacheMaxSkips: cacheMaxSkips,
-            cacheWholeSequenceProbe: cacheWholeSequenceProbe,
             conditioningNoise: conditioningNoise.map(URL.init(fileURLWithPath:)),
             attentionBackend: attention ?? cfg.attention.backend,
             allowSuboptimal: allowSuboptimal,

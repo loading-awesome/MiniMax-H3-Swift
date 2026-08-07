@@ -45,16 +45,15 @@ struct BenchmarkEmitterTests {
 
     @Test("the arm name says what was on")
     func armNameDescribesConfiguration() {
-        // Derived rather than sequential: `cached-0.100-perstream-sdpa` can be
-        // read back into a configuration, `run-3` cannot.
+        // Derived rather than sequential: `cached-0.100-sdpa` can be read back
+        // into a configuration, `run-3` cannot. The probe no longer appears in
+        // the name because it is no longer a choice — the whole-sequence arm
+        // lost its A/B and the flag went with it.
         #expect(BenchmarkEmitter.armName(request: Self.request(cache: 0),
                                          result: Self.result(backend: "sdpa")) == "dense-sdpa")
         #expect(BenchmarkEmitter.armName(request: Self.request(cache: 0.1),
                                          result: Self.result(backend: "sdpa"))
-                == "cached-0.100-perstream-sdpa")
-        #expect(BenchmarkEmitter.armName(request: Self.request(cache: 0.1, wholeSequence: true),
-                                         result: Self.result(backend: "sol"))
-                == "cached-0.100-wholeseq-sol")
+                == "cached-0.100-sdpa")
     }
 
     @Test("H3_ overrides are captured but the arm label is not one of them")
@@ -64,26 +63,15 @@ struct BenchmarkEmitterTests {
         // different arms of an experiment.
         let overrides = BenchmarkEmitter.environmentOverrides()
         #expect(overrides["H3_BENCH_ARM"] == nil)
-        #expect(overrides.allSatisfy { $0.key.hasPrefix("H3_")
-                                       || $0.key.hasPrefix("resolved.") })
+        #expect(overrides.allSatisfy { $0.key.hasPrefix("H3_") })
     }
 
-    @Test("switches that are on by default are recorded as resolved values")
-    func defaultsAreRecordedNotAssumed() {
-        // Scraping the environment records the exception and stays silent about
-        // the rule: with nothing overridden, a run with fused modulation on and
-        // a run from before it existed both write an empty overrides map. The
-        // fused path is a different computation by a few ulps, so a comparison
-        // between those two has to be able to see it.
-        #expect(BenchmarkEmitter.environmentOverrides()["resolved.fusedModulation"] != nil)
-    }
 
     // MARK: fixtures
 
-    private static func request(cache: Double, wholeSequence: Bool = false) -> RenderRequest {
+    private static func request(cache: Double) -> RenderRequest {
         var r = RenderRequest(prompt: "a red kite", videoOutput: URL(fileURLWithPath: "/tmp/x.mp4"))
         r.cacheThreshold = cache
-        r.cacheWholeSequenceProbe = wholeSequence
         return r
     }
 

@@ -296,10 +296,14 @@ Measured on a Mac Studio (M3 Ultra) at 864×480, 5 seconds, 20 steps:
 | `balanced` *(default)* | **11.4–11.8 min** | reuses work between steps — **16% less fine detail** |
 | `faithful` | **21.1–21.5 min** | nothing is approximated |
 
-Ranges are the spread across five different prompts, not a single run. There
-were three profiles until a `fast` one was removed: it had never been rendered,
-watched or tested, and cost nearly twice `balanced`'s detail. `--cache-threshold`
-still reaches any setting you want, and marks the render `custom` when you do.
+Ranges are the spread across five different prompts, not a single run.
+
+There were three profiles and a set of cache tuning flags. They existed to be
+swept, the sweeps finished, and the answers are now constants — threshold 0.10,
+at most five consecutive reuses, a per-stream probe. A `fast` profile went with
+them: it had never been rendered, watched or tested, and cost nearly twice
+`balanced`'s detail. What is left is the one choice that is genuinely yours,
+which is whether to approximate at all.
 
 **`balanced` is the default, and it is an approximation.** It reuses one step's
 work in the next when the step barely moved, which measures **1.85× faster** for

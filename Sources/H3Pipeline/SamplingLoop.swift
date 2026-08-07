@@ -53,14 +53,12 @@ enum SamplingLoop {
         // and a shared cache would reuse across that gap.
         let cache = request.cacheThreshold > 0
             ? H3StepCache(threshold: request.cacheThreshold,
-                          maxConsecutiveSkips: request.cacheMaxSkips,
-                          perStreamProbe: !request.cacheWholeSequenceProbe,
+                          maxConsecutiveSkips: RenderRequest.cacheMaxSkips,
                           branch: .conditional)
             : nil
         let negativeCache = (request.cacheThreshold > 0 && request.cfgScale > 1.0)
             ? H3StepCache(threshold: request.cacheThreshold,
-                          maxConsecutiveSkips: request.cacheMaxSkips,
-                          perStreamProbe: !request.cacheWholeSequenceProbe,
+                          maxConsecutiveSkips: RenderRequest.cacheMaxSkips,
                           branch: .unconditional)
             : nil
 

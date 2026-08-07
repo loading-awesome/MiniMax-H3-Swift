@@ -153,10 +153,18 @@ public struct RenderRequest: Sendable {
     /// A detail ratio across that gap compares content. The distribution
     /// fallback does not rescue it either: detail varies 25–28% between seeds,
     /// so resolving a 2% effect would need on the order of a hundred renders.
-    public var cacheMaxSkips: Int
+    /// How many steps in a row may reuse the cached residual.
+    ///
+    /// **A constant, not a setting.** It was a knob while it was being swept —
+    /// 3, 4, 5 and 6 rendered and watched — and 5 is the answer. See
+    /// `docs/PERF_ROADMAP.md` §6C.
+    public static let cacheMaxSkips = 5
     /// Probe the whole packed sequence rather than per stream — what every other
     /// published cache for this model does, kept so the two can be compared.
-    public var cacheWholeSequenceProbe: Bool
+    /// The whole-sequence probe lost its A/B against the per-stream one and
+    /// the flag that selected it is gone. Audio is the sole objection at one
+    /// late step of every render measured, which a whole-sequence probe cannot
+    /// see — it is 2.6% of the rows.
     /// Recorded conditioning noise from `emit_cond_noise.py`. Without it the
     /// rows are augmented from MLX's PRNG, which cannot reproduce the
     /// reference's `torch.Generator("cpu")` bytes, and the render falls outside
@@ -201,9 +209,6 @@ public struct RenderRequest: Sendable {
                 referenceAudio: [URL] = [],
                 cfgScale: Double = 1.0,
                 qualityProfile: QualityProfile = .balanced,
-                cacheThreshold: Double? = nil,
-                cacheMaxSkips: Int = 5,
-                cacheWholeSequenceProbe: Bool = false,
                 conditioningNoise: URL? = nil,
                 attentionBackend: String = "auto",
                 allowSuboptimal: Bool = false,
@@ -228,9 +233,7 @@ public struct RenderRequest: Sendable {
         self.referenceAudio = referenceAudio
         self.cfgScale = cfgScale
         self.qualityProfile = qualityProfile
-        self.cacheThreshold = cacheThreshold ?? qualityProfile.cacheThreshold
-        self.cacheMaxSkips = cacheMaxSkips
-        self.cacheWholeSequenceProbe = cacheWholeSequenceProbe
+        self.cacheThreshold = qualityProfile.cacheThreshold
         self.conditioningNoise = conditioningNoise
         self.attentionBackend = attentionBackend
         self.allowSuboptimal = allowSuboptimal

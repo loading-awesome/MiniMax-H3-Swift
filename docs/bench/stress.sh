@@ -1,4 +1,7 @@
 #!/bin/zsh
+# ARCHIVED. Kept as the record of what produced the .h3-bench.json files
+# beside it. Does not run today: the cache flags it passes were removed
+# once their sweeps finished and their answers became constants.
 # Stress test for cap 5, which looked good on the speaker probe by eye.
 #
 # Four axes, chosen for where a cross-step *residual* cache should break rather
