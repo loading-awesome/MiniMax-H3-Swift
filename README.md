@@ -330,12 +330,30 @@ Larger costs more than proportionally: attention grows with the *square* of the
 sequence length, so doubling the resolution roughly quadruples the time.
 `--dry-run` tells you before you commit twenty minutes.
 
+**A dry run prices a shape; it does not prove one will run.** It returns before
+`engine.start()`, so it never reaches the memory admission check — it will
+print a confident estimate for a configuration the machine then refuses. Asked
+for 12 seconds at 576x1024 it printed "about 2h 04m of sampling" for 51,604
+packed tokens; the engine wanted ~260 GB against 237 GB available and refused
+before loading a single weight. The only way to know a shape fits is to start
+it and watch for `H3-4001`, which costs a few seconds.
+
+Measured peaks, for planning: **87.2 GB at the verified 864x480x124**. Weights
+are a fixed ~66 GB of that and activations scale with packed tokens, so
+576x1024x243 — 2.7x the tokens — lands near 123 GB. A 96 GB card fits the
+first and not the second.
+
 The `int8` files are half the size on disk and **exactly the same size in
 memory**, because they are expanded back to full precision at load. They save
 download and storage, not RAM. The `pruned` files genuinely are smaller in
 memory and they change the maths, so `h3` refuses them unless you set
 `allow_approximate_weights` in the config — nobody should accidentally compare
 one against the real thing.
+
+For the complete public write-up—including sparse attention, partial cache
+refresh, quantized GEMM, graph compilation, kernel fusion, the quality traps,
+and recommendations for Comfy workflows—see
+[MiniMax H3 acceleration: what worked and what failed](docs/PERFORMANCE_GUIDE.md).
 
 ---
 
@@ -354,7 +372,7 @@ Useful `render` options:
 |---|---|
 | `--out-audio out.wav` | also write the audio on its own |
 | `--seconds 4…15` | duration. Use 5 or more; 4 lands under the model's trained floor |
-| `--steps 20` | more is slower and slightly better; 20 is the verified value |
+| `--steps 20` | 20 is the verified value. **More is nearly free** — see below |
 | `--seed 7` | same seed, machine and version → the same video |
 | `--width` / `--height` | exact size, multiples of 32 |
 | `--aspect-ratio 16:9` | or `9:16`, `21:9`, `4:3`, `3:4`, `1:1` |

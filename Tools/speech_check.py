@@ -95,7 +95,12 @@ def main():
     ap.add_argument("audio")
     ap.add_argument("--expect", default=None,
                     help="the dialogue the prompt asked for")
-    ap.add_argument("--model", default="mlx-community/whisper-small-mlx")
+    # large-v3, not small. `small` reports false failures on exactly the
+    # material this check exists to judge: on a line shouted over a cheering
+    # crowd it returned "Inheld! The line helped!" and FAILed at WER 0.60,
+    # where large-v3 transcribed "It held! The line held!" exactly, WER 0.00.
+    # A gate whose default fails clean audio is worse than no gate.
+    ap.add_argument("--model", default="mlx-community/whisper-large-v3-mlx")
     ap.add_argument("--json-out")
     a = ap.parse_args()
 

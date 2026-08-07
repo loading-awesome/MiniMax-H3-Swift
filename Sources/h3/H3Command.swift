@@ -33,9 +33,11 @@ struct H3: AsyncParsableCommand {
               h3 render --prompt "a red kite over a beach at sunset" --out kite.mp4
 
             That is 5 seconds at 1344x768, and on an M3 Ultra it takes about
-            fifteen minutes. `h3 render --help` lists every option, and
+            forty minutes. `h3 render --help` lists every option, and
             `h3 render --dry-run` prints the plan and the time estimate without
-            loading a checkpoint.
+            loading a checkpoint — but note that a dry run costs a shape, it
+            does not prove one will run. It returns before the engine starts,
+            so it never reaches the memory admission check.
             """,
         version: MiniMaxH3.version,
         subcommands: [Doctor.self, ConfigCommand.self, RenderCommand.self, BenchCommand.self]

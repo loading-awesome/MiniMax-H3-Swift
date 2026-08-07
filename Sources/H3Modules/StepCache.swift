@@ -91,11 +91,16 @@ package final class H3StepCache {
     ///    binding constraint far more of the time. The **fraction** of the
     ///    schedule that gets skipped rises.
     ///
-    /// Which effect dominates is not something to reason out from here — the
-    /// deltas at 40 steps have to be measured and replayed, exactly as the
-    /// 20-step ones were. Recorded because the intuition "more steps means the
-    /// cache coasts further" is only half right, and the half that is wrong
-    /// points the other way.
+    /// **Measured, 2026-08-06: they cancel.** Same prompt, seed and shape at
+    /// cap 5, 20 steps gives 10 full and 10 reused in 616.3 s; 40 steps gives
+    /// **10 full** and 30 reused in 641.8 s. Doubling the schedule costs 4%,
+    /// because the cache converges on roughly a fixed number of genuinely
+    /// distinct forwards however finely the trajectory is sliced.
+    ///
+    /// The practical consequence is the opposite of the usual instinct: to go
+    /// faster, lowering the step count buys nothing — the deltas grow, the
+    /// threshold stops admitting them, and the cache simply disengages. To go
+    /// better, raising it is nearly free. See `docs/PERFORMANCE_GUIDE.md` §2.
     package let maxConsecutiveSkips: Int
 
     /// Steps at the start and end of the schedule that always run in full.
@@ -181,6 +186,14 @@ package final class H3StepCache {
         // **Measured per stream, and gated on the worse of the two.**
         //
         // This is the whole reason to write another cache rather than use one.
+        // **The reuse structure does not depend on resolution.** The sweep that
+        // set these defaults ran at 864x480x124; a nine-shot production run at
+        // 576x1024x243 — 2.7x the packed tokens — reproduced it shot for shot:
+        // 10-11 of 20 reused, audio the sole objection at five refusals, every
+        // time, across a bunker interior, orbital vacuum, re-entry plasma and a
+        // mud-and-tracer firefight. Content does not move it either. What moves
+        // it is the flow schedule.
+        //
         // At 864x480x124 the packed sequence is 95.1% video rows and **2.6%
         // audio rows**, so a probe averaged over the whole sequence is a
         // video-only probe wearing a disguise: a change that destroys the
