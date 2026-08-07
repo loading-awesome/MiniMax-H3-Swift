@@ -597,40 +597,83 @@ exactly once in twenty steps, at step 4, in the direction of doing *more* work.
 
 ---
 
-## 6D — Axial-union oracle *(not started)*
+## 6D — Axial-union oracle *(measured; STOP — do not build 6E)*
 
-Research, isolated from the product surface.
+**The stop condition fires. The deterministic topology is less accurate than
+the content-adaptive routing it was meant to replace, at comparable density.**
 
-### Deterministic topology
+Measured on q/k/v captured from a real render at blocks 0, 24 and 49, 25%
+through the schedule, S = 15,993:
 
-- Prefix queries attend every key densely, and every query keeps the complete
-  prefix as keys.
-- Video queries attend: all tokens in the same latent frame; the same spatial
-  position across latent frames; deduplicated global landmark frames.
-- Audio stays in the dense prefix.
-- Blocks 0 and 49 dense. First and last sampling steps dense.
-- No entropy routing, no per-step content-dependent Top-K.
+```
+             density   video rel-RMS by block
+landmarks              block 0   block 24   block 49
+   2          0.194     0.5574     0.4803     0.2865
+   3          0.217     0.5023     0.4502     0.2739
+   5          0.263     0.4328     0.3934     0.2329
+   9          0.355     0.3088     0.3033     0.1902
 
-### The reference must stream one softmax
+prefix rel-RMS: 0.0000 at every density and every block
+```
 
-**Sliced SDPA cannot serve as the oracle.** Separate spatial, temporal and
-prefix results cannot be combined afterwards because each was normalised by its
-own softmax denominator. The reference has to run one block-streamed online
-softmax over the union of allowed keys.
+**Sol-Attn measured 0.29 and was rejected on quality** — it produced visible
+pulsing that no tensor metric caught. Axial at a useful density (3 landmarks,
+21.7%) sits at 0.45–0.50 on the video rows: roughly 1.6× worse than something
+already known to be unshippable. It only reaches Sol-Attn's 0.29 at 9
+landmarks and 35.5% density, where there is little sparsity left to spend.
 
-Operate on captured real H3 q/k/v. Prove that selecting every key reproduces
-dense. Report prefix, audio and video relative RMS **separately** — §8 of
-`SOL_ATTN.md` found they degrade differently, and an average hides it.
+In hindsight the result is not surprising. Content-adaptive routing picks the
+blocks that carry the mass; a fixed topology picks blocks by position and
+misses whatever the content put somewhere else. Determinism was bought, and
+this is the price.
 
-Do not optimise the oracle. Its job is correctness and early rejection.
+### Two things the design got right, and they are worth keeping
 
-**Stop condition:** if the deterministic topology already produces unacceptable
-prefix or audio error, or errors that are unstable between consecutive captured
-steps, do not build the Metal backend.
+**Prefix error is exactly zero**, at every density and every block. Prefix
+queries attend everything and every query keeps the whole prefix, so the text,
+the references and the target audio are bit-exact rather than approximately
+right. That is the failure every published cache and sparse method for this
+model shares, and this topology does not have it. Any future sparse work should
+inherit that structure whatever else it does.
+
+**The error does not move between steps.** Consecutive captures at schedule
+progress 0.25 and 0.30 give 0.4438 and 0.4469 — a 0.7% swing. The design's
+central claim holds: the same query attends the same keys at every step, so
+the operator cannot change discontinuously mid-trajectory. That is precisely
+the mechanism behind Sol-Attn's pulsing, and it is absent here. The accuracy is
+stably bad rather than unstably mediocre, which is the better failure to have —
+it means the topology is a fair test of the *idea* and not of an artefact.
+
+### The speed case, for completeness
+
+Attention is 36.9% of a forward. At 21.7% density the ideal is 1.4× on the
+whole forward; the Sol-Attn kernel achieved roughly half its ideal, which would
+put this near 1.2×. That is the upside, against a video error 1.6× worse than
+one already rejected.
+
+### What was built and what it is worth keeping for
+
+`AxialTopology` (integer arithmetic, no MLX, tested without a GPU) and
+`AxialReference` (two implementations, both one softmax over the union). They
+stay as the oracle any future topology proposal is measured against, and the
+tests encode the two traps:
+
+* **Sliced SDPA cannot be combined.** Separate attentions over the frame, the
+  column and the prefix each carry their own denominator, and summing them is
+  not attention over the union. `fullSelectionIsDense` catches it — such an
+  implementation cannot reproduce dense even when the union is everything.
+* **The online-softmax recurrence is silent when wrong.**
+  `attendStreamingKeys` is the arithmetic a kernel would implement, validated
+  against the masked definition across key tiles that do not divide the
+  sequence, since the ragged final tile is where it breaks.
+
+Also here: the density figure is counted by frame rather than estimated by
+inclusion-exclusion. The first version added the three axes and subtracted an
+estimate of their overlap, and came out 4.2% wrong against a counted mask.
 
 ---
 
-## 6E — Correctness-first Metal topology backend *(gated on 6D)*
+## 6E — Correctness-first Metal topology backend *(NOT STARTED — gated on 6D, which said stop)*
 
 One backend behind the existing `H3AttentionBackend` seam. Exact prefix
 handling, one softmax normalisation, dense fallback for unsupported geometry.
