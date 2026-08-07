@@ -355,7 +355,13 @@ fewer bits.
 ### Measured: the model is at MLX's ceiling, and the roadmap closes
 
 `GEMMCeilingTests` (`H3_BIG=1 swift test --filter gemmCeiling`), isolated
-kernels at production shapes:
+kernels at production shapes.
+
+> **These rows use a contiguous `[K,N]` right operand, which is not the layout
+> production runs.** Kept because they are the correct reference for MLX's
+> attainable rate, and because the conclusion drawn from them originally was
+> wrong in a way worth leaving visible. The layout the model actually uses is
+> in the table below them.
 
 | kernel | ms | TFLOP/s |
 |---|---:|---:|
@@ -366,22 +372,48 @@ kernels at production shapes:
 | attention `S=15731, 56×128` | 439.0 | 16.2 |
 | **square 8192³, clean best case** | 62.5 | **17.6** |
 
-**The model achieves 16.0 TFLOP/s. MLX's own best case on a clean square GEMM
-is 17.6.** The model is running at 91% of the fastest rate this library reaches
-on this machine.
+**The model achieves 16.0 TFLOP/s.** The square GEMM's 17.6 is *not* the
+reference it should be compared against, and an earlier version of this section
+claimed it was — reporting the model as running at "91% of the fastest rate this
+library reaches". That comparison was invalid: every row in the table above uses
+a contiguous `[K,N]` right operand, while the checkpoint stores `[N,K]` and
+every production projection calls `matmul(x, weight.T)`. The model was being
+measured against a layout it does not run.
 
-And the kernels account for the whole forward:
+At the layout it does run (`weightLayout`, same interleaved-median protocol):
+
+| kernel | TFLOP | `[N,K].T`, as production runs it | `[K,N]` |
+|---|---:|---:|---:|
+| qkv | 3.637 | **16.4** TFLOP/s | 17.1 |
+| attention out | 1.212 | **16.2** | 16.8 |
+| mlp fc1 | 4.850 | **16.4** | 17.0 |
+| mlp fc2 | 2.425 | **14.3** | 15.7 |
+| attention | 7.095 | **16.2** | n/a — not a weight matmul |
+
+**Aggregate isolated rate in the model's own layout: 16.0 TFLOP/s. The model
+achieves 16.0 TFLOP/s.** It is not at 91% of what MLX can do; it is at what MLX
+can do, and the 9% gap was the layout penalty misattributed to overhead.
+
+The kernel accounting moves the same way:
 
 ```
-per block   qkv 209.2 + out 70.9 + fc1 279.9 + fc2 155.5 + attention 439.0
-          = 1154.5 ms  x 50 blocks = 57.7 s   against a 60.0 s forward = 96.2%
+GEMM per block, model's layout   761.2 ms      (materialised [K,N]: 723.8 ms)
++ attention                      439.0 ms
+                               = 1200.2 ms  x 50 blocks = 60.0 s
+real forward, from the controls              = 60.0 s
 ```
 
-**Everything that is not one of those five kernels — every RMSNorm, the AdaLN
-projection, all modulation and gathers, RoPE, the residuals, and every kernel
-launch — is 3.8% of a forward in total, 45 ms per block.** 6B measured 0.94%
-and addressed part of that envelope. It fits exactly, and it was never going to
-be more.
+The earlier figure — 1154.5 ms per block, 96.2% — used the `[K,N]` timings, so
+**1.87 s of its 2.3 s "non-kernel envelope" was the weight-layout penalty**, not
+overhead.
+
+**Do not read the 100.0% as exact.** Non-kernel work in the block is real and
+has been measured directly: fused modulation 0.94%, the AdaLN projection 0.37%,
+block compilation 0.54%. Those cannot all fit inside a residual of zero, so the
+honest statement is that this accounting is good to **±2%**, and within that
+band there is no overhead left to reclaim. Two independent routes — summing
+isolated kernels, and measuring each non-kernel candidate on its own — agree
+that essentially all of a forward is the five kernels.
 
 So items 3, 4 and 5 are all **struck**:
 
@@ -389,7 +421,7 @@ So items 3, 4 and 5 are all **struck**:
 |---|---|
 | 3. AdaLN schedule batching | **measured 0.37%** of a full step, not estimated |
 | 4. Dense-block compilation | **0.54%** for one block and **1.15%** for two, interleaved medians |
-| 5. Weight layout, GEMM profiling | exact and real, but **3.0–3.1% of a full step**, below the 5% gate |
+| 5. Weight layout, GEMM profiling | exact and real, but **3.0–3.1% of a full step**, below the 5% gate — and it is the whole of the gap once thought to be overhead |
 
 ### Items 3 and 4 were struck on an estimate and are now struck on a measurement
 
@@ -420,8 +452,11 @@ different render. At 0.54–1.15% that is not a trade worth making.
 
 Two useful things fell out of it. The synthetic block at production width
 measures 1258.8 ms, and 50 × that is 62.9 s against the 60.0 s forward measured
-in the controls — **an independent confirmation of the 96.2% kernel accounting**
-from a completely different direction. And the 1.8% gap between the two compiled
+in the controls — **a third independent route to the kernel accounting**, from
+a real block rather than from summing isolated kernels. It lands 4.8% high,
+which is the honest width of this whole accounting: three routes agree that
+essentially all of a forward is the five kernels, and none of them resolves the
+remainder to better than a couple of percent. And the 1.8% gap between the two compiled
 rows prompted a direct measurement of the AdaLN projection, which is **4.4 ms
 per block with the fp32 upcast on, 0.37% of a step** — so item 3 is worth about
 a third of one percent, not the 0.008% its FLOP count suggested and not the 1.8%
@@ -492,6 +527,7 @@ Every lever has now been measured rather than estimated:
 | AdaLN schedule batching | 0.37% — struck |
 | dense-block compilation | 0.54–1.15% — struck |
 | weight layout / GEMM tuning | exact 3.0–3.1% full-step gain, below gate — struck |
+| GEMM efficiency in the model's own layout | model is *at* MLX's isolated rate, not 91% of it — nothing to reclaim |
 | int8 / int4 matmul | 1.2% — struck |
 | Sol-Attn sparse attention | rejected on quality |
 | axial-union topology | rejected on accuracy in 6D, no kernel written |
