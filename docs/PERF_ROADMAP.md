@@ -429,14 +429,56 @@ per block with the fp32 upcast on, 0.37% of a step** — so item 3 is worth abou
 a third of one percent, not the 0.008% its FLOP count suggested and not the 1.8%
 the gap suggested. FLOPs were the wrong unit; so was the gap.
 
-**Only two things can now move this workload**, and neither is scheduling:
+**Fewer bits does not work here either — measured.** MLX's quantised matmul at
+production shapes:
 
-1. **Fewer bits.** int8 or int4 matmul, if MLX's quantised path beats
-   17.6 TFLOP/s by enough to matter. That is the next measurement, and it is
-   another microbenchmark rather than a project.
-2. **Fewer FLOPs.** Sparse attention (38% of the forward — measured, rejected on
-   quality) or fewer steps (the cache — already shipped at 1.79×, and 6C is
-   about pushing it further).
+| shape | bf16 | int8 | int4 |
+|---|---:|---:|---:|
+| qkv `[S,H]×[H,3I]` | 223.2 ms | 227.4 ms (0.98×) | 227.3 ms (0.98×) |
+| mlp fc1 `[S,H]×[H,2F]` | 294.9 ms | 299.8 ms (0.98×) | 289.9 ms (1.02×) |
+| mlp fc2 `[S,F]×[F,H]` | 162.7 ms | 147.9 ms (1.10×) | 151.9 ms (1.07×) |
+
+About 1.02× across the GEMMs, which are 63% of a forward: **1.2% overall,
+below the 1.4% noise floor**, and two of three shapes are slower. int4 is no
+better, so there is no going further down.
+
+**And this was predictable from a figure already in this document.**
+Quantisation pays when the work is bandwidth-bound on weights — batch-1 decode,
+where every weight is read once per token. At S = 15,731 each weight read is
+amortised over 15,731 rows, and reading all 66.3 GB once per forward is 83 ms,
+0.1% of a step. Halving the bytes saves 0.05%. The arithmetic would have to get
+faster instead, and MLX's path evidently dequantises to compute.
+
+Worth separating from the checkpoints: the int8 files this tree already ships
+are a **disk format, not a compute format** — `h3 doctor` reports them as
+"dequantised at load — saves disk, not memory". They run bf16 matmuls and are
+unaffected by any of the above.
+
+**So the only remaining lever is fewer FLOPs**: sparse attention (36.9% of the
+forward — Sol-Attn measured and rejected on quality, axial measured and rejected
+in 6D) or fewer steps (the cache, shipped at 1.79× plus cap 5's 8–24%).
+
+### The roadmap is closed
+
+Every lever has now been measured rather than estimated:
+
+| lever | result |
+|---|---|
+| cross-step cache | **shipped**, 1.79× |
+| consecutive cap 3 → 5 | **shipped**, 8.4–9.5% at 20 steps, 24.5% at 40 |
+| fused modulation | 0.94% — off by default |
+| AdaLN schedule batching | 0.37% — struck |
+| dense-block compilation | 0.28% — struck |
+| weight layout / GEMM tuning | model is at 91% of MLX's isolated rate — struck |
+| int8 / int4 matmul | 1.2% — struck |
+| Sol-Attn sparse attention | rejected on quality |
+| axial-union topology | rejected on accuracy in 6D, no kernel written |
+
+What is left is not a tuning knob. It would be a hand-written Metal GEMM that
+beats MLX's, with no evidence yet that the hardware has headroom MLX is leaving;
+or a different cache design that refreshes the residual partially rather than
+all-or-nothing. Both are projects, not experiments, and neither should start
+without first establishing what the hardware can actually do.
 
 A third possibility exists and should be named rather than assumed away: a
 hand-written Metal GEMM that beats MLX's. That is a much larger undertaking

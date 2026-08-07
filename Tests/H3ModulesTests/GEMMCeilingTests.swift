@@ -95,4 +95,55 @@ struct GEMMCeilingTests {
         print(String(format: "  one block's share of a 60.0 s forward: %.1f ms\n",
                      60_000.0 / 50.0))
     }
+
+    /// What a quantised weight path would be worth, purely as a number.
+    ///
+    /// **Not a proposal.** Quantising the weights is a lossy change to the
+    /// model, and this tree's equivalence classes and 225 parity taps are
+    /// calibrated against bf16; adopting it would mean re-establishing all of
+    /// them and then accepting the result by eye, exactly as cap 5 had to be.
+    /// This measures the upside so the decision to decline it is made against
+    /// a number rather than an impression.
+    ///
+    /// Worth knowing before reading the result: **the int8 checkpoints this
+    /// tree already ships are a disk format, not a compute format.** `h3
+    /// doctor` reports them as "dequantised at load — saves disk, not memory",
+    /// so they run bf16 matmuls and are not what is measured here.
+    @Test(.enabled(if: ProcessInfo.processInfo.environment["H3_BIG"] != nil))
+    func quantizedCeiling() {
+        let cfg = H3Config()
+        let s = 15_731
+        let shapes: [(String, Int, Int, Int)] = [
+            ("qkv      [S,H]x[H,3I]", s, cfg.hiddenSize, 3 * cfg.innerDim),
+            ("mlp fc1  [S,H]x[H,2F]", s, cfg.hiddenSize, 2 * cfg.ffnHidden),
+            ("mlp fc2  [S,F]x[F,H]", s, cfg.ffnHidden, cfg.hiddenSize)
+        ]
+        print("\n  bf16 against quantised, same shapes\n")
+        print("  shape                        bf16 ms   int8 ms   int8 x   int4 ms   int4 x")
+        for (name, m, k, n) in shapes {
+            let x = MLXRandom.normal([m, k]).asType(.bfloat16)
+            // `quantizedMM` transposes by default, so the weight is [N, K] —
+            // which is also how every weight in this checkpoint is stored.
+            let w = MLXRandom.normal([n, k]).asType(.bfloat16)
+            MLX.eval(x, w)
+            let dense = timeIt { MLX.matmul(x, w.T) }
+
+            var cells: [String] = []
+            for bits in [8, 4] {
+                let (wq, scales, biases) = MLX.quantized(w, groupSize: 64, bits: bits)
+                MLX.eval(wq, scales, biases ?? MLXArray(0))
+                let ms = timeIt {
+                    MLX.quantizedMM(x, wq, scales: scales, biases: biases,
+                                    transpose: true, groupSize: 64, bits: bits)
+                }
+                cells.append(String(format: "%9.1f %8.2fx", ms * 1000, dense / ms))
+            }
+            print(String(format: "  %@ %9.1f%@",
+                         (name as NSString).padding(toLength: 24, withPad: " ", startingAt: 0),
+                         dense * 1000, cells.joined() as NSString))
+        }
+        print("\n  attention is 36.9% of a forward and is not a weight matmul,")
+        print("  so it is untouched by any of this — the ceiling below applies")
+        print("  to the 63% that is dense GEMM.\n")
+    }
 }
