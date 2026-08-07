@@ -271,10 +271,9 @@ The remaining gates (CUDA tap conformance) were not run: a kernel that is off by
 default and fails its speed gate does not need its conformance re-established.
 They become live again only if someone turns it on.
 
-Separately evaluable and not yet attempted: a fused Q/K RMSNorm plus split-half
-RoPE. Kept separate because the oracle already measured the unfused attention
-path as bit-identical to the reference's fused kernel, so this one is a pure
-traffic argument with no correctness upside.
+Separately evaluated below: fused Q/K RMSNorm plus split-half RoPE. The oracle
+already measured the unfused attention path as bit-identical to the reference's
+fused kernel, so this is a pure traffic argument with no correctness upside.
 
 `H3_FUSED_MODULATION=0` forces the readable path at run time, for bisecting a
 suspected difference on a real render without a rebuild.
@@ -342,7 +341,7 @@ motivated 6B — is reasoning about a rounding error.
 
 | item | ceiling | verdict |
 |---|---:|---|
-| 3. AdaLN schedule batching | ~0.05% | **dead.** The projection is 0.008% of FLOPs and its weight reads are 26 GB — 0.05% of a step. Precomputing all 20 steps saves a rounding error, and `AdalnProj` already measured its fp32 upcast at 0.2%. |
+| 3. AdaLN schedule batching | initially estimated ~0.05% | **measure the complete six-table schedule; FLOPs alone miss the small-M projection cost.** |
 | 4. MLX dense-block compilation | ~0.05% | **dead.** Roughly a thousand kernel launches per forward at ~30 µs is 30 ms against 60 s. |
 | 5. Canonical weight layout, GEMM profiling | up to 63% of FLOPs | **live.** This is the target. |
 | 6. Selective int8 matmul | same 63%, ~2× arithmetic rate | **live**, at a quality cost that needs the same measurement problem solved. |
@@ -408,22 +407,80 @@ The earlier figure — 1154.5 ms per block, 96.2% — used the `[K,N]` timings, 
 overhead.
 
 **Do not read the 100.0% as exact.** Non-kernel work in the block is real and
-has been measured directly: fused modulation 0.94%, the AdaLN projection 0.37%,
-block compilation 0.54%. Those cannot all fit inside a residual of zero, so the
-honest statement is that this accounting is good to **±2%**, and within that
-band there is no overhead left to reclaim. Two independent routes — summing
-isolated kernels, and measuring each non-kernel candidate on its own — agree
-that essentially all of a forward is the five kernels.
+has been measured directly: fused modulation 0.94%, AdaLN schedule batching
+0.8–1.3% at render level, block compilation 0.54%. Those cannot all fit inside
+a residual of zero, so the honest statement is that this accounting is good to
+**±2%**, and within that band there is no overhead left to reclaim. Two
+independent routes — summing isolated kernels, and measuring each non-kernel
+candidate on its own — agree that essentially all of a forward is the five
+kernels.
 
 So items 3, 4 and 5 are all **struck**:
 
 | item | why it is dead |
 |---|---|
-| 3. AdaLN schedule batching | **measured 0.37%** of a full step, not estimated |
+| 3. AdaLN schedule batching | **0.8–1.3% render-level saving**, 360–729 MiB, mode-dependent drift |
 | 4. Dense-block compilation | **0.54%** for one block and **1.15%** for two, interleaved medians |
 | 5. Weight layout, GEMM profiling | exact and real, but **3.0–3.1% of a full step**, below the 5% gate — and it is the whole of the gap once thought to be overhead |
 
-### Items 3 and 4 were struck on an estimate and are now struck on a measurement
+### AdaLN schedule batching — fast locally, irrelevant to the render
+
+The single-output projection probe was the wrong final unit: a block consumes
+all six modulation tables, and the schedule and cache decide how often the
+projection actually runs. `adalnScheduleBatching` therefore compares both
+supported schedule shapes with all six outputs evaluated: text-to-video/audio
+has one deduplicated row at the first step and two thereafter; paired visual and
+audio references have three, then four.
+
+| measurement | t2va, across four runs | paired ref2va |
+|---|---:|---:|
+| twenty separate projections, per block | 267.9–300.9 ms | 338.1 ms |
+| one schedule projection, per block | 22.5–36.7 ms | 30.1 ms |
+| local projection speedup | 7.7–12.5× | 11.25× |
+| dense twenty-step saving | 11.65–13.21 s (**1.0–1.1%**) | 15.40 s (**~1.3%**) |
+| cap-5 saving | 5.09–6.04 s (**0.8–0.9%**) | 7.12 s (**~1.1%**) |
+| persistent modulation tables | 360 MiB | 729 MiB |
+| numerical result | rel_rms 6.58e-6, not identical | bit-identical in measured arm |
+
+The cap-aware estimate includes block 0 on all twenty steps and blocks 1–49 on
+the ten full steps. Precomputing cannot know those cache decisions, so it must
+materialise every block's schedule, including the ten steps where those 49
+blocks will be skipped. GEMM accumulation is mode/shape dependent: t2va moved
+by 6.58e-6 while the larger reference arm happened to remain bit-identical.
+The optimization therefore cannot claim a universal exact equivalence class.
+A 0.8–1.3% gain does not justify 360–729 MiB of new lifecycle state or a render
+quality gate. Item 3 is closed without a production implementation.
+
+### Fused Q/K RMSNorm plus RoPE — 4.2× locally, 1.2% on the render
+
+The first ceiling fixture allocated independent contiguous Q and K tensors and
+reported 132.4 ms per block, apparently enough to justify a kernel. That was the
+wrong boundary. Production receives one contiguous QKV projection and Q/K are
+split/reshape views into it; MLX optimises that graph very differently. The
+correct fixture begins at the real QKV output and measures the exact path the
+block runs.
+
+A correctness-first Metal fixture consumes QKV directly, performs both fp32
+per-head reductions, rounds the normalized values to bf16 at the readable
+path's boundary, then applies the 96-channel split-half rotation:
+
+| production shape `S=15731, H=56, D=128` | result across four runs |
+|---|---:|
+| Q/K RMSNorm only | 13.4–14.0 ms |
+| Q/K RoPE only | 7.2–7.4 ms |
+| complete unfused chain | 19.5–20.1 ms |
+| fused Metal fixture | 4.6–4.8 ms (**4.19–4.22×**) |
+| measured full-step saving | 0.74–0.77 s (**~1.2–1.3%**) |
+| measured cap-5 render saving | 7.57–7.83 s of 660.5 s (**~1.2%**) |
+| numerical result | rel_rms 9.62e-6; worst 1.08 bf16 ulp; not bit-identical |
+
+Even an impossible free kernel is bounded at 1.62–1.68% of a full step. The
+real kernel is fast and its error is confined to reduction-order noise, but it
+still changes the trajectory and fails the 5% gate by fourfold. The Metal code
+therefore remains a test-only fixture: no production branch, environment flag,
+receipt field or dormant alternative math path was added.
+
+### Dense-block compilation — measured and struck
 
 The first pass costed item 4 as kernel-launch overhead alone — about a thousand
 dispatches at ~30 µs against a 60 s forward, so 0.05% — and that was the wrong
@@ -450,17 +507,15 @@ Compilation is also **not bit-identical** — relative RMS is 2.35e-4 for one
 block and 3.28e-4 for two, compounding over fifty blocks and twenty steps into a
 different render. At 0.54–1.15% that is not a trade worth making.
 
-Two useful things fell out of it. The synthetic block at production width
+One useful thing fell out of it. The synthetic block at production width
 measures 1258.8 ms, and 50 × that is 62.9 s against the 60.0 s forward measured
 in the controls — **a third independent route to the kernel accounting**, from
 a real block rather than from summing isolated kernels. It lands 4.8% high,
 which is the honest width of this whole accounting: three routes agree that
 essentially all of a forward is the five kernels, and none of them resolves the
-remainder to better than a couple of percent. And the 1.8% gap between the two compiled
-rows prompted a direct measurement of the AdaLN projection, which is **4.4 ms
-per block with the fp32 upcast on, 0.37% of a step** — so item 3 is worth about
-a third of one percent, not the 0.008% its FLOP count suggested and not the 1.8%
-the gap suggested. FLOPs were the wrong unit; so was the gap.
+remainder to better than a couple of percent. The compiler experiment also
+prompted the schedule-level AdaLN measurement above; that result supersedes the
+earlier 4.4 ms single-table projection probe.
 
 ### Canonical weight layout — real, exact, below the gate
 
@@ -511,6 +566,40 @@ are a **disk format, not a compute format** — `h3 doctor` reports them as
 "dequantised at load — saves disk, not memory". They run bf16 matmuls and are
 unaffected by any of the above.
 
+### Prefix-refresh cache — clears speed, destroys dialogue
+
+The last cache proposal relaxed the consecutive cap while recomputing a small
+current prefix on every reuse. Instead of applying the previous step's entire
+50-block residual, prefix 2 ran blocks 0 and 1 on the current latent and reused
+only the cached residual of blocks 2–49. The threshold and per-stream audio veto
+were unchanged. Prefixes 2 and 3 were the only candidates to clear an offline
+5% block-work screen; prefix 2 ran first because it has the higher ceiling.
+
+A contemporaneous cap-5 control was necessary: the older control's full steps
+were 2.2% faster than the experiment's, enough to reverse a 5% decision. With
+the same build, prompt, seed and machine, the result was:
+
+| speaker arm | reuses | full-step median | reuse median | sampling | total |
+|---|---:|---:|---:|---:|---:|
+| cap-5 control | 10/20 | 61.47 s | 1.24 s | 626.22 s | 707.49 s |
+| prefix-2, cap 99 | 11/20 | 61.03 s | 2.50 s | 584.33 s | 678.27 s |
+
+That is a real **7.2% sampling gain**, but only **4.3% to a finished file** on
+this run. More importantly, it fails the quality gate decisively. Whisper found
+the requested sentence in the control with 5/5 content keywords and 100% recall.
+Prefix 2 produced repetitive Welsh-like output, 0/5 keywords, 0% recall, and
+failed the repetition guard. Face and landmarks remained present in 124/124
+frames, so this is not a collapsed render hiding behind an absent subject; it is
+the cross-stream coherence failure the per-stream probe was meant to prevent.
+The probe can veto a reuse, but refreshing two visual/audio transformer blocks
+does not make an eleven-step-old shared tail coherent.
+
+Prefix 3 was stopped during prompt processing. It has a strictly lower speed
+ceiling and no mechanism that addresses the stale tail that broke prefix 2.
+The environment lever and production path were removed after the run. Records:
+`docs/bench/speaker-cap5-current.h3-bench.json` and
+`docs/bench/speaker-prefix2.h3-bench.json`.
+
 **So the only remaining lever is fewer FLOPs**: sparse attention (36.9% of the
 forward — Sol-Attn measured and rejected on quality, axial measured and rejected
 in 6D) or fewer steps (the cache, shipped at 1.79× plus cap 5's 8–24%).
@@ -524,19 +613,23 @@ Every lever has now been measured rather than estimated:
 | cross-step cache | **shipped**, 1.79× |
 | consecutive cap 3 → 5 | **shipped**, 8.4–9.5% at 20 steps, 24.5% at 40 |
 | fused modulation | 0.94% — off by default |
-| AdaLN schedule batching | 0.37% — struck |
+| AdaLN schedule batching | 0.8–1.3%, 360–729 MiB and mode-dependent drift — struck |
+| fused Q/K RMSNorm plus RoPE | 4.2× locally, ~1.2% render-level and 1.08 ulp — test-only, struck |
 | dense-block compilation | 0.54–1.15% — struck |
 | weight layout / GEMM tuning | exact 3.0–3.1% full-step gain, below gate — struck |
 | GEMM efficiency in the model's own layout | model is *at* MLX's isolated rate, not 91% of it — nothing to reclaim |
 | int8 / int4 matmul | 1.2% — struck |
+| prefix-2 partial refresh | 7.2% sampling, 4.3% end-to-end; dialogue 5/5 → 0/5 keywords — rejected |
 | Sol-Attn sparse attention | rejected on quality |
 | axial-union topology | rejected on accuracy in 6D, no kernel written |
 
 What is left is not a tuning knob. It would be a hand-written Metal GEMM that
 beats MLX's, with no evidence yet that the hardware has headroom MLX is leaving;
-or a different cache design that refreshes the residual partially rather than
-all-or-nothing. Both are projects, not experiments, and neither should start
-without first establishing what the hardware can actually do.
+or a fundamentally different cache whose reused state is stream-aware rather
+than one shared stale tail. The bounded prefix-refresh version has now been
+measured and rejected. A hand-written GEMM or a redesigned cache are projects,
+not experiments, and neither should start without first establishing what the
+hardware can actually do.
 
 A third possibility exists and should be named rather than assumed away: a
 hand-written Metal GEMM that beats MLX's. That is a much larger undertaking
@@ -884,6 +977,7 @@ nobody was watching an option nobody used.
 | `--quality fast`, `--quality custom` | gone; `faithful` or `balanced` |
 | `H3_SOL_*` (7 variables) | Sol-Attn removed |
 | `H3_FUSED_MODULATION` | fused modulation removed |
+| `H3_CACHE_PREFIX_REFRESH` | prefix refresh rejected; production path removed |
 | `--attention-backend sol` | registry is SDPA only |
 
 Deleted with them: `SolAttn{Backend,Metal,Reference,Routing}.swift` and five

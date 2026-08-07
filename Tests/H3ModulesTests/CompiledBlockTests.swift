@@ -166,6 +166,86 @@ struct CompiledBlockTests {
         print("")
     }
 
+    /// Does projecting the complete known schedule once per block outperform
+    /// twenty small projections, after paying for cache-skipped blocks and the
+    /// persistent modulation tables? This is the shippable unit for roadmap
+    /// item 3; a single-call microbenchmark cannot answer it.
+    @Test(.enabled(if: ProcessInfo.processInfo.environment["H3_BIG"] != nil))
+    func adalnScheduleBatching() {
+        let cfg = H3Config()
+        let steps = 20
+        MLXRandom.seed(11)
+        let projection = AdalnProj(
+            weight: (MLXRandom.normal([cfg.adalnOutFeatures, cfg.timeEmbedDim]) * 0.02)
+                .asType(.bfloat16),
+            bias: nil, expand: 6, modalities: 3, hidden: cfg.hiddenSize,
+            computeFP32: true)
+
+        // Plain generation has one deduplicated timestep at sigma=1 and two
+        // thereafter. A paired visual+audio reference adds the pinned .999 and
+        // 1.0 rows: three at sigma=1, then four. Measure both supported shapes.
+        let scenarios: [(String, [Int])] = [
+            ("t2va", [1] + Array(repeating: 2, count: steps - 1)),
+            ("ref2va", [3] + Array(repeating: 4, count: steps - 1))
+        ]
+        for (label, rowsPerStep) in scenarios {
+            let perStep = rowsPerStep.map { rows in
+                (MLXRandom.normal([rows, cfg.timeEmbedDim]) * 0.009).asType(.bfloat16)
+            }
+            let wholeSchedule = concatenated(perStep, axis: 0)
+            MLX.eval(wholeSchedule)
+
+            let sequential = { perStep.flatMap { projection($0) } }
+            let batched = { projection(wholeSchedule) }
+
+            // Preserve the row order consumed by ModulationIndex: timestep,
+            // then modality, with the six expansion tables kept separate.
+            let byStep = perStep.map { projection($0) }
+            let expected = (0 ..< 6).map { expansion in
+                concatenated(byStep.map { $0[expansion] }, axis: 0)
+            }
+            let actual = batched()
+            MLX.eval(expected)
+            MLX.eval(actual)
+            var worstRel: Float = 0
+            var identical = true
+            for (a, b) in zip(expected, actual) {
+                let delta = a.asType(.float32) - b.asType(.float32)
+                let rel = MLX.sqrt(MLX.mean(delta * delta)).item(Float.self)
+                    / MLX.sqrt(MLX.mean(a.asType(.float32) * a.asType(.float32)))
+                        .item(Float.self)
+                worstRel = max(worstRel, rel)
+                identical = identical && MLX.all(a .== b).item(Bool.self)
+            }
+
+            let measured = BenchmarkSupport.interleavedArrays(first: sequential,
+                                                               second: batched)
+            let sequentialMs = measured.first * 1000
+            let batchedMs = measured.second * 1000
+            let denseSaving = (sequentialMs - batchedMs) * Double(cfg.numLayers) / 1000
+            let currentCalls = steps + (cfg.numLayers - 1) * 10 // cap 5: ten full
+            let currentCached = sequentialMs / Double(steps) * Double(currentCalls) / 1000
+            let batchedCached = batchedMs * Double(cfg.numLayers) / 1000
+            let cachedSaving = currentCached - batchedCached
+            let tableMiB = Double(wholeSchedule.dim(0) * cfg.adalnOutFeatures * 2
+                                  * cfg.numLayers) / 1_048_576
+
+            print(String(format: "\n  AdaLN %@ schedule (%d steps, %d input rows)",
+                         label as NSString, steps, wholeSchedule.dim(0)))
+            print(String(format: "  per block   sequential %.1f ms   batched %.1f ms   %.2fx",
+                         sequentialMs, batchedMs, sequentialMs / batchedMs))
+            print(String(format: "  dense render saving %.2f s; cap-5 estimate %.2f s",
+                         denseSaving, cachedSaving))
+            print(String(format: "  persistent tables %.0f MiB; rel RMS %.3e; bit-identical %@\n",
+                         tableMiB, worstRel, (identical ? "yes" : "no") as NSString))
+
+            // A larger M dimension selects a different GEMM accumulation path.
+            // A qualified speed result would therefore require a render gate.
+            #expect(worstRel < 1e-4,
+                    "schedule batching exceeded the block-level error bound")
+        }
+    }
+
     /// Does a larger compiled subgraph do better than one block at a time?
     ///
     /// The block boundary is a real barrier: `x1 = x + gate * attn(...)` ends

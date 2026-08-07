@@ -102,9 +102,8 @@ enum BenchmarkEmitter {
     /// and leaving it in would make two identical configurations compare as
     /// different.
     static func environmentOverrides() -> [String: String] {
-        var out = ProcessInfo.processInfo.environment
+        ProcessInfo.processInfo.environment
             .filter { $0.key.hasPrefix("H3_") && $0.key != "H3_BENCH_ARM" }
-        return out
     }
 
     /// Writes `<output>.h3-bench.json` and `<output>.h3-steps.csv`.

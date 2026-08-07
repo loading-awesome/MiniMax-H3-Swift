@@ -38,6 +38,46 @@ enum BenchmarkSupport {
         return (median(firstSamples), median(secondSamples))
     }
 
+    static func interleavedArrays(
+        rounds: Int = 5, first: () -> [MLXArray], second: () -> [MLXArray]
+    ) -> (first: Double, second: Double) {
+        MLX.eval(first())
+        MLX.eval(second())
+        var firstSamples: [Double] = []
+        var secondSamples: [Double] = []
+
+        func sample(_ body: () -> [MLXArray], into samples: inout [Double]) {
+            let t0 = Date()
+            MLX.eval(body())
+            samples.append(Date().timeIntervalSince(t0))
+        }
+        for round in 0 ..< rounds {
+            if round.isMultiple(of: 2) {
+                sample(first, into: &firstSamples)
+                sample(second, into: &secondSamples)
+                sample(second, into: &secondSamples)
+                sample(first, into: &firstSamples)
+            } else {
+                sample(second, into: &secondSamples)
+                sample(first, into: &firstSamples)
+                sample(first, into: &firstSamples)
+                sample(second, into: &secondSamples)
+            }
+        }
+        return (median(firstSamples), median(secondSamples))
+    }
+
+    static func medianArrays(rounds: Int = 10, _ body: () -> [MLXArray]) -> Double {
+        MLX.eval(body())
+        var samples: [Double] = []
+        for _ in 0 ..< rounds {
+            let t0 = Date()
+            MLX.eval(body())
+            samples.append(Date().timeIntervalSince(t0))
+        }
+        return median(samples)
+    }
+
     private static func median(_ values: [Double]) -> Double {
         precondition(!values.isEmpty)
         let sorted = values.sorted()
