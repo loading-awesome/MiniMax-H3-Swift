@@ -5,16 +5,27 @@
 *.pth
 *.mp4
 *.wav
-# ...except the two clips the README embeds. They are the only evidence a
+# ...except the clips the README embeds. They are the only evidence a
 # first-time reader has that any of this works, and a link to a file that is
 # not in the repository is worse than no link.
-!docs/media/*.mp4
+#
+# This said `docs/media` until 2026-08-10, a directory that has never existed;
+# the clips live in `demo-media`. They are tracked and the README works, so
+# they must have been force-added past the rule that was supposed to permit
+# them — which means the next person to add one would have found it silently
+# ignored and the link dead.
+!demo-media/*.mp4
 
 # build / env
 .build/
 .swiftpm/
 .venv/
 .DS_Store
+
+# Python bytecode from Tools/. Regenerated on every run of the analysis
+# scripts, so a tracked one shows up as a spurious change in unrelated work.
+__pycache__/
+*.pyc
 
 # secrets — belt and braces
 .env
