@@ -212,6 +212,22 @@ With a keyframe, add `--first-frame` (and `--last-frame`):
 h3 render --out out.mp4 --prompt "..." --first-frame shot.png --width 864 --height 480 --seconds 6 --steps 20
 ```
 
+Anchors elsewhere on the timeline go through `--keyframes`, as `path@frame`:
+
+```bash
+h3 render --out out.mp4 --prompt "..." --keyframes a.png@0 b.png@72 c.png@140 --width 864 --height 480 --seconds 6 --steps 20
+```
+
+Three things about those frame numbers. They index the **rendered** timeline,
+which is the requested duration snapped up onto the 17k+5 lattice — 6 s at 24 fps
+is 158 frames, so the last one is 157 and not the 143 the obvious arithmetic
+gives. `seconds * fps - 1` is refused for that reason rather than accepted more
+than half a second early; `--last-frame` resolves the end for you. And the
+positions are exact but the behaviour is not gated: fl2va was trained with
+conditioning at the two ends, so a middle anchor is out of distribution. It pins
+the rows to the right instant; whether the picture lands there is the model's
+call.
+
 > **`--conditioning-noise` is for reproducing reference results, and most people
 > should ignore it.** Keyframe rows are noise-augmented, and the reference draws
 > that noise from `torch.Generator("cpu")`, which MLX's PRNG cannot reproduce —

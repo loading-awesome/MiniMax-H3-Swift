@@ -142,6 +142,7 @@ package enum PipelineRuntime {
             ? ConditionEncoder.loadLatents(conditioningLatents.video)
             : ConditionEncoder.encodeVisual(request: request, videoVAE: checkpoints.videoVAE,
                                             width: width, height: height,
+                                            frameCount: geometry.frameCount,
                                             referenceVideoFrames: referenceVideoFrames, log: log)
         let audioLatents = try conditioningLatents.audio != nil
             ? ConditionEncoder.loadLatents(conditioningLatents.audio)

@@ -44,8 +44,12 @@ enum ConditioningEncoder {
         // packed sequence. The reference does both from the same image, so
         // dropping this half leaves the DiT conditioned on a prompt that never
         // mentions the picture it is being asked to start from.
-        let presented = [request.firstFrame, request.lastFrame].compactMap { $0 }
-            + request.referenceImages
+        // In resolved anchor order — ascending by frame — which is the order the
+        // packed layout's cond segments and the VAE encode both use. `<Picture
+        // N>` ordinals follow this list, so presenting them in a different order
+        // would describe the anchors to Qwen in an order the DiT does not see.
+        let presented = request.resolvedKeyframes(frameCount: request.alignedFrameCount)
+            .map(\.image) + request.referenceImages
         let hasReferences = !presented.isEmpty || !request.referenceVideos.isEmpty
             || !request.referenceAudio.isEmpty
 

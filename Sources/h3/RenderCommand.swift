@@ -68,6 +68,10 @@ struct RenderCommand: AsyncParsableCommand {
     @Option(help: "last-frame anchor")
     var lastFrame: String?
 
+    @Option(parsing: .upToNextOption,
+            help: "anchors as path@frame, e.g. shot.png@48; frames index the aligned timeline")
+    var keyframes: [String] = []
+
     @Option(parsing: .upToNextOption, help: "reference images, up to 9")
     var referenceImages: [String] = []
 
@@ -134,6 +138,7 @@ struct RenderCommand: AsyncParsableCommand {
             aspectRatio: aspectRatio, resolution: resolution,
             firstFrame: firstFrame.map(URL.init(fileURLWithPath:)),
             lastFrame: lastFrame.map(URL.init(fileURLWithPath:)),
+            keyframes: try keyframes.map(RenderRequest.Keyframe.init(spec:)),
             referenceImages: referenceImages.map(URL.init(fileURLWithPath:)),
             referenceVideos: referenceVideos.map(URL.init(fileURLWithPath:)),
             // An empty string is "silent", so a later video can still have one.

@@ -74,6 +74,48 @@ public struct RenderRequest: Sendable {
         public var isApproximate: Bool { self == .balanced }
     }
 
+    /// A still image anchored at one frame of the timeline.
+    public struct Keyframe: Sendable, Equatable, Codable {
+        public var image: URL
+        /// A **pixel** frame index, 0-based, into the *aligned* timeline —
+        /// ``RenderRequest/alignedFrameCount``, not `seconds * fps`. The two
+        /// differ whenever the requested duration is off the 17k+5 lattice,
+        /// which is most of the time.
+        public var frame: Int
+
+        public init(image: URL, frame: Int) {
+            self.image = image
+            self.frame = frame
+        }
+
+        /// `path@frame`, the CLI's spelling.
+        ///
+        /// Split at the **last** `@`, so a path may contain one — `@` is legal
+        /// in a filename and splitting at the first would truncate the path and
+        /// then fail to parse a frame out of the rest, reporting the wrong
+        /// problem. It lives here rather than in the command because the command
+        /// has no test target, and a parser nobody can test is a parser nobody
+        /// has checked.
+        public init(spec: String) throws {
+            guard let at = spec.lastIndex(of: "@") else {
+                throw H3Error.invalidRequest(
+                    rule: "malformed keyframe", detail: "'\(spec)' has no @",
+                    remedy: "spell an anchor as path@frame, e.g. shot.png@48.")
+            }
+            let path = String(spec[spec.startIndex ..< at])
+            let index = String(spec[spec.index(after: at)...])
+            guard !path.isEmpty, let frame = Int(index) else {
+                throw H3Error.invalidRequest(
+                    rule: "malformed keyframe",
+                    detail: path.isEmpty ? "'\(spec)' has no path before its @"
+                                         : "'\(index)' is not a frame number",
+                    remedy: "spell an anchor as path@frame, e.g. shot.png@48. The frame is a "
+                          + "0-based index into the aligned timeline.")
+            }
+            self.init(image: URL(fileURLWithPath: path), frame: frame)
+        }
+    }
+
     // MARK: what to render
 
     public var prompt: String
@@ -101,6 +143,18 @@ public struct RenderRequest: Sendable {
 
     public var firstFrame: URL?
     public var lastFrame: URL?
+    /// Still images anchored at chosen frames, beyond the two ends.
+    ///
+    /// **`firstFrame` and `lastFrame` are the same mechanism** — sugar for
+    /// anchors at 0 and `alignedFrameCount - 1`. They are kept because they are
+    /// the two positions the model was trained with, and because naming the end
+    /// is safer than computing it (see `validate()`).
+    ///
+    /// An anchor away from the ends is positionally exact and behaviourally
+    /// untested: fl2va saw conditioning at the ends during training, so a middle
+    /// anchor is out of distribution. It pins rows to the right instant; the
+    /// model is not promised to land on them.
+    public var keyframes: [Keyframe]
     public var referenceImages: [URL]
     public var referenceVideos: [URL]
     /// Index-matched to `referenceVideos`; nil leaves that video silent.
@@ -203,6 +257,7 @@ public struct RenderRequest: Sendable {
                 resolution: ResolutionTier = .p768,
                 firstFrame: URL? = nil,
                 lastFrame: URL? = nil,
+                keyframes: [Keyframe] = [],
                 referenceImages: [URL] = [],
                 referenceVideos: [URL] = [],
                 referenceVideoSoundtracks: [URL?] = [],
@@ -227,6 +282,7 @@ public struct RenderRequest: Sendable {
         self.resolution = resolution
         self.firstFrame = firstFrame
         self.lastFrame = lastFrame
+        self.keyframes = keyframes
         self.referenceImages = referenceImages
         self.referenceVideos = referenceVideos
         self.referenceVideoSoundtracks = referenceVideoSoundtracks
@@ -271,16 +327,62 @@ public struct RenderRequest: Sendable {
         if !referenceImages.isEmpty || !referenceVideos.isEmpty || !referenceAudio.isEmpty {
             return .reference
         }
-        if firstFrame != nil || lastFrame != nil { return .firstLastFrame }
+        if hasAnchors { return .firstLastFrame }
         return .textToVideo
     }
 
     public var modeDescription: String {
-        if firstFrame != nil || lastFrame != nil { return "first/last-frame interpolation" }
+        if hasAnchors {
+            let n = anchorCount
+            return n <= 2 && keyframes.isEmpty
+                ? "first/last-frame interpolation"
+                : "keyframe interpolation, \(n) anchors"
+        }
         if !referenceVideos.isEmpty { return "video reference" }
         if !referenceAudio.isEmpty { return "audio reference" }
         if !referenceImages.isEmpty { return "image reference" }
         return "text to video and audio"
+    }
+
+    /// Whether this request carries any visual anchor, of either spelling.
+    /// Anchors select the fl2va partition, so this is what `mode` turns on.
+    public var hasAnchors: Bool {
+        firstFrame != nil || lastFrame != nil || !keyframes.isEmpty
+    }
+
+    public var anchorCount: Int {
+        (firstFrame == nil ? 0 : 1) + (lastFrame == nil ? 0 : 1) + keyframes.count
+    }
+
+    /// The frame count the render will actually have.
+    ///
+    /// **Anchor indices are indices into this, not into `seconds * fps`.** The
+    /// requested duration is snapped *up* onto the 17k+5 lattice before anything
+    /// downstream sees it, so 5 s at 24 fps is 124 frames and the last one is
+    /// 123 — not the 119 the arithmetic a caller is likely to do produces.
+    public var alignedFrameCount: Int {
+        LatentGeometry.alignFrameCount(seconds * H3Video.fps)
+    }
+
+    /// Every visual anchor, in the one order all three consumers must agree on:
+    /// **ascending by frame**.
+    ///
+    /// The packed layout, the VAE encode and the `<Picture N>` presentation each
+    /// walk this list positionally and independently. If they disagreed, the
+    /// k-th cond segment would carry the k-th image at some other image's
+    /// instant — every shape valid, every anchor wrong. So there is one list and
+    /// they all call it.
+    ///
+    /// The sort is stable in the index a caller supplied, which matters only if
+    /// two anchors share a frame — and `validate()` refuses that.
+    package func resolvedKeyframes(frameCount: Int) -> [Keyframe] {
+        var all: [Keyframe] = []
+        if let f = firstFrame { all.append(Keyframe(image: f, frame: 0)) }
+        if let l = lastFrame { all.append(Keyframe(image: l, frame: frameCount - 1)) }
+        all += keyframes
+        return all.enumerated()
+            .sorted { ($0.element.frame, $0.offset) < ($1.element.frame, $1.offset) }
+            .map(\.element)
     }
 
     public var usesApproximateSampling: Bool { cacheThreshold > 0 }
@@ -379,7 +481,8 @@ public struct RenderRequest: Sendable {
             throw H3Error.tooManyReferences(kind: "audio", got: referenceAudio.count, limit: 3)
         }
 
-        let hasAnchors = firstFrame != nil || lastFrame != nil
+        try validateAnchors()
+
         let hasReferences = !referenceImages.isEmpty || !referenceVideos.isEmpty
             || !referenceAudio.isEmpty || !referenceVideoSoundtracks.isEmpty
         if hasAnchors && hasReferences {
@@ -411,6 +514,62 @@ public struct RenderRequest: Sendable {
             throw H3Error.invalidRequest(
                 rule: "negative cache threshold", detail: "\(cacheThreshold)",
                 remedy: "0 disables the cache; 0.10 is the measured knee.")
+        }
+    }
+
+    /// The anchor half of `validate()`.
+    ///
+    /// Every rule here guards a mistake that would otherwise render — the packed
+    /// layout only refuses an index off the timeline, and everything else it
+    /// accepts, correctly, at whatever instant it was given.
+    private func validateAnchors() throws {
+        let frames = alignedFrameCount
+        let last = frames - 1
+
+        // A cap, and it is not arbitrary: one anchor per second across the
+        // longest render the model covers, plus the closing one. 15 s is 362
+        // frames, so 0, 24, ... 360 is 16. Each anchor costs its rows twice —
+        // one cond segment in the packed sequence *and* one `<Picture N>` block
+        // in the text span — which is ~26% more sequence at this density and
+        // roughly 1.6x the attention work.
+        guard anchorCount <= 16 else {
+            throw H3Error.tooManyReferences(kind: "keyframe anchor", got: anchorCount, limit: 16)
+        }
+
+        for kf in keyframes {
+            guard kf.frame >= 0, kf.frame < frames else {
+                throw H3Error.keyframeIndex(index: kf.frame, frameCount: frames)
+            }
+            // The trap the layout used to catch by refusing every middle index.
+            // `seconds * fps - 1` is the "last frame" a caller computes, and it
+            // is short of the real end whenever the duration was off-lattice —
+            // an anchor placed a fraction of a second early, with every shape
+            // still correct. It costs one legal index to refuse it here, and the
+            // message names both ways to say what was meant.
+            if kf.frame == seconds * H3Video.fps - 1 && kf.frame != last {
+                throw H3Error.invalidRequest(
+                    rule: "anchor on the unaligned end",
+                    detail: "frame \(kf.frame) is `seconds * fps - 1`, but this render is "
+                          + "\(frames) frames — the duration snapped up onto the 17k+5 lattice, "
+                          + "so the last frame is \(last)",
+                    remedy: "use frame \(last), or `lastFrame`, which resolves the end for you. "
+                          + "If you did mean \(kf.frame), it is \(last - kf.frame) frame(s) "
+                          + "early — ask for it as a fraction of \(frames).")
+            }
+        }
+
+        var seen: [Int: Int] = [:]
+        for kf in resolvedKeyframes(frameCount: frames) {
+            seen[kf.frame, default: 0] += 1
+            guard seen[kf.frame] == 1 else {
+                let named = kf.frame == 0 ? " (which is where `firstFrame` sits)"
+                    : kf.frame == last ? " (which is where `lastFrame` sits)" : ""
+                throw H3Error.invalidRequest(
+                    rule: "duplicate anchor",
+                    detail: "two anchors claim frame \(kf.frame)\(named)",
+                    remedy: "one image per frame; the layout would stack both cond segments at "
+                          + "the same instant and the later one would not obviously win.")
+            }
         }
     }
 

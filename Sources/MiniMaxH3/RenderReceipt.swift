@@ -23,6 +23,10 @@ public struct RenderReceipt: Codable, Sendable {
         public let referenceImages: Int
         public let referenceVideos: Int
         public let referenceAudio: Int
+        /// Visual anchors, counting `firstFrame` and `lastFrame`. Their frame
+        /// positions are not recorded: this file is meant to be shareable, and
+        /// an anchor schedule describes the content.
+        public let keyframeAnchors: Int
     }
 
     public struct Environment: Codable, Sendable {
@@ -79,7 +83,10 @@ public struct RenderReceipt: Codable, Sendable {
     init(jobID: UUID, request: RequestSummary, environment: Environment) {
         // 2 adds `benchmarkArm`, `secondsPerStep`, and a `model_load` phase
         // that used to be counted in no phase at all.
-        schemaVersion = 2
+        // 3 adds `request.keyframeAnchors`. A v2 reader ignores it; a v3 reader
+        // handed a v2 file fails on the missing key, which is what the version
+        // is for.
+        schemaVersion = 3
         self.jobID = jobID
         status = .running
         startedAt = .now

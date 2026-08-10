@@ -106,6 +106,38 @@ package enum PositionGrid {
     package static func videoTSpan(_ n: Int) -> Double {
         (0 ..< n).reduce(0.0) { $0 + frameRescale * Double(framesPerToken[$1 % framesPerToken.count]) }
     }
+
+    /// The t coordinate of a keyframe anchored at pixel frame `p`.
+    ///
+    /// Latent token `k` spans `frameRescale * framesPerToken[k % 5]` and covers
+    /// `framesPerToken[k % 5]` pixel frames, so cumulative time at pixel frame
+    /// `p` is exactly `frameRescale * p`. That identity is what makes an anchor
+    /// away from the ends *defined* rather than guessed: substituting
+    /// `p = frameCount - 1` reproduces the reference's own last-frame
+    /// expression, because `sum(framesPerToken over latentT) == frameCount` on
+    /// the 17k+5 lattice.
+    ///
+    ///     textTokens + frameRescale * (frameCount - 1)
+    ///       == textTokens + frameRescale * frameCount - frameRescale
+    ///       == textTokens + videoTSpan(latentT) - frameRescale
+    ///
+    /// **The two endpoints keep the reference's expressions rather than the
+    /// general form.** They are mathematically identical, but the reference
+    /// accumulates `latentT` float additions where the general form does one
+    /// multiply, and the two disagree in the last bits (~7e-15 at F = 362).
+    /// Reusing them means every existing first/last render produces
+    /// byte-identical positions, so widening this cannot move an L1 verdict.
+    ///
+    /// `p` is a **pixel** frame index on the aligned lattice, not a latent one,
+    /// and the caller is responsible for having aligned it. Range is not checked
+    /// here; `PackedLayout` refuses out-of-range anchors where it knows the
+    /// frame count.
+    package static func condT(textTokens: Int, latentT: Int, frameCount: Int,
+                              pixelIndex p: Int) -> Double {
+        if p == 0 { return Double(textTokens) }
+        if p == frameCount - 1 { return Double(textTokens) + videoTSpan(latentT) - frameRescale }
+        return Double(textTokens) + frameRescale * Double(p)
+    }
 }
 
 package struct KeyframeConfig: Sendable, Equatable {
@@ -153,10 +185,9 @@ package struct PackedLayout: Sendable, Equatable {
     /// Row-major `[S, 3]` of `(t, h, w)`, in float64 as the reference builds it.
     package let positionIds: [Double]
 
-    /// - Throws: `H3Error.keyframeIndex` for an anchor the reference defines no
-    ///   `cond_t` for. This was a `preconditionFailure`, which in a library
-    ///   takes the host application down over a value the caller is entitled to
-    ///   get wrong.
+    /// - Throws: `H3Error.keyframeIndex` for an anchor off the timeline. This
+    ///   was a `preconditionFailure`, which in a library takes the host
+    ///   application down over a value the caller is entitled to get wrong.
     package init(textTokens: Int, geometry: LatentGeometry,
                 keyframes: [KeyframeConfig] = [], refs: [ReferenceBlock] = []) throws {
         self.textTokens = textTokens
@@ -179,21 +210,24 @@ package struct PackedLayout: Sendable, Equatable {
 
         // 2. Keyframes (fl2va)
         for kf in keyframes {
-            // The reference supports exactly two anchors and raises on anything
-            // else. A middle index has no defined `cond_t`, so accepting one and
-            // quietly treating it as the last frame would pin the keyframe to
-            // the wrong instant with every shape still correct.
-            let condT: Double
-            switch kf.resolvedFrameIndex {
-            case 0:
-                condT = Double(textTokens)
-            case geometry.frameCount - 1:
-                let tSpan = PositionGrid.videoTSpan(geometry.latentT)
-                condT = Double(textTokens) + tSpan - PositionGrid.frameRescale
-            default:
+            // The reference raises on any anchor that is not an end, but only
+            // because it never derives the general position — the two branches
+            // it does define are one expression evaluated at its endpoints, and
+            // `condT` carries the derivation. What stays refused is an index off
+            // the timeline entirely, which has no coordinate at all.
+            //
+            // Anchors away from the ends are *positionally* exact and
+            // *behaviourally* untested: fl2va was trained with conditioning at
+            // the ends, so a middle anchor is out of distribution. It pins the
+            // rows to the right instant; it does not promise the model lands on
+            // them.
+            guard kf.resolvedFrameIndex >= 0, kf.resolvedFrameIndex < geometry.frameCount else {
                 throw H3Error.keyframeIndex(index: kf.resolvedFrameIndex,
                                             frameCount: geometry.frameCount)
             }
+            let condT = PositionGrid.condT(textTokens: textTokens, latentT: geometry.latentT,
+                                           frameCount: geometry.frameCount,
+                                           pixelIndex: kf.resolvedFrameIndex)
             segments.append(PackedSegment(start: row, stop: row + frame.count, kind: .cond))
             for r in frame { pos.append(contentsOf: [condT, r.h, r.w]) }
             row += frame.count

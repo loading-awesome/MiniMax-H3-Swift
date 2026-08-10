@@ -153,10 +153,10 @@ public enum H3Error: Error, CustomStringConvertible, Sendable {
                  + "17k+5 lattice, so 4 s becomes 107 — the only value in the whole 4-15 s "
                  + "range that lands under the floor. Ask for 5 s or more."
         case let .keyframeIndex(index, frameCount):
-            return "keyframe anchor at frame \(index) is neither the first (0) nor the last "
-                 + "(\(frameCount - 1)). The reference defines cond_t for those two positions "
-                 + "only; a middle index has no defined value and would pin the anchor to the "
-                 + "wrong instant with every shape still correct."
+            return "keyframe anchor at frame \(index) is outside 0...\(frameCount - 1). Anchors "
+                 + "are pixel frame indices on the *aligned* timeline: the requested length is "
+                 + "snapped up onto the 17k+5 lattice first, so an index derived from the "
+                 + "duration you asked for can land short of the end rather than on it."
         case let .dimensionOffGrid(width, height, multiple):
             return "\(width)x\(height) is not a multiple of \(multiple) on both axes. The VAE "
                  + "downsamples by 16 and the DiT patchifies by 2, so an off-grid size produces "

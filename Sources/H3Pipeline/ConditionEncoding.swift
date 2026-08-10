@@ -73,12 +73,15 @@ enum ConditionEncoder {
     /// its rows at coordinates the target never visits. Reference images are
     /// independent blocks with their own grid, so they keep their own size.
     static func encodeVisual(request: RenderRequest, videoVAE url: URL,
-                             width: Int, height: Int,
+                             width: Int, height: Int, frameCount: Int,
                              referenceVideoFrames: [MLXArray],
                              log: (String) -> Void = { _ in }) throws -> [MLXArray] {
-        var paths: [(URL, Bool)] = []                       // (url, fitToTarget)
-        if let f = request.firstFrame { paths.append((f, true)) }
-        if let l = request.lastFrame { paths.append((l, true)) }
+        // Anchors in resolved order, which is ascending by frame — the same
+        // order `assemble` builds the cond segments in and the same order the
+        // text encoder presents `<Picture N>`. All three read it from the
+        // request rather than each deriving it.
+        var paths: [(URL, Bool)] = request.resolvedKeyframes(frameCount: frameCount)
+            .map { ($0.image, true) }                       // (url, fitToTarget)
         paths += request.referenceImages.map { ($0, false) }
         guard !paths.isEmpty || !referenceVideoFrames.isEmpty else { return [] }
 
@@ -139,14 +142,12 @@ enum ConditionEncoder {
                          recordedNoise: [MLXArray],
                          log: (String) -> Void = { _ in }) throws -> EncodedConditions {
 
-        var keyframes: [KeyframeConfig] = []
-        if request.firstFrame != nil { keyframes.append(KeyframeConfig(resolvedFrameIndex: 0)) }
-        // The last anchor sits on the *aligned* frame count, not on the
-        // requested duration: the request is snapped up onto the 17k+5 lattice
-        // before anything else sees it.
-        if request.lastFrame != nil {
-            keyframes.append(KeyframeConfig(resolvedFrameIndex: geometry.frameCount - 1))
-        }
+        // Anchors sit on the *aligned* frame count, not on the requested
+        // duration: the request is snapped up onto the 17k+5 lattice before
+        // anything else sees it. `resolvedKeyframes` is what resolves
+        // `lastFrame` against it, and orders the whole set.
+        let anchors = request.resolvedKeyframes(frameCount: geometry.frameCount)
+        let keyframes = anchors.map { KeyframeConfig(resolvedFrameIndex: $0.frame) }
 
         let wantVisual = keyframes.count + request.referenceImages.count
             + request.referenceVideos.count

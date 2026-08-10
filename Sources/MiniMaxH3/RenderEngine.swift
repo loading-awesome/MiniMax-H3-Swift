@@ -160,7 +160,8 @@ private enum RenderOperation {
                 cacheThreshold: request.cacheThreshold,
                 referenceImages: request.referenceImages.count,
                 referenceVideos: request.referenceVideos.count,
-                referenceAudio: request.referenceAudio.count),
+                referenceAudio: request.referenceAudio.count,
+                keyframeAnchors: request.anchorCount),
             environment: .init(
                 libraryVersion: MiniMaxH3.version,
                 operatingSystem: ProcessInfo.processInfo.operatingSystemVersionString,
@@ -292,6 +293,7 @@ private enum RenderOperation {
         var result = message
         var urls = request.referenceImages + request.referenceVideos + request.referenceAudio
         urls.append(contentsOf: request.referenceVideoSoundtracks.compactMap { $0 })
+        urls.append(contentsOf: request.keyframes.map(\.image))
         urls.append(contentsOf: [request.firstFrame, request.lastFrame,
                                  request.conditioningNoise, request.audioOutput].compactMap { $0 })
         urls.append(request.videoOutput)
@@ -330,6 +332,7 @@ private enum Preflight {
         inputURLs.append(contentsOf: request.referenceVideos)
         inputURLs.append(contentsOf: request.referenceAudio)
         inputURLs.append(contentsOf: request.referenceVideoSoundtracks.compactMap { $0 })
+        inputURLs.append(contentsOf: request.keyframes.map(\.image))
         inputURLs.append(contentsOf: [request.firstFrame, request.lastFrame,
                                       request.conditioningNoise].compactMap { $0 })
         for input in inputURLs {
