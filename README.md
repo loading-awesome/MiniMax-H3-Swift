@@ -3,100 +3,44 @@
 Type a sentence, get a video **with the sound already in it**. No GPU rental, no
 Python environment, no node graph. One command, on your Mac.
 
-[![A drag race](demo-media/race.jpg)](demo-media/race.mp4)
-
-<sub>**A drag race.** 864×480, 7 s, 20 steps. Two speakers — the dialogue, both
-engines and the music were generated *together with the picture*, nothing was
-dubbed on afterwards. Click any still to get the clip; GitHub will not play
-video inline in a README.</sub>
-
 ```bash
 h3 render --prompt "a red kite over a beach at sunset" --out kite.mp4
 ```
 
-### Two more, one command each
+[![A drag race](demo-media/race.jpg)](demo-media/race.mp4)
 
-No flags — 864×480, 7 s, 20 steps, about 19 minutes apiece on a Mac Studio
-when they were rendered. The default has since got faster; see below.
-
-[![An anime girl at her computer](demo-media/anime.jpg)](demo-media/anime.mp4)
-
-<sub>**An anime girl at her computer.** Rain on the window and a piano under it.</sub>
-
-[![Two officers on a starship bridge](demo-media/scifi.jpg)](demo-media/scifi.mp4)
-
-<sub>**Two officers on a starship bridge.** Dialogue over ship tone and strings.</sub>
-
----
-
-## What this is
+<sub>**A drag race.** 864×480, 7 s. Two speakers — the dialogue, both engines and
+the music were generated *together with the picture*, nothing was dubbed on
+afterwards. Click any still for the clip; GitHub will not play video inline.</sub>
 
 [MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) is an open-weights
 video model that is unusual in one specific way: **it generates the picture and
-the soundtrack in a single pass.** Most video models hand you a silent clip and
-leave you to add audio. H3 moves a character's lips and produces the voice
-saying those words at the same time, from the same prompt.
-
-`h3` is a native Swift and [MLX](https://github.com/ml-explore/mlx) port of it
-for Apple silicon — a command-line tool and a Swift library, with no Python
+the soundtrack in a single pass.** It moves a character's lips and produces the
+voice saying those words at the same time, from the same prompt. `h3` is a native
+Swift and [MLX](https://github.com/ml-explore/mlx) port of it, with no Python
 anywhere in it.
 
-**It is not a small, friendly download.** The model is 124 GB of weights and the
-clip above took about twenty minutes on a Mac Studio. Please read the next
-section before you get attached to the idea.
+---
 
 ## Will it run on my Mac?
 
-Probably not, and I would rather say so here than have you find out after a very
-long download. Two things gate it, and **the disk usually stops people first**:
+**Probably not**, and I would rather say so before you download 124 GB. The disk
+usually stops people first.
 
 | | you need |
 |---|---|
-| **memory** | 96 GB unified memory, realistically 128 GB |
-| **disk** | 124 GB free for text-to-video, 190 GB for everything |
+| **memory** | 96 GB unified, realistically 128 GB |
+| **disk** | 124 GB for text-to-video, 190 GB for everything |
 | **chip** | any Apple silicon (M1 or later) |
 | **macOS** | 14 or later |
 
-Which works out as:
+A MacBook Air cannot *store* the model, never mind run it. 48–64 GB Macs are
+**not yet** supported — two specific pieces of work would get there, both listed
+under [Status](#status). 96 GB and up: yes.
 
-| Mac | verdict |
-|---|---|
-| MacBook Air, any configuration | **no.** A 16 GB Air with a 256 GB drive cannot *store* the model, never mind run it. |
-| MacBook Pro or mini, 16–36 GB | no |
-| M4 Pro, 48 GB | not yet — needs the work listed under [Status](#status) |
-| M4 Max, 64 GB | not yet |
-| **96 GB or more** | yes |
-| **Mac Studio, 128 GB+** | yes, comfortably |
-
-I would like this to reach further down the range, and it does not yet. Two
-specific pieces of work would bring it to roughly 48 GB — keeping the weights
-quantised in memory, and decoding the video in chunks. Neither is done, and
-neither is hand-waving: they are the two items at the top of [Status](#status).
-
-`h3 doctor` answers the question for your actual machine in about a second. It
-reads file headers, not file bodies, so it is fast even against 66 GB files:
-
-```
-$ h3 doctor
-machine
-  Apple M3 Ultra (Mac15,14), 275 GB unified memory, 28 cores
-  145 GB available right now (free + inactive + speculative)
-
-memory plan at 15750 packed tokens
-  bf16         peak   98.7 GB   FITS, +32 GB headroom
-  int8         peak   98.7 GB   FITS, +32 GB headroom   [dequantised at load — saves disk, not memory]
-  pruned_bf16  peak   73.8 GB   refused (approximate weights)
-
-selected: bf16
-  textEncode   53.5 GB
-  vaeEncode     7.8 GB
-  sampling     98.7 GB   <- peak
-  decode       13.9 GB
-  available   145.9 GB
-  headroom     +32.4 GB after a 15% margin
-
-no problems found
-```
+`h3 doctor` answers this for your actual machine in about a second, reading file
+headers rather than file bodies. It ends with `no problems found` when you are
+ready.
 
 ---
 
@@ -106,15 +50,14 @@ no problems found
 
 ### [⬇ Download the latest release](https://github.com/loading-awesome/MiniMax-H3-Swift/releases/latest)
 
-Take the **`.pkg`** and double-click it. It puts `h3` on your path, and you can
-then open Terminal and type:
+Take the **`.pkg`** and double-click it. Then:
 
 ```bash
 h3 doctor
 ```
 
 <details>
-<summary>Or take the <code>.zip</code>, if you would rather not run an installer</summary>
+<summary>Or the <code>.zip</code>, if you would rather not run an installer</summary>
 
 Unpack it and keep `h3` and `mlx.metallib` **in the same folder** — `h3` looks
 for its GPU kernels beside itself and will not start without them.
@@ -134,15 +77,6 @@ sudo ln -sf /usr/local/lib/h3/h3 /usr/local/bin/h3
 The symlink is fine; `h3` resolves symlinks before looking for the kernels.
 </details>
 
-> **If macOS says the file is damaged or from an unidentified developer**, you
-> have an unsigned build — a build made from source, or from a release cut
-> before signing was set up. Clear the quarantine flag once, in the folder you
-> unpacked into:
->
-> ```bash
-> xattr -dr com.apple.quarantine h3
-> ```
-
 <details>
 <summary><b>Or build it from source</b></summary>
 
@@ -156,18 +90,22 @@ swift build -c release
 .build/release/h3 doctor
 ```
 
-`bootstrap-metal.sh` is not optional. SwiftPM does not build MLX's Metal
-kernels — mlx-swift compiles those in its Xcode project — so without it the
-first render dies with an unhelpful C++ error naming no file.
+`bootstrap-metal.sh` is not optional. SwiftPM does not build MLX's Metal kernels,
+so without it the first render dies with an unhelpful C++ error naming no file.
 See [CONTRIBUTING.md](CONTRIBUTING.md).
 </details>
+
+> **If macOS says the file is damaged or from an unidentified developer**, you
+> have an unsigned build. Clear the quarantine flag once:
+> ```bash
+> xattr -dr com.apple.quarantine h3
+> ```
 
 ## 2. Get the model files
 
 The weights are **not** in this repository and are licensed separately by
-MiniMax. You need these, from the single-file conversions published for
-[WanGP](https://github.com/deepbeepmeep/Wan2GP) on Hugging Face, which are
-derived from [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3):
+MiniMax. Take the single-file conversions published for
+[WanGP](https://github.com/deepbeepmeep/Wan2GP) on Hugging Face:
 
 | file | size | what it does |
 |---|---|---|
@@ -182,13 +120,7 @@ Plus a tokenizer folder holding `vocab.json`, `merges.txt` and
 
 **You do not need both of the big ones to start.** `FL2VA` alone gives you
 text-to-video and frame anchors, which is most of what people want — 124 GB
-instead of 190 GB.
-
-Put them anywhere you like; `h3` never moves or copies them.
-
-> You will also see `int8` and `pruned` versions with smaller file sizes. They
-> are worth knowing about and mostly will not help yet — see
-> [Speed and quality](#speed-and-quality).
+instead of 190 GB. Put them anywhere; `h3` never moves or copies them.
 
 ## 3. Point `h3` at them
 
@@ -197,8 +129,7 @@ h3 config init
 ```
 
 That writes `~/.config/minimax-h3/config.json` with the filenames already filled
-in. Open it and set two things — the folder your models are in, and the
-tokenizer:
+in. Set two things — the folder your models are in, and the tokenizer:
 
 ```json
 {
@@ -209,16 +140,9 @@ tokenizer:
 }
 ```
 
-Then check your work:
-
-```bash
-h3 doctor
-```
-
-Every file is identified **from its own header, not from its name**, so one that
-has been renamed, truncated or converted differently is reported as what it
-actually is rather than what it claims. Anything missing is listed with the path
-that was checked. When it says **`no problems found`**, you are ready.
+Then `h3 doctor` again. Every file is identified **from its own header, not its
+name**, so one that has been renamed, truncated or converted differently is
+reported as what it actually is. When it says `no problems found`, you are ready.
 
 ## 4. Render something
 
@@ -240,14 +164,12 @@ h3 render --prompt "a red kite over a beach at sunset" --out kite.mp4
 
 The countdown is measured from **your** render rather than read from a table, so
 it settles after a couple of steps and then tracks reality. The one-line estimate
-above it does not yet know about the cache, so on the default profile it reads
-high until the countdown takes over.
-
-Two flags worth knowing straight away:
+above it does not account for the cache, so on the default profile it reads high
+until the countdown takes over.
 
 ```bash
-h3 render --prompt "..." --out out.mp4 --dry-run           # what would this cost? (1 second)
-h3 render --prompt "..." --out out.mp4 --quality faithful   # nothing approximated, ~2x slower
+h3 render --prompt "..." --out out.mp4 --dry-run          # what would this cost? (1 second)
+h3 render --prompt "..." --out out.mp4 --quality faithful  # nothing approximated, ~2x slower
 ```
 
 ---
@@ -257,9 +179,10 @@ h3 render --prompt "..." --out out.mp4 --quality faithful   # nothing approximat
 | you want | how |
 |---|---|
 | video from a description | just `--prompt` |
-| a character who speaks | put the words in the prompt (below) |
+| a character who speaks | put the words in the prompt |
 | start from your photo | `--first-frame photo.png` |
 | start here, end there | `--first-frame a.png --last-frame b.png` |
+| pass through a shot mid-clip | `--keyframes b.png@48` |
 | a consistent character | `--reference-images face1.png face2.png` |
 | match a clip's motion | `--reference-videos clip.mp4` |
 | lip-sync to your own audio | `--reference-audio speech.wav` |
@@ -272,8 +195,8 @@ the job.
 
 ### Making a character talk
 
-Put the dialogue in the prompt with a speaker tag. The lip movement and the
-voice come out of the same pass:
+Put the dialogue in the prompt with a speaker tag. The lip movement and the voice
+come out of the same pass:
 
 ```bash
 h3 render --out hello.mp4 --prompt \
@@ -281,79 +204,32 @@ h3 render --out hello.mp4 --prompt \
    <d>[English] This is running on Apple silicon now.</d>'
 ```
 
-The clip at the top of this page uses two speakers, `(S1)` and `(S2)`.
+Measured on that clip: the audio transcribed back with Whisper at a **word error
+rate of 0.00**, and a face detected with landmarks in **124 of 124 frames**.
+
+[![A woman in a kitchen](demo-media/talking-head.jpg)](demo-media/talking-head.mp4)
+
 [docs/PROMPTING.md](docs/PROMPTING.md) has the full grammar — camera moves,
 soundscape, music — and is worth ten minutes if you want reliable results.
 
----
+### Frame anchors
 
-## Speed and quality
+`--first-frame` and `--last-frame` pin a still to the two ends. `--keyframes
+image.png@48` pins one anywhere, as `path@frame`.
 
-Measured on a Mac Studio (M3 Ultra) at 864×480, 5 seconds, 20 steps:
+Anchors land where you put them: measured on a three-anchor render, each anchor
+reproduced its own frame at a normalised cross-correlation of **0.999**, against
+a 0.850 baseline for how alike the anchors were to each other, and the frames
+between them interpolated rather than cutting. That was one clip — the two ends
+are what the model was trained on, and a middle anchor is out of distribution, so
+it is measured to work rather than guaranteed to.
 
-| quality | time | what changes |
-|---|---|---|
-| `balanced` *(default)* | **11.4–11.8 min** | reuses work between steps — **16% less fine detail** |
-| `faithful` | **21.1–21.5 min** | nothing is approximated |
-
-Ranges are the spread across five different prompts, not a single run.
-
-There were three profiles and a set of cache tuning flags. They existed to be
-swept, the sweeps finished, and the answers are now constants — threshold 0.10,
-at most five consecutive reuses, a per-stream probe. A `fast` profile went with
-them: it had never been rendered, watched or tested, and cost nearly twice
-`balanced`'s detail. What is left is the one choice that is genuinely yours,
-which is whether to approximate at all.
-
-**`balanced` is the default, and it is an approximation.** It reuses one step's
-work in the next when the step barely moved, which measures **1.85× faster** for
-16% less fine detail. On a twenty-minute render that is the trade almost
-everybody wants, and finding out afterwards that a flag would have halved it is
-worse than the 16%.
-
-**Asking for more steps is close to free.** Doubling to 40 steps takes 12.2
-minutes against 11.7 for 20 — about 4% more wall clock for twice the sampling.
-A finer schedule moves the latent less per step, so more steps fall below the
-reuse threshold and the cache absorbs almost all of the extra work: it skips 75%
-of them at 40 steps against 50% at 20.
-
-It says so on every run and it is recorded in the render's receipt, so nobody
-discovers months later that their comparison was against a shortcut. That
-disclosure is the part that matters, and it never depended on which profile was
-the default.
-
-```bash
-h3 render --prompt "..." --out out.mp4 --quality faithful   # nothing approximated
-```
-
-Larger costs more than proportionally: attention grows with the *square* of the
-sequence length, so doubling the resolution roughly quadruples the time.
-`--dry-run` tells you before you commit twenty minutes.
-
-**A dry run prices a shape; it does not prove one will run.** It returns before
-`engine.start()`, so it never reaches the memory admission check — it will
-print a confident estimate for a configuration the machine then refuses. Asked
-for 12 seconds at 576x1024 it printed "about 2h 04m of sampling" for 51,604
-packed tokens; the engine wanted ~260 GB against 237 GB available and refused
-before loading a single weight. The only way to know a shape fits is to start
-it and watch for `H3-4001`, which costs a few seconds.
-
-Measured peaks, for planning: **87.2 GB at the verified 864x480x124**. Weights
-are a fixed ~66 GB of that and activations scale with packed tokens, so
-576x1024x243 — 2.7x the tokens — lands near 123 GB. A 96 GB card fits the
-first and not the second.
-
-The `int8` files are half the size on disk and **exactly the same size in
-memory**, because they are expanded back to full precision at load. They save
-download and storage, not RAM. The `pruned` files genuinely are smaller in
-memory and they change the maths, so `h3` refuses them unless you set
-`allow_approximate_weights` in the config — nobody should accidentally compare
-one against the real thing.
-
-For the complete public write-up—including sparse attention, partial cache
-refresh, quantized GEMM, graph compilation, kernel fusion, the quality traps,
-and recommendations for Comfy workflows—see
-[MiniMax H3 acceleration: what worked and what failed](docs/PERFORMANCE_GUIDE.md).
+Frame numbers index the **rendered** timeline, which is your duration rounded up
+onto the model's frame lattice: 5 s is 124 frames, so the last is 123, not 119.
+`h3` refuses `seconds × fps − 1` for that reason rather than silently placing
+your anchor early. Each anchor costs its rows twice — once in the packed sequence
+and once as a `<Picture N>` block — so they are not free: three anchors measured
+about 20% more sampling time than one, at 864×480×124.
 
 ---
 
@@ -364,6 +240,7 @@ h3 doctor            what this Mac can run, which files it found, what it chose
 h3 config init       write a configuration file
 h3 config validate   resolve every path and identify what is there
 h3 render            make a video
+h3 bench             compare recorded renders
 ```
 
 Useful `render` options:
@@ -376,6 +253,7 @@ Useful `render` options:
 | `--seed 7` | same seed, machine and version → the same video |
 | `--width` / `--height` | exact size, multiples of 32 |
 | `--aspect-ratio 16:9` | or `9:16`, `21:9`, `4:3`, `3:4`, `1:1` |
+| `--quality faithful` | turn off the cache; nothing approximated |
 | `--cfg-scale 5` | stronger prompt adherence, at twice the work per step |
 | `--negative-prompt "..."` | needs `--cfg-scale` above 1 to do anything at all |
 | `--dry-run` | print the plan and the estimate, load nothing |
@@ -383,15 +261,60 @@ Useful `render` options:
 
 `h3 render --help` lists every one.
 
-## Examples
+---
 
-**Speech generated with the picture.** 864×480, 5 s. The audio was transcribed
-back with Whisper at a word error rate of **0.00** against the prompt's line,
-and a face was detected with landmarks in **124 of 124 frames**.
+## Speed and quality
 
-[![A woman in a kitchen](demo-media/talking-head.jpg)](demo-media/talking-head.mp4)
+Measured on a Mac Studio (M3 Ultra) at 864×480, 5 seconds, 20 steps. Ranges are
+the spread across five prompts, not a single run.
 
-<sub>**A woman in a kitchen.**</sub>
+| quality | time | what changes |
+|---|---|---|
+| `balanced` *(default)* | **11.4–11.8 min** | reuses work between steps — softer fine texture |
+| `faithful` | **21.1–21.5 min** | nothing is approximated |
+
+**`balanced` is the default and it is an approximation.** It reuses one step's
+work in the next when the step barely moved, which is where roughly half the
+render time goes. What it costs is fine texture — hair, foliage, fabric weave,
+the lettering on a book spine. How much depends on the material: on a still
+subject it is hard to find, and on high-frequency detail in fast motion you can
+see it side by side. That is the trade almost everybody wants on a twenty-minute
+render, and `--quality faithful` turns it off.
+
+**The cache is not what degrades fast motion.** Measured on a deliberately
+hostile case — a car crossing a wall of bookshelves, where every spine moves
+between frames — detail fell by half between the stillest and fastest parts of
+the clip *with the cache off*, several times anything the cache contributed. A
+slow pan across the same shelves held its detail all the way through. Fast motion
+costs texture because fast motion is blurred; the cache adds a little on top of
+that, and does not cause it.
+
+**Asking for more steps is close to free.** Doubling to 40 steps takes 12.2
+minutes against 11.7 for 20 — about 4% more wall clock for twice the sampling. A
+finer schedule moves the latent less per step, so more steps fall below the reuse
+threshold: the cache skips 75% of them at 40 steps against 50% at 20.
+
+**Larger costs more than proportionally.** Attention grows with the *square* of
+the sequence length, so doubling the resolution roughly quadruples the time.
+
+**A dry run prices a shape; it does not prove one will run.** It returns before
+the memory admission check, so it will confidently price a configuration the
+machine then refuses — 12 seconds at 576×1024 priced at "about 2h 04m" and was
+refused wanting ~260 GB. The only way to know a shape fits is to start it and
+watch for `H3-4001`, which costs seconds.
+
+Measured peaks, for planning: **87.2 GB at 864×480×124**. Weights are a fixed
+~66 GB and activations scale with packed tokens, so 576×1024×243 lands near
+123 GB. A 96 GB Mac fits the first and not the second.
+
+The `int8` files are half the size on disk and **exactly the same size in
+memory** — they are expanded at load, so they save download, not RAM. The
+`pruned` files genuinely are smaller in memory and they change the maths, so `h3`
+refuses them unless you set `allow_approximate_weights` in the config.
+
+The full write-up — sparse attention, partial cache refresh, quantised GEMM,
+graph compilation, kernel fusion, the quality traps — is in
+[docs/PERFORMANCE_GUIDE.md](docs/PERFORMANCE_GUIDE.md).
 
 ---
 
@@ -415,24 +338,24 @@ backend, the quantisation scheme and the compute backend change without breaking
 callers.
 
 **On correctness.** This was ported against the CUDA reference with parity
-established by measurement rather than hope: 225 gating taps inside
-CUDA-measured equivalence classes at production shape, and 36 documented
-contracts in [FRAGILE_CONTRACTS.md](FRAGILE_CONTRACTS.md), each carrying the
-evidence that established it. That file exists because this codebase's failure
-mode is *silent* — a wrong packed layout, a dropped label or a transposed qkv
-all keep every tensor exactly the right shape.
+established by measurement rather than hope: 225 gating taps inside CUDA-measured
+equivalence classes at production shape, and 36 documented contracts in
+[FRAGILE_CONTRACTS.md](FRAGILE_CONTRACTS.md), each carrying the evidence that
+established it. That file exists because this codebase's failure mode is
+*silent* — a wrong packed layout, a dropped label or a transposed qkv all keep
+every tensor exactly the right shape.
 
 Further reading: [CONTRIBUTING.md](CONTRIBUTING.md) for setup and house style,
-[docs/adr/](docs/adr/) for design decisions and their reasons, and
+[docs/adr/](docs/adr/) for design decisions, and
 [docs/OPERATIONS.md](docs/OPERATIONS.md) for running it in anger.
 
 <details>
 <summary><b>Architecture</b></summary>
 
-Dependencies point downward only, and the four lowest layers do not link MLX —
-so geometry, the frame lattice, checkpoint identification and the memory planner
-all test in milliseconds with no GPU and no 66 GB download. Those are exactly
-the places where an error stays silent.
+Dependencies point downward only, and the four lowest layers do not link MLX — so
+geometry, the frame lattice, checkpoint identification and the memory planner all
+test in milliseconds with no GPU and no 66 GB download. Those are exactly the
+places where an error stays silent.
 
 | target | owns | MLX |
 |---|---|---|
@@ -451,19 +374,25 @@ the places where an error stays silent.
 ## Status
 
 Verified end to end through this package: text-to-video with joint audio at
-864×480×124, checked with two oracles that need no reference — speech at
-**WER 0.00**, and a face with landmarks in **124/124 frames**.
+864×480×124, checked with two oracles that need no reference — speech at **WER
+0.00** and a face with landmarks in **124/124 frames** — plus first-frame and
+mid-timeline keyframe anchors, measured landing at their frames.
 
-Frame anchors and the three reference kinds were rendered end to end in the
-experimental tree this was ported from, and have not yet been re-run here.
+The three reference kinds were rendered end to end in the experimental tree this
+was ported from, and have not yet been re-run here.
+
+**Known defect.** On violent fast motion, renders can drop whole frames to black:
+7 of 124 on one 20-step test, cache off. `docs/PROMPTING.md` reports these
+disappearing above 6 steps, which holds for the prompt it was measured on but not
+for this one. Under investigation.
 
 Not done:
 
 - **Resident quantised weights.** The single item that decides whether 48–64 GB
   Macs are supported.
-- **Chunked video decode.** Currently the largest memory allocation in an entire
-  render, and not a hard problem.
-- **2K output.** Produced by a separate upscaler that MiniMax has not released.
+- **Chunked video decode.** The largest allocation in a render, and not a hard
+  problem.
+- **2K output.** Produced by a separate upscaler MiniMax has not released.
 - **Fixtures for `H3Conformance`**, so the 36 contracts are documented but not
   yet enforced by a test.
 
@@ -474,16 +403,14 @@ Not done:
 Use it for anything, including commercially and in closed-source products.
 Modify it, fork it, ship it. Two things travel with it: keep the copyright and
 the `NOTICE` file in what you distribute, and state that you changed the files
-you changed. That is the attribution.
+you changed.
 
 `Resources/mlx.metallib` is MLX's compiled Metal kernel library, redistributed
-here under its own MIT licence — see
+under its own MIT licence — see
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). The model weights are not in
 this repository and are licensed separately by MiniMax.
 
 > **If you verify the signature on a download**, `codesign -dv` reports
 > `Developer ID Application: Tesserapps, LLC`, which is not the name on the
 > copyright above. That is expected: the copyright is personal and Tesserapps is
-> the Apple developer account whose certificates sign the binaries. Same author,
-> two hats — checking the signature is the right instinct and this is the
-> explanation.
+> the Apple developer account whose certificates sign the binaries.
