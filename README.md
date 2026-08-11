@@ -388,8 +388,12 @@ for this one. Under investigation.
 
 Not done:
 
-- **Resident quantised weights.** The single item that decides whether 48–64 GB
-  Macs are supported.
+- **Smaller machines.** Two routes, neither built. Resident quantised weights
+  was the assumed one. Block streaming is now the measured one — reading each
+  transformer block from disk while the previous one computes costs 1.9–4.9%
+  and holds 64 GB of weights in 2.4 GB, verified bit-identical. What that has
+  not been tested on is a 48–64 GB Mac, which is the only machine the claim is
+  about. `docs/PERF_ROADMAP.md` §7.
 - **Chunked video decode.** The largest allocation in a render, and not a hard
   problem.
 - **2K output.** Produced by a separate upscaler MiniMax has not released.

@@ -606,6 +606,11 @@ in 6D) or fewer steps (the cache, shipped at 1.79× plus cap 5's 8–24%).
 
 ### The roadmap is closed
 
+> **Closed for speed, reopened for memory.** Section 7 measures block
+> streaming, which costs 1.9–4.9% and returns 64 GB of residency. Nothing below
+> is retracted — every speed lever here stays measured and struck — but "what is
+> left is not a tuning knob" was written with only speed in view.
+
 Every lever has now been measured rather than estimated:
 
 | lever | result |
@@ -998,3 +1003,866 @@ registry entry and no production surface.
 evidence for why is not. The scripts under `docs/bench/` are marked archived —
 they record what produced the JSON beside them and will not run today, because
 the flags they pass no longer exist.
+
+---
+
+## 7 — Block streaming *(MEASURED 2026-08-11; the roadmap reopens on memory)*
+
+The roadmap above closed because every remaining lever was a speed lever and
+each had been measured to nothing. This one is not a speed lever. It costs
+speed and buys residency, and `docs/PERFORMANCE_GUIDE.md` already named the
+category: *"Memory work remains useful even when it is not a speedup ... those
+changes solve capacity, not the 95%-DiT sampling bottleneck, and should be
+evaluated under a different success criterion."*
+
+The prompt came from [`antirez/h3.c`](https://github.com/antirez/h3.c), an
+independent C and Metal implementation of this model. It keeps two DiT blocks
+resident and reads the rest from disk during GPU execution: 36.5 GiB of
+residency becomes 2.0 GiB, at **26–84% slower**.
+
+**That penalty is a property of their shape, not of streaming.** They measure
+512x512x22, where a block is about 37 ms of compute. The control shape here
+leaves 1.289 s. Same bytes, 35x the time to hide them behind. The arithmetic
+said this tree sits on the opposite side of the trade, so it was measured before
+anything was built.
+
+    H3_BIG=1 swift test --filter blockStreaming
+
+### What the checkpoint looks like from a streamer's side
+
+| | |
+|---|---:|
+| block span, whole | 1291.1 MB |
+| of which `adaln_proj` | 520.4 MB (**40.3%**) |
+| tail — attention and MLP | 770.7 MB |
+| blocks | 50, every span contiguous |
+
+`adaln_proj` sits at the **start** of every span, bias then weight. Skipping it
+therefore leaves one contiguous read rather than a scatter, so a streamer issues
+a single `pread` per block either way.
+
+### Measured
+
+External PCIe SSD, `F_NOCACHE` throughout — this machine has 256 GB of RAM and
+the checkpoint is 66 GB, so a cached read reports memory bandwidth and the
+experiment becomes a tautology.
+
+| | |
+|---|---:|
+| uncached sequential read | **3.17 GB/s**, flat from 1 to 4 concurrent readers |
+| whole span | 0.408 s/block |
+| tail only | 0.244 s/block |
+| block compute, control shape | 1.289 s |
+
+Eight blocks, double-buffered, prefetch issued before the previous block's
+forward:
+
+| arm | bytes/block | s/block | overhead | stalled |
+|---|---:|---:|---:|---:|
+| resident | — | 1.289 | — | — |
+| tail streamed | 770.7 MB | 1.313 | **+1.9%** | 0.11 s of 1.95 s of reads |
+| whole span streamed | 1291.1 MB | 1.352 | **+4.9%** | 0.25 s of 3.26 s of reads |
+
+Residency, sixteen consecutive streamed blocks with `Memory.cacheLimit` pinned
+to two blocks so the allocator cannot flatter the curve:
+
+    865 865 865 865 865 865 865 865 865 865 865 865 865 865 865 865   MB
+
+Flat to the megabyte — **0.00 blocks' worth of growth**. 64.6 GB of block
+weights held as 0.9 GB on the MLX side plus 1.5 GB of host staging.
+
+And the output is **bit-identical** to the resident path. It is the same bytes
+reinterpreted, so anything less would have meant the offset arithmetic or the
+qkv permute was wrong — both of which fail silently, which is why that check
+exists rather than a tolerance.
+
+### What this changes
+
+Sampling residency at 864x480x124 goes from ~66 GB of weights to ~2.4 GB. Peak
+was **87.2 GB**, of which activations are ~21 GB and do not move. The sampling
+stage lands near **25 GB**.
+
+**The AdaLN precompute is an optimisation, not a precondition.** That is the
+result that matters for sequencing, and it was the opposite of the expectation
+going in. `H3Transformer` derives `tEmb` from `plan.values` alone, so every
+block's modulation is a function of the timestep schedule and could be computed
+once per render — which would drop 40.3% of the bytes. But whole-span streaming
+already costs only 4.9%, so precomputing buys **3 percentage points**, not
+feasibility. Item 3 above struck AdaLN *batching* on a 0.8–1.3% speed argument;
+nothing here disturbs that. Caching the schedule is a different operation from
+batching it — same shapes, same accumulation order, so bit-identical by
+construction rather than the 6.58e-6 that batching moved.
+
+### What is not established
+
+- **Storage dependence is linear and this was one drive.** At 1.5 GB/s the
+  whole-span read is 0.86 s against 1.289 s of compute — it still hides, with no
+  margin. Below about 1 GB/s it does not hide at all, and the tail-only arm
+  becomes the only viable one. A USB enclosure is not a PCIe slot.
+- **Nothing was measured under memory pressure.** This ran on 256 GB where the
+  staging buffers, the page cache and the activations never competed. The claim
+  "this makes 48 GB Macs work" needs a 48 GB Mac or a constrained run; what is
+  established is that the mechanism holds its footprint flat, not that the
+  machine it is for behaves.
+- **Eight blocks, extrapolated to 50**, with no thermal exposure. A 20-minute
+  render sustaining 3.2 GB/s is a different question from 10 seconds of it.
+- **SSD wear is real and should be stated to users, not discovered by them.**
+  Whole-span streaming reads 64.6 GB per full forward; a cap-5 20-step render
+  runs about 11 of them, so roughly **710 GB per render** (424 GB tail-only).
+- **The cross-step cache interaction is unmeasured.** Cached steps skip blocks
+  1–49 entirely and therefore issue no reads at all, so the direction is
+  favourable, but the figure above assumes full steps throughout.
+- **Decode is untouched.** Chunked video decode remains the other half of a
+  small-machine story and this does nothing for it.
+
+---
+
+## 8 — MLX is not the hardware *(MEASURED 2026-08-11)*
+
+> **Superseded in part by section 14.** The 11-22% gap is real and reproduced,
+> but "17.3 TFLOP/s is MLX's ceiling" was wrong: MLX had the faster kernel
+> compiled in all along and its routing heuristic did not select it. Read this
+> section for the gap, section 14 for what it was.
+
+Section 6 closed on this sentence: *"a hand-written Metal GEMM that beats MLX's
+... should not be started without first establishing what the hardware can
+actually do."* That measurement had never been taken. It costs a minute.
+
+It does not need a kernel. A second **vendor** implementation of the same
+arithmetic answers the question: Apple's own `MPSMatrixMultiplication`, same
+shapes, same machine.
+
+    H3_BIG=1 swift test --filter hardwareCeiling
+
+| shape | MLX bf16 | MLX fp16 | MPS fp16 | MPS/MLX |
+|---|---:|---:|---:|---:|
+| qkv      `[S,H]x[H,3I]` | 17.0 | 17.1 | 19.2 | **1.13x** |
+| attn out `[S,I]x[I,H]` | 17.0 | 16.8 | 19.0 | **1.13x** |
+| mlp fc1  `[S,H]x[H,2F]` | 17.0 | 17.1 | 19.4 | **1.14x** |
+| mlp fc2  `[S,F]x[F,H]` | 15.2 | 15.3 | 18.8 | **1.23x** |
+| square 8192³ | 17.0 | 17.2 | 19.0 | 1.10x |
+
+Two independent samples agree to ±0.01x, against a 1.4% noise floor. **MLX's
+bf16 and fp16 rates are identical**, which is what makes the fp16 comparison
+legitimate for a bf16 production path.
+
+**So 17 TFLOP/s was MLX, not the machine.** `gemmCeiling` showed the model at
+92% of MLX's own ceiling and concluded there was nothing left to reclaim. That
+conclusion was right about MLX and wrong about the hardware — the ceiling it
+measured was the floor of another vendor's kernel.
+
+### What it would be worth
+
+From `gemmCeiling`'s per-shape times, against the 1200 ms block:
+
+| | now | at MPS rates |
+|---|---:|---:|
+| qkv | 212.5 ms | 188.1 ms |
+| attn out | 72.6 ms | 64.2 ms |
+| mlp fc1 | 291.3 ms | 255.5 ms |
+| mlp fc2 | 157.5 ms | 128.0 ms |
+| **four GEMMs** | **733.9 ms** | **635.8 ms** |
+
+**98 ms of a 1200 ms block — 8.2% of a full step**, if it survived integration.
+It does not; see below. The figure is kept because it is what the kernels do, and
+because it was the first thing to clear the
+5% gate since the consecutive-cap sweep. Attention is a further 446.2 ms (37.8%
+of the block) and was not tested; MPSGraph exposes an SDPA primitive, so the
+figure is a floor rather than a total.
+
+### The bf16 gate — passed, and it is not a numerical change
+
+`MPSMatrixMultiplication` exposes no bf16, so the table above is fp16 and rests
+on an argument. `MPSGraph` removes the argument. Same production shapes, the
+model's own precision, both implementations fed **the same bytes** so any
+disagreement is the arithmetic rather than the inputs:
+
+    H3_BIG=1 swift test --filter mpsGraphBF16
+
+| shape | MLX bf16 | MPSGraph bf16 | ratio | rel RMS | control |
+|---|---:|---:|---:|---:|---:|
+| qkv | 17.1 | 19.3 | **1.13x** | 0.00e+00 | 5.17e-06 |
+| attn out | 16.9 | 19.0 | **1.12x** | 0.00e+00 | 3.90e-06 |
+| mlp fc1 | 16.9 | 19.3 | **1.14x** | 0.00e+00 | 4.87e-06 |
+| mlp fc2 | 15.3 | 18.7 | **1.22x** | 0.00e+00 | 3.88e-06 |
+| square 8192³ | 17.3 | 19.2 | 1.11x | 0.00e+00 | 5.76e-06 |
+
+**Bit-identical at every shape.** A zero that size is a claim about the
+instrument as much as the kernel, so the `control` column exists: flipping one
+bf16 ulp in one element of one input moves the comparison to ~4e-6. It detects a
+single-bit change and reports exactly zero here.
+
+That is consistent with both implementations accumulating in fp32 along K in
+order — tiling over M and N does not reorder a reduction, and only split-K
+would. So **the accumulation-order objection is gone**: this is not an
+approximation, needs no equivalence class, and the fp16 argument above is
+retired rather than relied on.
+
+### Integration — measured, and it closes the item
+
+    H3_BIG=1 swift test --filter mpsIntegration
+
+Both arms run the same modelled block — the real `H3RMSNorm`, `modScaleShift`,
+`modGate`, `SplitHalfRoPE` and SDPA, in the real order — differing only in who
+multiplies. The model is checked against the real `DiTBlock` first:
+**bit-identical, and 1317 ms against 1321 ms**, so it is the block.
+
+Weights are uploaded once as graph constants and activations cross `noCopy`,
+because the question is whether the win *can* survive rather than whether a
+naive port loses it.
+
+| sample | all MLX | MPSGraph GEMMs | change |
+|---|---:|---:|---:|
+| 1 | 1299 ms | 1339 ms | +3.1% |
+| 2 | 1291 ms | 1278 ms | −1.1% |
+| 3 | 1295 ms | 1308 ms | +1.0% |
+| 4 | 1291 ms | 1307 ms | +1.3% |
+| 5 | 1212 ms | 1252 ms | +3.3% |
+
+**Median +1.3%, four of five slower.** The predicted −8.2% does not appear. The
+block output stays bit-identical, so nothing is wrong with the arithmetic — what
+fails is the boundary.
+
+### Where the 8.2% goes, and why it is the barrier rather than the bytes
+
+    H3_BIG=1 swift test --filter crossingBreakdown
+
+The same four projections measured standalone, at their real shapes:
+
+| projection | MLX | MPS+copy | MPS only | copy | out |
+|---|---:|---:|---:|---:|---:|
+| qkv | 224.3 ms | 209.4 ms | 190.5 ms | 18.9 ms | 677 MB |
+| attn out | 75.5 ms | 68.7 ms | 64.7 ms | 4.0 ms | 169 MB |
+| mlp fc1 | 292.7 ms | 268.8 ms | 252.4 ms | 16.4 ms | 902 MB |
+| mlp fc2 | 172.4 ms | 134.8 ms | 137.1 ms | −2.3 ms | 169 MB |
+| **total** | **765 ms** | **682 ms** | **645 ms** | **37 ms** | |
+
+**Standalone, MPS wins by 83 ms even paying the copy back.** The copy — the one
+part a future MLX API could remove, since there is no public way to hand MLX an
+existing `MTLBuffer` — is only 37 ms of it. So the data movement was never the
+problem, and the obvious fix would not have fixed anything.
+
+The problem is that 83 ms of standalone advantage becomes ~17 ms of block-level
+*deficit*. Roughly **100 ms per block is MLX's own overlap being destroyed**:
+`asMTLBuffer` calls `eval()`, so each of the four crossings drains a lazy graph
+that MLX would otherwise have kept running underneath the norms, splits, gathers,
+RoPE and the silu. MLX executes a block as one asynchronous stream; four
+synchronous handoffs serialise it.
+
+### Verdict
+
+**Closed as a drop-in.** The kernel headroom is real — 1.11–1.22x, bit-identical,
+and it survives the copy — but it does not survive the synchronisation, and the
+synchronisation is not removable from outside MLX. Paying it back would mean
+MPSGraph work encoded into MLX's *own* command stream so no drain is needed,
+which is a change inside MLX rather than a call this tree can make.
+
+What that leaves, stated precisely so it is not rediscovered:
+
+- **The 17.3 TFLOP/s ceiling is MLX's, not the machine's** — that stands, and it
+  is new. Anything that gets kernels into MLX's stream inherits ~11%.
+- Attention, 37.8% of a block, was never tested. If the barrier problem is ever
+  solved, that is the next thing to measure, not more GEMM work.
+- Bit-identity is five shapes on one macOS build. It is a measurement, not a
+  guarantee across either.
+
+**Nothing in sections 1–6 is retracted.** Every lever there was measured against
+MLX and every one of them is still struck against MLX. What changes is that
+"MLX is the ceiling" was a statement about MLX.
+
+---
+
+## 9 — The barrier is per-crossing, not per-runtime *(MEASURED 2026-08-11)*
+
+Section 8 closed the MPS idea on a block that crossed four times. That was the
+worst arrangement available, and the verdict was drawn from it without asking
+what a crossing costs.
+
+The prompt to ask came from `StoryForge`, a sibling tree that solved the same
+problem in the opposite direction. Two mechanisms there are worth naming:
+
+- **`MPSGraphDenoiseStep` — the "Super Fusion Kernel".** CFG, STG, modality
+  guidance, variance-preserving rescale and the Euler update, fused into *one*
+  MPSGraph dispatch per step, writing directly into the caller's `MTLBuffer`
+  with no host round trip. Its own bottleneck report attributes **66.9% of
+  denoise time to the MLX materialisation bridge** — the same barrier measured
+  here, found independently.
+- **`Flux2FusedKernels` — `MLXFast.metalKernel`.** Custom Metal source that MLX
+  JIT-compiles and dispatches **inside its own command stream**. There is no
+  `eval()`, no handoff, and therefore no barrier at all. It is present in the
+  MLX revision this tree already pins.
+
+So the question was never "MLX or MPS". It is **how much work per crossing**.
+
+### The slope
+
+    H3_BIG=1 swift test --filter crossingCost
+
+Routing one, two and four projections, everything else identical:
+
+| arm | block | vs MLX | GEMM win forgone | implied barrier |
+|---|---:|---:|---:|---:|
+| 1 crossing (fc2) | 1208.3 ms | **−6.6** | −37.6 | 31.0 /crossing |
+| 2 crossings (fc2+fc1) | 1217.3 ms | −3.4 | −61.5 | 29.1 /crossing |
+| 4 crossings (all) | 1239.2 ms | +14.9 | −83.2 | 24.5 /crossing |
+
+**A crossing costs about 28 ms.** The four GEMMs are worth 83 ms. Everything
+follows from those two numbers, on a 1224 ms block:
+
+| design | change |
+|---|---:|
+| 4 crossings — what §8 measured | +30 ms, **+2.4%** |
+| 1 crossing per block | −55 ms, **−4.5%** |
+| 1 crossing per step, barrier amortised over 50 blocks | −83 ms, **−6.7%** |
+| 0 crossings — `MLXFast.metalKernel` | −83 ms, **−6.8%**, and attention becomes reachable |
+
+Note the first row of the table: **routing fc2 alone is already a win today**,
+−6.6 ms. It is the shape where MLX is weakest (15.3 against MPS's 18.7) and it
+pays only one barrier. It is also far too small to ship, and it is quoted here
+because it confirms the model rather than because anyone should do it.
+
+### What this changes about §8
+
+Nothing measured there is retracted — four crossings really does lose. What was
+wrong was the conclusion drawn from it. "Closed as a drop-in" stands; "not
+removable from outside MLX" does not, because `MLXFast.metalKernel` removes it
+from inside MLX, using an API this tree already has.
+
+### Which of the three is worth doing
+
+**`MLXFast.metalKernel` is the only one worth starting**, and the reason is risk
+rather than the extra 0.1%.
+
+- It stays a *drop-in matmul*. The equivalence classes, taps and 36 contracts
+  already in this tree validate it unchanged, because nothing about the model's
+  structure moves.
+- The two MPSGraph designs require re-expressing a block — attention, RoPE,
+  per-head norms, the packed-sequence modulation — in a second framework. That
+  is a second implementation of precisely the code `FRAGILE_CONTRACTS.md` exists
+  because of: a wrong packed layout or a transposed qkv keeps every shape
+  correct and every number wrong. −4.5% does not buy that.
+- `StoryForge` fused its *sampler step* this way, not its transformer. That is
+  the same judgement, made independently.
+
+**What it requires is a Metal GEMM that reaches MPS's rate**, ~19.2 TFLOP/s
+against MLX's 17.3. That is the hard part and it should not be understated: MLX's
+steel kernels are tuned, and beating them by 11% by hand is a project. What is
+new is that it is no longer speculative — §8 established the hardware does 19.2
+on these exact shapes, so this is matching a demonstrated number rather than
+hoping for headroom.
+
+**Attention is the reason to care.** It is 446.2 ms of a 1224 ms block, 37.8%,
+and it has never been measured against anything but MLX. A custom-kernel path
+reaches it; a GEMM-routing path does not. If it carries the same ~11%, the two
+together are roughly 11% of the whole forward — about **1.2 minutes off an
+11.4-minute render** — and that is the number that would justify the work.
+
+### Still true, and still the constraint
+
+The model remains compute-bound: fusing to save memory traffic is worth very
+little here. fc1 writes 902 MB, the silu-gate reads it and writes 451 MB, fc2
+reads that — fusing all three saves ~1.35 GB of traffic, which at 800 GB/s is
+under 2 ms of a 1224 ms block. This tree has measured that three times now
+(fused modulation 0.94%, fused Q/K RMSNorm plus RoPE 1.2%, AdaLN batching
+0.8–1.3%). **A custom kernel here is worth writing for its arithmetic rate and
+for nothing else.**
+
+---
+
+## 10 — The custom GEMM prototype *(MEASURED 2026-08-11)*
+
+> **Superseded by section 14.** The conclusion here — that collecting this
+> needs a multi-week kernel project starting at 61% of MLX — was answered by a
+> routing patch. No kernel should be written. The prototype and its tiling
+> sweep are kept because they are what established that writing one was the
+> wrong layer.
+
+Section 9 recommended `MLXFast.metalKernel` as the only path worth starting, on
+the argument that it has no crossing and therefore inherits §8's 11% for free.
+The mechanism works exactly as described. The performance is the whole problem.
+
+    H3_BIG=1 swift test --filter customGEMM
+
+A shape-specialised bf16 GEMM at the fc1 shape — `[15731,5376] x [5376,28672]`,
+`simdgroup_matrix<bfloat,8,8>` fragments, fp32 accumulators, threadgroup-tiled
+over K. Six tilings, **every one bit-exact against MLX**:
+
+| tiling | acc/simdgroup | FLOP/byte | ms | TFLOP/s | vs MLX |
+|---|---:|---:|---:|---:|---:|
+| 64x64x32, 2x2 sg | 16 | 32 | 611.1 | 7.9 | 0.44x |
+| 128x128x32, 4x2 sg | **32** | 64 | 6694.6 | **0.7** | 0.04x |
+| 128x128x32, 4x4 sg | 16 | 64 | 738.7 | 6.6 | 0.36x |
+| 128x64x32, 4x2 sg | 16 | 43 | 536.4 | 9.0 | 0.50x |
+| 128x128x16, 4x4 sg | 16 | 64 | 680.7 | 7.1 | 0.39x |
+| **256x128x16, 8x4 sg** | 16 | 85 | **439.3** | **11.0** | **0.61x** |
+| MLX | | | 268.4 | **18.1** | 1.00x |
+| MPSGraph (§8) | | | | **19.3** | 1.07x |
+
+**Register pressure, not tiling, was the trap.** Rows 2 and 3 are the same
+128x128 tile and differ only in how many simdgroups share it: 32 accumulators a
+simdgroup spills and runs at 0.7 TFLOP/s, 16 does not and runs at 6.6 — a 9x
+swing from a change that looks like scheduling. The first two attempts here moved
+tile size and register count together and so measured nothing; the sweep exists
+because of that mistake.
+
+With that separated, intensity behaves as predicted: 32 → 7.9, 43 → 9.0,
+85 → 11.0 FLOP/byte.
+
+### Steel-style follow-up — 16.2 TFLOP/s, still below break-even
+
+The first recommended follow-up was implemented in `CustomGEMMTests`: the
+M3-Ultra Steel geometry (`64x64x16`, `1x2` simdgroups), 16-byte-padded
+threadgroup rows, one 32-byte vector load per thread, Steel's two-float register
+fragment layout, register-resident A/B fragments, a direct fp32-to-bf16 store,
+and the same four-way tile-grid swizzle. It remains an `MLXFast.metalKernel`, so
+there is no framework crossing.
+
+| implementation | TFLOP/s | vs original custom | vs MLX | exact |
+|---|---:|---:|---:|---:|
+| original best, `256x128x16` | 11.0 | 1.00x | 0.61x | yes |
+| padded/vectorised/direct-store | 14.1 | 1.28x | 0.78x | yes |
+| register-resident fragments | **16.3** | **1.48x** | **0.93x** | yes |
+| plus Steel grid swizzle/unroll barriers | 16.2 | 1.47x | 0.93x | yes |
+| MLX | 17.4–18.0 | | 1.00x | reference |
+| MPSGraph target | 19.3 | | 1.07–1.11x | yes (§8) |
+
+The loader and epilogue changes recovered most of the gap, and the grid swizzle
+did not help this JIT kernel. More importantly, inspecting the bundled Steel
+loop corrected the earlier diagnosis below: Steel itself is single-buffered, so
+double buffering is not the missing prerequisite for reaching MLX. The
+remaining 7% custom-to-MLX gap needs GPU-counter profiling or work inside MLX's
+own build; it is no longer explained by an obvious omitted mechanism.
+
+### What the original number meant
+
+**The competent first cut reached 61% of MLX and 57% of the target.** It was
+correct, ran in MLX's own command stream, and was 1.65x away from being
+worth anything at all.
+
+That last clause is the finding. The break-even is not zero — it is MLX's 18.1,
+because a kernel that merely matches MLX delivers nothing. **The project is
+"start 40% behind a tuned vendor kernel and finish 6% ahead of it."**
+
+What the original 11-TFLOP/s prototype did not do:
+
+- **No double buffering.** Global loads and compute are serialised by a
+  threadgroup barrier. The follow-up established that bundled Steel does the
+  same, so this is a possible experiment rather than the primary explanation.
+- **Scalar global loads.** Elements move one bf16 at a time where the hardware
+  wants vectorised loads.
+- **A threadgroup round trip in the epilogue**, forced by fp32 accumulators
+  writing a bf16 output.
+- **No software pipelining across K steps.**
+
+The follow-up implemented the vector loader and direct epilogue and recovered
+5.2 TFLOP/s. Bundled Steel does not double-buffer or pipeline across K, so those
+last two are new experiments rather than missing pieces to copy.
+
+### Verdict
+
+**Not recommended, and now for a measured reason rather than an assumed one.**
+§9 called this the best risk-adjusted option because it avoids a second model
+implementation. That is still true and it is no longer sufficient: the work is a
+Metal GEMM tuning project measured in weeks, whose entire payoff is the ~6.8% in
+§9, and which delivers *nothing at all* until it passes 18.1.
+
+Worth keeping in view rather than discarding:
+
+- **The harness is the durable part.** `CustomGEMMTests` checks bit-exactness
+  before it reports a rate and now retains the 16.2-TFLOP/s Steel-style control.
+  Anyone resuming should start with a Metal GPU capture against MLX, not another
+  speculative tiling or double-buffering rewrite.
+- **MLX improving is a free win.** The gap §8 found is MLX's, and upstream
+  closing it needs nothing from this tree.
+- **Attention was never measured against MPS** and remains 37.8% of a block —
+  a larger prize than the GEMMs and still unpriced.
+
+---
+
+## 11 — Attention has no headroom *(MEASURED 2026-08-11; the file closes)*
+
+The last unpriced thing. Attention is 446.2 ms of a 1224 ms block, 7.095 TFLOP
+of a forward's 961 — **36.4% of a block, a larger single prize than all four
+GEMMs together** — and every measurement in this tree had compared MLX against
+MLX.
+
+    H3_BIG=1 swift test --filter mpsAttention
+
+Production shape, B=1 H=56 N=15,731 D=128, bf16, both implementations fed the
+same bytes:
+
+| | ms | TFLOP/s | |
+|---|---:|---:|---:|
+| MLX SDPA | 414.8 | 17.1 | |
+| MPSGraph SDPA | 409.5 | 17.3 | **1.01x** |
+
+Three samples, 1.01x every time, relative RMS 1.89e-04 — the same attention,
+computed at the same rate. Neither materialises the `[B,H,N,N]` score matrix,
+which at this shape would be 27.7 GB; both are flash-style and both land on the
+same number.
+
+**So §8's gap is specific to the GEMMs and does not generalise.** Two
+independent vendors agree on attention to within 1%, which is the strongest
+evidence available that 17 TFLOP/s is the machine here rather than one library's
+schedule. The 11-22% MLX leaves on `matmul` is a property of MLX's GEMM, not a
+property of Apple silicon.
+
+### What that means for the whole investigation
+
+The arithmetic, weighted by where a block's time actually goes:
+
+| | share of block | best available gap | worth |
+|---|---:|---:|---:|
+| four GEMMs | 733.9 ms, 60.0% | 1.11-1.22x | ~98 ms |
+| attention | 446.2 ms, 36.4% | **1.01x** | ~4 ms |
+| everything else | ~44 ms, 3.6% | measured repeatedly, ~1% | ~0 ms |
+
+**The ceiling on this machine is about 8%, all of it in the GEMMs**, and §9 and
+§10 established that both routes to it cost more than it is worth: routing out
+of MLX pays ~28 ms a crossing, and a hand-written kernel starts at 61% of MLX
+and must exceed it before delivering anything.
+
+### The roadmap closes again, on a firmer footing
+
+Section 6 closed it on "the model is at MLX's ceiling". That was true and
+incomplete — the ceiling was MLX's. Sections 8 through 11 replace it with a
+statement about the hardware:
+
+- **Attention is at the machine's rate.** Two vendors, 1.01x.
+- **The GEMMs are ~11% off it**, demonstrated, bit-identical, and worth ~8% of a
+  render.
+- **Nothing in this tree can collect that 8%** without either an MLX-internal
+  change or a multi-week kernel project that starts 40% behind.
+
+What remains, and is now the honest full list:
+
+- **MLX improving** — free, needs nothing from here, and §8's table is the
+  benchmark to re-run when it does.
+- **Fewer steps** — the cache, already shipped at 1.79x plus cap 5.
+- **Fewer tokens** — the one untried lever, from `antirez/h3.c`'s token
+  reduction (24.5-28.3% there). It reduces S, so it cuts the quadratic term
+  rather than making a kernel faster, and it lands on the quality-measurement
+  problem 6C never solved.
+- **Block streaming** (§7) — not speed, but 64 GB of residency for 1.9-4.9%.
+
+---
+
+## 12 — The MLX GEMM gap upstream *(researched 2026-08-11)*
+
+§11 closed with "MLX improving is a free win — needs nothing from here". That is
+still the shape of the opportunity, but it was written without checking what
+upstream is actually doing. Checked, it is narrower than it sounded.
+
+### The gap is known, open, and not ours alone
+
+[`ml-explore/mlx#3196`](https://github.com/ml-explore/mlx/issues/3196) — *"NA/M5
+addmm / matmul on MPS ~10–20% slower than PyTorch for 1280×1280 BF16"*, opened
+2026-03-03, **still open**, assigned to `jagrit06`, labelled `performance`.
+Reported figures: `matmul` 1.18x and `addmm` 1.09x slower than PyTorch's MPS
+backend, bf16, on M5.
+
+That is the same ratio measured here in §8 — **1.11–1.22x** — and the two
+measurements are close to independent:
+
+| | #3196 | §8 here |
+|---|---|---|
+| chip | M5 (has NAX) | M3 Ultra (no NAX) |
+| shape | 1280x1280 | up to 15731x14336x28672 |
+| compared against | PyTorch MPS backend | MPSGraph directly |
+
+So the gap is **not** an artefact of one chip generation, one shape class, or
+one comparison harness. It is MLX's GEMM.
+
+*Not* corroboration, and worth naming so it is not cited later: the widely
+linked [matmul blog post](https://kevinmartinjose.com/2025/04/21/matmul-using-pytorchs-mps-backend-is-faster-than-apples-mlx/)
+reports 5.5x at 128x128 fp32. At that size the measurement is dispatch overhead,
+not GEMM, and it says nothing about these shapes.
+
+### NAX Split-K is already here, and it cannot run on this machine
+
+> **Corrected 2026-08-11.** This section first said NAX Split-K arrived in MLX
+> 0.32.0 and that this tree predated it. Both halves were wrong. The claim came
+> from a release-notes summary — the same fetch that misdated several mlx-swift
+> releases — and it was contradicted by evidence already open in this
+> investigation: `steel_gemm_splitk_axpby_nax` sits at `matmul.cpp:687` of the
+> **bundled 0.31.1**, alongside `steel_gemm_splitk_nax.metal`. Verify locally
+> before citing a changelog.
+
+[`mlx#3017`](https://github.com/ml-explore/mlx/issues/3017) reports large-K
+GEMMs on M5 showing high run-to-run variance and slow tail iterations, with up
+to **1.62x** recovered by partitioning K.
+[PR #3018](https://github.com/ml-explore/mlx/pull/3018) landed that work —
+merged 2026-01-26 as `7ed2b6b`, first shipped in **v0.30.4**. This tree's MLX
+0.31.1 contains it.
+
+So the fix is present and simply cannot fire here. `mlx/backend/metal/matmul.cpp`
+gives two split-K routes and our shapes take neither:
+
+- **Case 1, SIMD split-K** needs `(_tm * _tn) <= 2048` on Max and Ultra, with
+  `_tm = ceil(M/16)`. At M = 15,731 that term alone is 983, so `N` would have to
+  be about 32. Our shapes score 262,144 to 1,763,328 — over the gate by two to
+  three orders of magnitude. It is a path for skinny decode GEMMs.
+- **Case 2, NAX split-K** is gated on `metal::is_nax_available()`. NAX is the M5
+  neural accelerator; **on M3 Ultra it is false and the branch cannot be taken.**
+  Even given the hardware it wants `K >= 3 * max(M, N)` — fc2 has K = 14,336
+  against a required 47,193.
+
+**So there is no upgrade that collects this**, and the reason is the hardware and
+the shapes rather than the version. Both split-K paths are for K-dominant
+shapes; every GEMM in this model is M-dominant.
+
+### Where this tree actually sits
+
+`Package.resolved` pins `mlx-swift` **0.31.6**, which vendors MLX core
+**0.31.1** (`Source/Cmlx/mlx/mlx/version.h`). That already includes PR #3018, so
+no upgrade is pending for this particular fix.
+
+### What this changes
+
+- **§11's "free win" is still true and further away.** The fix that would close
+  this is general steel-GEMM work on non-NAX hardware, which is what #3196 is
+  open about and nobody has landed.
+- **Re-running §8's table is the right trigger**, not a version number.
+  `hardwareCeiling` and `mpsGraphBF16` answer in a minute whether anything
+  moved, and no release note can answer it at all.
+- **Worth reporting upstream.** #3196 has M5 data at one small shape. This tree
+  has M3 Ultra data at five production shapes, bit-identical outputs, and a
+  clean MPSGraph-vs-MLX harness. That is a useful comment on an open issue, and
+  it costs nothing.
+- **Untested and now the interesting question:** whether MLX's large-K
+  degradation reported in #3017 exists on non-NAX hardware at all. A K sweep at
+  fixed M and N would answer it, and there is no such data upstream.
+
+---
+
+## 13 — Large K on non-NAX hardware *(MEASURED 2026-08-11, revised after review)*
+
+> **Explained by section 14.** The large-M/large-K decay measured here is tile
+> selection: it vanishes under the routing patch. This section deliberately
+> declined to assert a mechanism, and the mechanism turned out to be one nobody
+> had proposed.
+
+> **This section was rewritten.** Its first version compared `M=4096,N=4096`
+> against `M=15731,N=5376`, moved both M and N, and concluded "M-by-K
+> interaction". It also reported means, while `mlx#3017` is a report about
+> *variance and slow tails* — so its "does not reproduce" was unfounded, since a
+> mean hides exactly the tail being claimed. And its split-K rows sat entirely
+> inside the routing gate, which cannot attribute anything to split-K. The
+> harness now crosses M and N independently, records every iteration, and uses
+> matched pairs across the routing boundary.
+
+    H3_BIG=1 swift test --filter gemmKSweep
+
+15 iterations per shape, MLX and MPSGraph interleaved so ordering and thermal
+drift cannot settle on one arm. Rates are TFLOP/s at the median; `worst/p50` is
+the slow-tail factor.
+
+### N does not matter. M does.
+
+| M | K | N | MLX p50 | worst/p50 | MPS p50 | MPS/MLX |
+|---:|---:|---:|---:|---:|---:|---:|
+| 4096 | 2688 | 4096 | 17.1 | 1.16x | 18.1 | 1.06x |
+| 4096 | 5376 | 4096 | 17.5 | 1.06x | 18.8 | 1.08x |
+| 4096 | 14336 | 4096 | **18.9** | 1.03x | 18.9 | **1.00x** |
+| 4096 | 2688 | 5376 | 17.2 | 1.04x | 18.5 | 1.08x |
+| 4096 | 5376 | 5376 | 17.3 | 1.06x | 18.4 | 1.07x |
+| 4096 | 14336 | 5376 | **18.7** | 1.02x | 18.8 | **1.00x** |
+| 15731 | 2688 | 4096 | 18.1 | 1.31x | 19.4 | 1.07x |
+| 15731 | 5376 | 4096 | 18.0 | 1.03x | 19.5 | 1.08x |
+| 15731 | 14336 | 4096 | **16.7** | 1.25x | 19.6 | **1.17x** |
+| 15731 | 2688 | 5376 | 18.2 | 1.02x | 19.5 | 1.07x |
+| 15731 | 5376 | 5376 | 18.1 | 1.11x | 19.6 | 1.09x |
+| 15731 | 14336 | 5376 | **16.4** | 1.15x | 19.4 | **1.18x** |
+
+Reading down the two N columns at each M, they agree: **N = 4096 and N = 5376
+behave identically**. Reading across M, they do not — at M = 4096 MLX *gains*
+with K (17.1 → 18.9) and converges onto MPSGraph; at M = 15,731 it *loses*
+(18.1 → 16.4) while MPSGraph holds ~19.5.
+
+With N controlled at two values, the interaction is with M. Two values of N is
+not a proof that no N matters anywhere, and this is one machine and one dtype.
+
+### #3017's tail does not appear at #3017's shapes
+
+| M | K | N | MLX p50 | worst/p50 | MPS p50 | MPS/MLX |
+|---:|---:|---:|---:|---:|---:|---:|
+| 4096 | 4096 | 4096 | 17.6 | 1.05x | 18.5 | 1.05x |
+| 4096 | 12288 | 4096 | 18.8 | 1.02x | 19.0 | 1.01x |
+| 4096 | 24576 | 4096 | 18.6 | 1.02x | 18.8 | 1.01x |
+
+Worst-of-15 within 2-5% of the median, out to K = 24,576, and MLX ties
+MPSGraph. The slow tail #3017 describes is not present on this hardware at these
+shapes — now measured as a tail rather than inferred from an average.
+
+**Tails do show up in the large-M rows** (MLX 1.15-1.31x, and MPSGraph 1.68x at
+one point), so variance exists at this model's shapes and is not MLX's alone.
+Characterising it is a separate job from this sweep.
+
+**Caveat on the statistic.** At 15 samples the 95th percentile *is* the maximum,
+so `p95` and `worst` are one number, not two. Distinguishing them needs a few
+hundred iterations per shape; what is reported is "worst of 15 against the
+median", which detects a gross tail and cannot describe its distribution.
+
+### Split-K is what MLX is winning with — matched pairs
+
+`_tm*_tn <= 2048` puts N = 1024 inside the Case-1 gate (32x64 = 2048) and
+N = 1088 outside it (32x68 = 2176). A 6% change in N changes the kernel MLX
+picks and nothing else:
+
+| M | K | N | MLX path | MLX p50 | MPS p50 | MPS/MLX |
+|---:|---:|---:|---|---:|---:|---:|
+| 512 | 32768 | 1024 | **split-K** | **13.0** | 11.8 | 0.91x |
+| 512 | 32768 | 1088 | steel | **8.3** | 11.1 | 1.34x |
+| 512 | 8192 | 1024 | **split-K** | **10.6** | 10.3 | 0.97x |
+| 512 | 8192 | 1088 | steel | **7.4** | 9.4 | 1.27x |
+
+**MLX drops 36% across a 6% change in N**, from beating MPSGraph to losing to it
+by a third, while MPSGraph moves 6%. The advantage tracks the routing decision,
+not the shape.
+
+### What is established, and what is not
+
+Established:
+
+- MLX's rate **decays with K at M = 15,731** and rises with K at M = 4096, with
+  N held constant across both — so the effect follows M, not N.
+- **No slow tail at #3017's shapes on non-NAX hardware**, measured per
+  iteration.
+- **Split-K causes MLX's advantage** where it routes there, by matched pair.
+
+Not established, and not to be written as though it were:
+
+- **That extending split-K to the large-M corner would help.** Every split-K
+  point measured is a skinny shape (M = 512). Nothing here shows the kernel
+  helps at M = 15,731, and testing it needs a patched MLX with the gate widened
+  — which is the actual next experiment, not a conclusion.
+- **A mechanism.** "Loses reuse down a long K loop" is #3017's explanation for
+  M5 and is not evidence for what M3 Ultra does at large M.
+- **That the tails at large M mean anything.** MPSGraph shows a larger one than
+  MLX at the same point.
+
+### For upstream
+
+What is worth posting to [`mlx#3196`](https://github.com/ml-explore/mlx/issues/3196)
+is the observation, not the theory: on M3 Ultra, bf16, MLX matches MPSGraph at
+M = 4096 for K >= 12288 but falls 11-18% behind at M = 15,731 with K = 14,336,
+with N controlled and outputs bit-identical. That is a shape-dependent gap in
+the steel path, reported as such, with the harness attached and the mechanism
+left open.
+
+---
+
+## 14 — The optimized kernel was already in MLX *(MEASURED 2026-08-11)*
+
+The 16.2-TFLOP/s custom-kernel follow-up in §10 established that another JIT
+rewrite was the wrong layer. The next experiment patched only MLX's routing and
+swept every non-NAX Steel shape already compiled into its metallib. No shader,
+arithmetic or framework integration changed.
+
+At the fc1 production shape, three samples each:
+
+| Steel route | TFLOP/s | result |
+|---|---:|---:|
+| default `64x64x16, 1x2sg` | 18.0–18.1 | baseline |
+| `64x64x16, 2x2sg` | 19.6 | +8% |
+| `64x32x32, 2x2sg` | 19.3 | +7% |
+| **`32x64x16, 1x2sg`** | **19.7–19.8** | **+9%** |
+| `32x32x16, 2x2sg` | 18.3 | +1% |
+| `64x32x8, 4x1sg` | 15.7 | −13% |
+
+The best route then ran across the whole §8 table:
+
+| shape | tuned MLX bf16 | MPS | MPS/MLX |
+|---|---:|---:|---:|
+| qkv | 19.7 | 19.7 | 1.00x |
+| attention output | 19.6 | 19.7 | 1.00x |
+| mlp fc1 | 19.8 | 19.8 | 1.00x |
+| mlp fc2 | 19.4 | 19.4 | 1.01x |
+| square 8192³ | 19.5 | 19.3 | 0.98x |
+
+The bf16 gate also passed at all five shapes: **bit-identical to MPSGraph**, with
+the existing one-ULP controls detecting changes. This is especially decisive
+for fc2: the former 15.3-TFLOP/s outlier reaches 18.6–19.4 depending on the
+correctness-versus-throughput harness, tying MPSGraph rather than trailing it by
+22%.
+
+### Full-block result
+
+With the tuned route applied to the ordinary MLX `matmul`, the modeled block ran
+in **1179 ms**, against the previous roughly 1290-ms range: about **8.6% faster**.
+The block remained bit-identical. Routing the GEMMs to MPSGraph now took 1240 ms
+and lost 5.1%, as expected once its kernels no longer have an arithmetic-rate
+advantage but still pay the framework crossing.
+
+### The actual change
+
+For Ultra-class devices, large bf16/fp16 matmuls with `M >= 8192` and reasonable
+K should route from `64x64x16, 1x2sg` to the already-shipped
+`32x64x16, 1x2sg` Steel kernel. The conservative M gate preserves the measured
+M=4096 regime where the original route already tied MPSGraph.
+
+The upstream-ready patch is `patches/mlx-m3-ultra-large-m-gemm.patch`. The
+SwiftPM dependency checkout was restored after measurement; making this durable
+in the application requires that patch in an MLX/mlx-swift fork or an upstream
+release. No custom kernel should ship.
+
+### Independently reproduced *(2026-08-11)*
+
+Patch applied to the SwiftPM checkout, measured, and the checkout restored
+byte-identical afterwards (`diff` clean, baseline fc2 back to 16.6 TFLOP/s).
+Two things were verified that the original run did not record.
+
+**fp16, which the patch also changes.** The branch is
+`out.dtype() != float32`, so half takes the same route and no fp16 figure had
+been recorded — the one gap that could have made this a regression for other
+callers. It is not:
+
+| shape | MLX bf16 | MLX fp16 | MPS fp16 | MPS/MLX |
+|---|---:|---:|---:|---:|
+| qkv | 19.6 | 19.7 | 19.7 | 1.00x |
+| attention output | 19.6 | 19.6 | 19.6 | 1.00x |
+| mlp fc1 | 19.7 | 19.8 | 19.8 | 1.00x |
+| mlp fc2 | 19.3 | 19.3 | 19.5 | 1.01x |
+| square 8192³ | 19.6 | 19.7 | 19.1 | **0.97x** |
+
+fp16 improves identically to bf16, and at the square MLX now *beats* MPS.
+`mpsGraphBF16` still reports **bit-identical at all five shapes**, with both
+controls live.
+
+**The whole large-M plane, not only the production shapes.** Re-running
+`gemmKSweep` patched:
+
+| M | K | N | MLX before | MLX after | MPS/MLX after |
+|---:|---:|---:|---:|---:|---:|
+| 15731 | 2688 | 4096 | 18.1 | **19.6** | 1.00x |
+| 15731 | 5376 | 4096 | 18.0 | **19.7** | 0.99x |
+| 15731 | 14336 | 4096 | 16.7 | **19.6** | 1.00x |
+| 15731 | 2688 | 5376 | 18.2 | **19.6** | 1.00x |
+| 15731 | 5376 | 5376 | 18.1 | **19.7** | 1.00x |
+| 15731 | 14336 | 5376 | 16.4 | **19.3** | 1.01x |
+
+Every large-M cell ties MPSGraph, at both N and all three K. **§13's large-K
+decay was tile selection all along** — it disappears entirely, which is a
+better explanation than the "loses reuse down a long K loop" mechanism that
+section declined to assert.
+
+And the gate is as conservative as claimed: M = 4096 rows are unchanged
+(17.2–19.1, ratios 1.00–1.08x, matching the unpatched sweep), and the Case-1
+split-K pairs at M = 512 are untouched.
+
+### What is still unverified before upstreaming
+
+- **`GEMM_TPARAM_MACRO` has three call sites**, not one:
+  `steel_matmul_regular_axpby` (measured), **`gather_mm`** and
+  **`segmented_mm`** (not). This model exercises the first; MoE and segmented
+  callers take the same tile change unmeasured.
+- **The threshold boundary is verified at its endpoints only** — 4096 below and
+  8192 at the gate. Nothing between 4096 and 8192 was measured, and 8192 is
+  where the discontinuity now sits.
+- **Transpose variants.** The `2 * max(M,N) > K` branch is transpose-agnostic
+  and applies to nn/nt/tn/tt alike; only the combinations production uses were
+  measured.
+
+None of these block the result for *this* application, where the affected path
+is the one measured and the outcome is bit-identical. They are what an upstream
+reviewer will ask for.

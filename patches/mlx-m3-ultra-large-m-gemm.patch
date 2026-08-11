@@ -1,0 +1,29 @@
+diff --git a/mlx/backend/metal/matmul.cpp b/mlx/backend/metal/matmul.cpp
+index 84b6ee06..00000000 100644
+--- a/mlx/backend/metal/matmul.cpp
++++ b/mlx/backend/metal/matmul.cpp
+@@ -109,11 +109,19 @@ ensure_batch_contiguous(const array& x, metal::Device& d, const Stream& s) {
+     if ((size_t)batch_size_out * M * N >= 1ul << 20) { /* large matmul */ \
+       if (out.dtype() != float32) { /* half and bfloat */                 \
+         if (2 * std::max(M, N) > K) { /* Reasonable K */                  \
+-          bm = 64;                                                        \
+-          bn = 64;                                                        \
+-          bk = 16;                                                        \
+-          wm = 1;                                                         \
+-          wn = 2;                                                         \
++          if (M >= 8192) { /* Large-M Max/Ultra tuning */                \
++            bm = 32;                                                      \
++            bn = 64;                                                      \
++            bk = 16;                                                      \
++            wm = 1;                                                       \
++            wn = 2;                                                       \
++          } else {                                                        \
++            bm = 64;                                                      \
++            bn = 64;                                                      \
++            bk = 16;                                                      \
++            wm = 1;                                                       \
++            wn = 2;                                                       \
++          }                                                               \
+         } else if (!transpose_a && transpose_b) { /* nt with large k */   \
+           bm = 64;                                                        \
+           bn = 32;                                                        \
