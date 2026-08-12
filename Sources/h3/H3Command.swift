@@ -20,11 +20,12 @@ struct H3: AsyncParsableCommand {
         commandName: "h3",
         abstract: "Generate video and audio together with MiniMax-H3, on Apple silicon.",
         discussion: """
-            Three commands, in the order you will need them.
+            The commands, in the order you will need them.
 
               h3 doctor          what this Mac can run, which checkpoints it found,
                                  and what it would choose. Takes about a second.
               h3 config init     write a config file to fill in with your model paths
+              h3 recipes         the output sizes, with what each one costs
               h3 render          make a video
               h3 bench           compare renders you have already made
 
@@ -40,6 +41,7 @@ struct H3: AsyncParsableCommand {
             so it never reaches the memory admission check.
             """,
         version: MiniMaxH3.version,
-        subcommands: [Doctor.self, ConfigCommand.self, RenderCommand.self, BenchCommand.self]
+        subcommands: [Doctor.self, ConfigCommand.self, RecipesCommand.self,
+                      RenderCommand.self, BenchCommand.self]
     )
 }

@@ -11,13 +11,92 @@ public enum H3RecipeID: String, Sendable, Codable, CaseIterable {
     case h3_2k_4_3
     case h3_2k_3_4
     case h3_2k_1_1
-    
-    case h3_768p_16_9
-    case h3_768p_9_16
+
+    // The 16:9 megapixel ladder and its transpose. See `H3Ladder`.
+    //
+    // These replace `h3_768p_16_9` and `h3_768p_9_16`, which named exactly one
+    // rung each — 1344x768 and 768x1344, the 0.98 MP row. The single-size
+    // spelling was the reason 864x480, the shape every golden and every
+    // measured tolerance uses, could not be named at all and had to be reached
+    // through `--width`/`--height`.
+    case h3_16x9_0p2mp, h3_9x16_0p2mp
+    case h3_16x9_0p3mp, h3_9x16_0p3mp
+    case h3_16x9_0p4mp, h3_9x16_0p4mp
+    case h3_16x9_0p5mp, h3_9x16_0p5mp
+    case h3_16x9_0p6mp, h3_9x16_0p6mp
+    case h3_16x9_0p7mp, h3_9x16_0p7mp
+    case h3_16x9_0p8mp, h3_9x16_0p8mp
+    case h3_16x9_0p9mp, h3_9x16_0p9mp
+    case h3_16x9_0p98mp, h3_9x16_0p98mp
+    case h3_16x9_1p0mp, h3_9x16_1p0mp
+    case h3_16x9_1p2mp, h3_9x16_1p2mp
+    case h3_16x9_1p5mp, h3_9x16_1p5mp
+    case h3_16x9_1p8mp, h3_9x16_1p8mp
+    case h3_16x9_2p0mp, h3_9x16_2p0mp
+
     case h3_768p_21_9
     case h3_768p_4_3
     case h3_768p_3_4
     case h3_768p_1_1
+}
+
+/// One rung of the megapixel ladder: a landscape size and its transpose.
+package struct H3LadderRung: Sendable, Equatable {
+    /// The nominal target this rung was derived from, not what it delivers.
+    /// Snapping to 32 overshoots: the 0.4 rung is 414,720 pixels, and the
+    /// 0.98 and 1.0 rungs differ by 32 pixels of width and share a height.
+    package let megapixels: Double
+    /// Landscape orientation. The portrait recipe is this transposed.
+    package let width: Int
+    package let height: Int
+    package let landscape: H3RecipeID
+    package let portrait: H3RecipeID
+}
+
+/// The recommended output sizes, as one table.
+///
+/// **Every rung is a multiple of 32 on both axes and none of them is exactly
+/// 16:9.** The VAE downsamples by 16 and the DiT patchifies by 2, so 32 is the
+/// grid a render has to land on; forcing 1.778 onto that grid is not possible
+/// at most sizes, and the ladder takes the nearest grid point instead. The
+/// spread is 1.727 (608x352) to 1.810 (1216x672). 864x480 is the closest at
+/// exactly 1.800, which is one more reason it is the shape the port verified.
+///
+/// **The ladder is a menu, not a promise about cost.** Attention is quadratic
+/// in packed sequence length, so the rungs do not cost what their megapixel
+/// numbers suggest — 2.0 MP is 5x the pixels of 0.4 MP and roughly 12x the
+/// sampling time. The top two rungs are past `H3RenderPolicy`'s three-hour
+/// ceiling at 124 frames and 20 steps and will be refused at render time unless
+/// the caller passes `allowSuboptimal`. They are registered rather than
+/// omitted so the refusal can carry its measured reason, which is the same
+/// argument the 2K entries are kept under.
+package enum H3Ladder {
+    package static let rungs: [H3LadderRung] = [
+        .init(megapixels: 0.2,  width: 608,  height: 352,  landscape: .h3_16x9_0p2mp,  portrait: .h3_9x16_0p2mp),
+        .init(megapixels: 0.3,  width: 736,  height: 416,  landscape: .h3_16x9_0p3mp,  portrait: .h3_9x16_0p3mp),
+        .init(megapixels: 0.4,  width: 864,  height: 480,  landscape: .h3_16x9_0p4mp,  portrait: .h3_9x16_0p4mp),
+        .init(megapixels: 0.5,  width: 960,  height: 544,  landscape: .h3_16x9_0p5mp,  portrait: .h3_9x16_0p5mp),
+        .init(megapixels: 0.6,  width: 1056, height: 608,  landscape: .h3_16x9_0p6mp,  portrait: .h3_9x16_0p6mp),
+        .init(megapixels: 0.7,  width: 1152, height: 640,  landscape: .h3_16x9_0p7mp,  portrait: .h3_9x16_0p7mp),
+        .init(megapixels: 0.8,  width: 1216, height: 672,  landscape: .h3_16x9_0p8mp,  portrait: .h3_9x16_0p8mp),
+        .init(megapixels: 0.9,  width: 1280, height: 736,  landscape: .h3_16x9_0p9mp,  portrait: .h3_9x16_0p9mp),
+        .init(megapixels: 0.98, width: 1344, height: 768,  landscape: .h3_16x9_0p98mp, portrait: .h3_9x16_0p98mp),
+        .init(megapixels: 1.0,  width: 1376, height: 768,  landscape: .h3_16x9_1p0mp,  portrait: .h3_9x16_1p0mp),
+        .init(megapixels: 1.2,  width: 1504, height: 832,  landscape: .h3_16x9_1p2mp,  portrait: .h3_9x16_1p2mp),
+        .init(megapixels: 1.5,  width: 1664, height: 928,  landscape: .h3_16x9_1p5mp,  portrait: .h3_9x16_1p5mp),
+        .init(megapixels: 1.8,  width: 1824, height: 1024, landscape: .h3_16x9_1p8mp,  portrait: .h3_9x16_1p8mp),
+        .init(megapixels: 2.0,  width: 1920, height: 1088, landscape: .h3_16x9_2p0mp,  portrait: .h3_9x16_2p0mp),
+    ]
+
+    /// The rung the port has actually verified end to end.
+    ///
+    /// Pinned against `H3RenderPolicy.verifiedWidth`/`verifiedHeight` by the
+    /// tests: if the ladder and the policy ever name different shapes, the menu
+    /// no longer contains the one size with a measured tolerance behind it.
+    package static var verified: H3LadderRung {
+        rungs.first { $0.width == H3RenderPolicy.verifiedWidth
+                   && $0.height == H3RenderPolicy.verifiedHeight }!
+    }
 }
 
 /// What a recipe's resolution actually *is* in this model's pipeline.
@@ -136,19 +215,34 @@ package struct H3RecipeRegistry {
     /// are tagged `.upscaleTarget` so asking for one as a base render fails
     /// with an explanation instead of quietly sampling a shape the model was
     /// never trained to sample.
-    package static let all: [H3RecipeID: H3Recipe] = [
-        .h3_2k_16_9: H3Recipe(id: .h3_2k_16_9, tier: .upscaleTarget, targetWidth: 2560, targetHeight: 1440),
-        .h3_2k_9_16: H3Recipe(id: .h3_2k_9_16, tier: .upscaleTarget, targetWidth: 1440, targetHeight: 2560),
-        .h3_2k_21_9: H3Recipe(id: .h3_2k_21_9, tier: .upscaleTarget, targetWidth: 3360, targetHeight: 1440),
-        .h3_2k_4_3: H3Recipe(id: .h3_2k_4_3, tier: .upscaleTarget, targetWidth: 1920, targetHeight: 1440),
-        .h3_2k_3_4: H3Recipe(id: .h3_2k_3_4, tier: .upscaleTarget, targetWidth: 1440, targetHeight: 1920),
-        .h3_2k_1_1: H3Recipe(id: .h3_2k_1_1, tier: .upscaleTarget, targetWidth: 1440, targetHeight: 1440),
-        
-        .h3_768p_16_9: H3Recipe(id: .h3_768p_16_9, tier: .baseRender, targetWidth: 1344, targetHeight: 768),
-        .h3_768p_9_16: H3Recipe(id: .h3_768p_9_16, tier: .baseRender, targetWidth: 768, targetHeight: 1344),
-        .h3_768p_21_9: H3Recipe(id: .h3_768p_21_9, tier: .baseRender, targetWidth: 1792, targetHeight: 768),
-        .h3_768p_4_3: H3Recipe(id: .h3_768p_4_3, tier: .baseRender, targetWidth: 1024, targetHeight: 768),
-        .h3_768p_3_4: H3Recipe(id: .h3_768p_3_4, tier: .baseRender, targetWidth: 768, targetHeight: 1024),
-        .h3_768p_1_1: H3Recipe(id: .h3_768p_1_1, tier: .baseRender, targetWidth: 768, targetHeight: 768),
-    ]
+    /// The four aspect ratios the ladder does not cover keep their single 768p
+    /// entry. The source table is 16:9 only, and deriving 21:9 or 4:3 rungs
+    /// from it would be inventing sizes rather than registering recommended
+    /// ones — a menu whose entries have different provenance, with nothing in
+    /// the name to say which is which.
+    package static let all: [H3RecipeID: H3Recipe] = {
+        var out: [H3RecipeID: H3Recipe] = [
+            .h3_2k_16_9: H3Recipe(id: .h3_2k_16_9, tier: .upscaleTarget, targetWidth: 2560, targetHeight: 1440),
+            .h3_2k_9_16: H3Recipe(id: .h3_2k_9_16, tier: .upscaleTarget, targetWidth: 1440, targetHeight: 2560),
+            .h3_2k_21_9: H3Recipe(id: .h3_2k_21_9, tier: .upscaleTarget, targetWidth: 3360, targetHeight: 1440),
+            .h3_2k_4_3: H3Recipe(id: .h3_2k_4_3, tier: .upscaleTarget, targetWidth: 1920, targetHeight: 1440),
+            .h3_2k_3_4: H3Recipe(id: .h3_2k_3_4, tier: .upscaleTarget, targetWidth: 1440, targetHeight: 1920),
+            .h3_2k_1_1: H3Recipe(id: .h3_2k_1_1, tier: .upscaleTarget, targetWidth: 1440, targetHeight: 1440),
+
+            .h3_768p_21_9: H3Recipe(id: .h3_768p_21_9, tier: .baseRender, targetWidth: 1792, targetHeight: 768),
+            .h3_768p_4_3: H3Recipe(id: .h3_768p_4_3, tier: .baseRender, targetWidth: 1024, targetHeight: 768),
+            .h3_768p_3_4: H3Recipe(id: .h3_768p_3_4, tier: .baseRender, targetWidth: 768, targetHeight: 1024),
+            .h3_768p_1_1: H3Recipe(id: .h3_768p_1_1, tier: .baseRender, targetWidth: 768, targetHeight: 768),
+        ]
+        // Generated from the one table rather than transcribed twice: a
+        // portrait entry that disagreed with its landscape rung would be a
+        // plausible-looking size with no measurement behind it.
+        for rung in H3Ladder.rungs {
+            out[rung.landscape] = H3Recipe(id: rung.landscape, tier: .baseRender,
+                                           targetWidth: rung.width, targetHeight: rung.height)
+            out[rung.portrait] = H3Recipe(id: rung.portrait, tier: .baseRender,
+                                          targetWidth: rung.height, targetHeight: rung.width)
+        }
+        return out
+    }()
 }

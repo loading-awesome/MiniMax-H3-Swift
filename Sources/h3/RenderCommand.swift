@@ -53,7 +53,7 @@ struct RenderCommand: AsyncParsableCommand {
     @Option(help: "explicit height, a multiple of 32")
     var height: Int?
 
-    @Option(help: "a registered recipe, e.g. h3_768p_16_9")
+    @Option(help: "a registered recipe, e.g. h3_16x9_0p4mp (864x480, the verified shape)")
     var recipe: H3RecipeID?
 
     @Option(help: "16:9, 9:16, 21:9, 4:3, 3:4 or 1:1")

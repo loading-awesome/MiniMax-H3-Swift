@@ -130,9 +130,11 @@ public struct RenderRequest: Sendable {
 
     /// Explicit pixel dimensions, which override `recipe` and `aspectRatio`.
     ///
-    /// The tiers cannot express 864x480, and that is the shape every golden and
-    /// every measured tolerance uses — without this there is no way to render at
-    /// the verified shape at all.
+    /// **This used to be the only route to the verified shape.** The tiers
+    /// cannot express 864x480 — the shape every golden and every measured
+    /// tolerance uses — so before the megapixel ladder there was no way to name
+    /// it. `--recipe h3_16x9_0p4mp` is now that name, and this stays for sizes
+    /// off the ladder rather than for the one size that most needed it.
     public var width: Int?
     public var height: Int?
     public var recipe: H3RecipeID?
@@ -398,6 +400,9 @@ public struct RenderRequest: Sendable {
             return (rec.targetWidth, rec.targetHeight)
         }
         if let w = width, let h = height { return (w, h) }
+        // The 768p landscape and portrait sizes here are the ladder's 0.98 MP
+        // rung, so `--aspect-ratio` and `--recipe` cannot disagree about what
+        // 768p means. The other four ratios have no ladder and only this.
         let is2k = resolution == .k2
         switch aspectRatio {
         case .r16x9: return is2k ? (2560, 1440) : (1344, 768)
