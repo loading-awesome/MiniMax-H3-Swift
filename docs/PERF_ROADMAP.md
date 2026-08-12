@@ -1801,10 +1801,25 @@ K should route from `64x64x16, 1x2sg` to the already-shipped
 `32x64x16, 1x2sg` Steel kernel. The conservative M gate preserves the measured
 M=4096 regime where the original route already tied MPSGraph.
 
-The upstream-ready patch is `patches/mlx-m3-ultra-large-m-gemm.patch`. The
-SwiftPM dependency checkout was restored after measurement; making this durable
-in the application requires that patch in an MLX/mlx-swift fork or an upstream
-release. No custom kernel should ship.
+The upstream-ready patch is `patches/mlx-m3-ultra-large-m-gemm.patch`. No custom
+kernel should ship.
+
+**Status *(2026-08-12)*: applied to the SwiftPM checkout and enforced.** The
+sentence here used to read "the checkout was restored after measurement", which
+was true when it was written and had stopped being true without anything saying
+so — the patch was re-applied to build releases with the win, and the document
+still described a clean checkout. That is the same failure the patch itself has:
+no symptom.
+
+`Scripts/check-mlx-patch.sh` now fails the build when it is missing, and runs
+from both `bootstrap-metal.sh` and `package-release.sh`. It reverse-applies the
+patch to test for it, so it distinguishes *not applied* from *no longer
+applicable* — the second means the pinned mlx-swift revision has moved and the
+patch needs re-cutting, or that upstream now tunes this branch itself, in which
+case the check should be deleted rather than repaired.
+
+Making this durable outside the checkout still requires the patch in an
+MLX/mlx-swift fork or an upstream release. Until then it is enforced, not held.
 
 ### Independently reproduced *(2026-08-11)*
 

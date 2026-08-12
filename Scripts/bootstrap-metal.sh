@@ -47,3 +47,10 @@ if [ "$copied" -eq 0 ]; then
 fi
 
 echo "mlx.metallib -> $copied location(s)"
+
+# The GEMM patch check rides along here rather than in a script of its own that
+# nobody remembers to run. This is already the step that turns a bare
+# `swift build` into a working one, so it is the only place a development build
+# reliably passes through. It runs last: the metallib copy above is this
+# script's actual job and should not be held up by a performance concern.
+"$root/Scripts/check-mlx-patch.sh"

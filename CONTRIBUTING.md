@@ -31,6 +31,30 @@ remedy. Re-run the script after any build that relinks the test bundle.
 `Resources/mlx.metallib` is version-coupled to the mlx-swift revision pinned in
 `Package.resolved`. Bumping one means replacing the other.
 
+### The MLX GEMM patch, which your build will lose
+
+`bootstrap-metal.sh` ends by running `Scripts/check-mlx-patch.sh`, which fails
+when `patches/mlx-m3-ultra-large-m-gemm.patch` is not in the dependency
+checkout:
+
+```bash
+./Scripts/check-mlx-patch.sh --apply
+```
+
+That patch routes large bf16/fp16 matmuls on Ultra-class devices to a Steel
+kernel MLX already ships, and it is worth 8.6% of block time — measured, and
+bit-identical, in section 14 of `docs/PERF_ROADMAP.md`. It lives in
+`.build/checkouts`, which is gitignored, so **nothing in this repository can
+hold it**: `swift package reset`, `swift package update`, and a fresh clone all
+drop it silently. Nothing fails afterwards. The build succeeds, the tests pass,
+every number stays bit-identical, and the binary is slower for the rest of its
+life. The check exists because that failure has no other symptom.
+
+It is Ultra-class tuning, so a machine that will never take that branch does not
+need it. `H3_ALLOW_UNPATCHED_MLX=1` downgrades the failure to a warning. Do not
+set it for a release build — `Scripts/package-release.sh` runs the same check
+before it builds, and that is the binary somebody else ends up running.
+
 ### If the suite dies with SIGBUS and no failing test
 
 Delete `.build` and rebuild. Adding or reordering a case in `H3Error` — or any

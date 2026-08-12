@@ -49,6 +49,13 @@ sign_app="${H3_SIGN_APP:-}"
 sign_pkg="${H3_SIGN_PKG:-}"
 notary="${H3_NOTARY_PROFILE:-}"
 
+# Before the build, not after: this is the one build whose output is handed to
+# someone else, and the GEMM patch it depends on lives in a gitignored
+# dependency checkout that a reset or an update silently empties. An unpatched
+# release is correct, ~8.6% slower, and indistinguishable from a good one
+# without re-running the benchmark.
+"$root/Scripts/check-mlx-patch.sh"
+
 echo "building ${name}"
 swift build -c release --disable-sandbox
 
