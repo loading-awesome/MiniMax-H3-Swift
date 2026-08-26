@@ -48,9 +48,17 @@ let package = Package(
             ]
         ),
         .target(
+            name: "H3ANEBridge",
+            publicHeadersPath: "include",
+            linkerSettings: [
+                .linkedFramework("Foundation"),
+                .linkedFramework("IOSurface"),
+            ]
+        ),
+        .target(
             name: "H3Modules",
             dependencies: [
-                "H3Foundation", "H3Catalog", "H3Attention",
+                "H3Foundation", "H3Catalog", "H3Attention", "H3ANEBridge",
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXFast", package: "mlx-swift"),
@@ -120,7 +128,7 @@ let package = Package(
                                    .product(name: "MLXFast", package: "mlx-swift"),
                                    .product(name: "MLXRandom", package: "mlx-swift")]),
         .testTarget(name: "H3ModulesTests",
-                    dependencies: ["H3Modules", "H3Attention", "H3Hardware",
+                    dependencies: ["H3Modules", "H3Attention", "H3Hardware", "H3ANEBridge",
                                    .product(name: "MLX", package: "mlx-swift")]),
         .testTarget(name: "H3PipelineTests",
                     dependencies: ["H3Pipeline", "H3Foundation", "H3Catalog",

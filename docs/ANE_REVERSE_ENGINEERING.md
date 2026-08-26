@@ -176,7 +176,7 @@ into a rejected one.
 
 Per-die energy is what makes this worth having: the wall clock cannot say which
 die ran a job, and energy can. That is how the instance-hint result in
-`docs/ANE_OVERLAP_RESULTS.md` was found.
+the telemetry below was found.
 
 Two matching traps, both hit while building this. `"ANE"` is a substring of
 *Miscellaneous*, *VLane* and *LanesEng*, so a loose channel filter silently
@@ -275,8 +275,8 @@ The differential pass resolved this lead. `weightsBuffer` was accepted by the
 request and evaluation APIs but substituting a different weight matrix did not
 change the output. Two ordinary tensor inputs did work: changing the independent
 weight IOSurface changed the next evaluation without recompilation and matched
-the CPU oracle. Use the two-input program as the baseline; details and numerical
-results are in `docs/ANE_DIFFERENTIAL_RESULTS.md`.
+the CPU oracle. Use the two-input program as the baseline; the layout and rate consequences are
+under *MIL and weight representation* below.
 
 The installed runtime names that entitlement explicitly as
 `com.apple.aned.private.adapterWeight.allow`. That strongly suggests the field
@@ -298,11 +298,21 @@ _ANEInputBuffersReady
 _ANEOutputSetEnqueue
 ```
 
-This is evidence of driver-level wait and signal support. It is not evidence
-that the public Metal `MTLSharedEvent` interoperability behaves efficiently.
-OMLX found that the private request-wide event path serialized useful GPU work
-on its tested driver and instead used a CPU-side shared-event signal after ANE
-completion. We must repeat that experiment on build 25F84.
+This is evidence of driver-level wait and signal support, and on build 25F84
+none of it turned out to be needed.
+
+`evaluateWithQoS:` blocks the calling thread, so overlap is obtained by keeping
+the GPU busy across that block rather than by signalling into it: submit the
+GPU's share with `MLX.asyncEval` on its own stream, then call the engine.
+Measured 20.2 ms overlapped against 39.9 ms serial, for work that is 19.2 and
+19.8 ms alone.
+
+Two related seam questions, both answered: `MLXFast.metalKernel` allocates its
+own output buffer and **cannot** be pointed at an IOSurface, while
+`MLXArray(rawPointer:)` **does** map one at the same address. So results come
+back by adoption and inputs go out by copy — and the copy is cheap, because
+materialising the activation for the engine costs nothing beyond work MLX had to
+do anyway (1.214x from a materialised input against 1.216x from a lazy chain).
 
 ### Instrumentation
 
@@ -322,22 +332,59 @@ kANEFProcedureVariantHint = 1
 kANEFAneInstanceHint      = 1 or 2
 ```
 
-The keys are not present in a public header and their meaning is not established
-by selector inspection. A direct probe must show that two pinned requests run
-concurrently and that invalid hints fail predictably. Treat the values as
-version-specific data, not constants embedded throughout the implementation.
+**`kANEFAneInstanceHint` does not select a die.** Probed with per-die IOReport
+energy (`Energy Model|ANE0_0` and `ANE0_1`), a job submitted with the hint set
+to 2 burned its energy on die 0 and left die 1 powered down:
+
+| arm | die 0 | die 1 |
+|---|---|---|
+| ANE hint 1, alone | 1204 mJ | 0 mJ |
+| **ANE hint 2, alone** | **1209 mJ** | **0 mJ** |
+| two evaluations in flight | 1201 mJ | 1214 mJ |
+
+What engages the second die is **concurrency**: two evaluations outstanding at
+once, which the kernel load-balancer then spreads. Measured at the production
+shard, one evaluation is 19.90 ms and two concurrent are 19.91 — the second die
+is free. Two sequential are 39.7. `h3_ane_run_pair` exists for exactly this
+reason and runs its two shards on separate threads.
+
+Pass the hint anyway, since it is harmless, but never rely on it for placement
+or for per-die weight residency — the latter would be a correctness hazard.
 
 ## MIL and weight representation
 
-The working direct implementations feed textual MIL 1.3 to the in-memory
-descriptor. A linear is expressed as a 1x1 convolution over the channel-first
-layout:
+Textual MIL 1.3 goes to the in-memory descriptor. `H3ANEBridge` expresses a
+linear as a matmul over two runtime tensor inputs:
 
 ```text
-activation: [1, K, 1, S]
-weight:     [N, K, 1, 1]
-output:     [1, N, 1, S]
+a: [1, K, 1, S]   activation, sequence as the minor axis
+w: [1, K, 1, N]   weight, contraction axis leading
+y: [1, S, 1, N]   output, row-major [S, N] and contiguous
 ```
+
+reshaping `a` to `[1,1,K,S]`, transposing to `[1,1,S,K]`, and matmul-ing against
+`w` reshaped to `[1,1,K,N]`. Three layout facts were measured and none are
+guessable:
+
+- **The activation wants the sequence as its minor axis.** Declaring it
+  `[1,S,1,K]` and contracting the last axis of both operands via `transpose_y`
+  runs at 2.42 TFLOP/s a die and takes 30 seconds to compile; the form above
+  runs at 3.85 and compiles in under 100 ms.
+- **The output needs no transpose.** Reshaping the matmul result straight to
+  `[1,S,1,N]` gives the caller's own orientation, contiguous, so it can be
+  adopted into MLX rather than copied.
+- **The minor extent must pad well.** 3.87 TFLOP/s a die at S=14336 and 16384,
+  but 2.45 at S=15731, which is prime. Round the compiled length up to a
+  multiple of 64 and slice the surplus off.
+
+Rows are padded to a 64-byte stride within each surface. Weight binding was
+settled by differential test: `weightsBuffer` is accepted by the request API but
+substituting a different matrix does not change the output — it belongs to
+Apple's adapter-weight facility, gated by
+`com.apple.aned.private.adapterWeight.allow`. **Two ordinary tensor inputs are
+the primary path**: changing the weight IOSurface changes the next evaluation
+with no recompilation, and matches a CPU oracle to 2.2e-4. Static and dynamic
+lowerings are bit-identical, so there is no better lowering to find.
 
 Static weights use a `BLOBFILE` value at a 64-byte-aligned chunk. The observed
 blob convention includes a 64-byte file header, 64-byte chunk headers, type and
@@ -350,171 +397,6 @@ protobuf schemas, converter IR, shape/type semantics, and blob references. It
 does not publish the on-device ANE compiler or execution ABI. Use its schema and
 passes to generate controlled inputs; do not mistake it for the hardware
 backend.
-
-## Reverse-engineering protocol
-
-### Rule 1: one-variable differential tests
-
-For each graph, construct three forms:
-
-1. Public Core ML neural network or ML Program.
-2. Direct in-memory MIL with static weights.
-3. Direct in-memory MIL with the candidate dynamic binding.
-
-Change one property at a time. Record:
-
-- source model and MIL text hashes;
-- weight blob hash and exact byte layout;
-- OS build, compiler version, ANE architecture fingerprint;
-- Core ML compute plan and supported devices;
-- compile, load, map, first-evaluation, and warm-evaluation times;
-- private error domain, code, and complete description;
-- program handle, queue depth, procedure index, and execution options;
-- hardware execution time and counters when accessible;
-- output hash, relative RMS, maximum error, cosine, and non-finite count.
-
-Never infer placement from latency when `MLComputePlan` or the private runtime
-can report it directly.
-
-### Rule 2: characterize boundaries before production shapes
-
-Use small deterministic graphs to map each contract, then repeat the surviving
-form at H3 shapes. Required sweeps include:
-
-| Axis | Values or boundary |
-|---|---|
-| Channels | 63, 64, 65; 255, 256, 257; H3 `K` and `N` |
-| Spatial `S` | 1, 2, 63, 64, 65, 512, 2048, 4096, 16384, 16385 |
-| Dtype | FP16, BF16 where accepted, FP32 boundary conversion |
-| Operator | `matmul`, `linear`, 1x1 `conv` |
-| Inputs | one, multiple, packed single input |
-| Weights | static blob, tensor input, request `weightsBuffer` |
-| Program | one procedure, multiple procedures, changed procedure index |
-| Mapping | whole IOSurface, nonzero start offset, explicit map/unmap |
-| Sync | blocking call, completion handler, private shared events, host signal |
-| Placement | unpinned, instance 1, instance 2, invalid instance |
-
-Failures are results. Preserve the smallest failing and succeeding pair.
-
-### Rule 3: separate compile-time from runtime constraints
-
-Track these independently:
-
-- model/schema acceptance;
-- Core ML segmentation and placement;
-- MIL verification;
-- ANE compilation;
-- program load and static-weight mapping;
-- request IOSurface mapping;
-- evaluation and firmware execution;
-- output visibility to Metal.
-
-The reported approximately 2 GiB single-program constraint, approximately
-4 GiB resident-weight window, tensor-extent restrictions, and IOSurface mapping
-capacity may originate in different layers. A single generic "ANE limit" label
-would prevent useful workarounds.
-
-### Rule 4: cache by the actual compatibility boundary
-
-Any retained compiled artifact is invalidated when one of these changes:
-
-- OS build;
-- `_ANEDeviceInfo` architecture/subtype fingerprint;
-- ANECompiler framework version;
-- ABI selector/type-encoding fingerprint;
-- MIL text, weights, or options;
-- physical-instance hint;
-- cache schema version.
-
-A cache hit that fails to load is deleted and compiled once more. A second
-failure disables the experimental backend for that process.
-
-## Ordered experiments
-
-### RE-1 — ABI snapshot and drift detector
-
-Turn `inspect-runtime.m` output into a normalized manifest containing only the
-classes and selectors the project intends to call. Compare it against the
-checked-in manifest at startup and in diagnostics.
-
-Exit criterion: missing classes, changed type encodings, architecture changes,
-or compiler-version changes produce a clean incompatibility result before a
-model is loaded.
-
-### RE-2 — Public-to-private compiler oracle
-
-Generate a small model family with Core ML Tools, compile with
-`coremlcompiler`, obtain `MLComputePlan`, and recreate the same operations in
-textual MIL. Preserve the public model, compiled metadata, MIL, weight blob,
-and numerical outputs in a versioned diagnostic bundle.
-
-Exit criterion: static direct MIL reproduces Core ML output and placement for
-the same convolution-as-GEMM geometry.
-
-### RE-3 — Runtime weights
-
-Status: the deployable binding question is resolved on h15g/25F84.
-
-1. `weightsBuffer` was accepted but had no numerical effect.
-2. A second ordinary MIL tensor input worked and is the selected path.
-3. Packed activation and weights worked but showed slice-layout sensitivity.
-
-The next part of this phase is to determine whether total runtime mappings can
-exceed the static 4 GiB window across sequential layer surfaces.
-
-Exit criterion: identify the lowest-copy, non-entitled dynamic binding that
-works at all four H3 projection shapes.
-
-### RE-4 — Metal/ANE memory and synchronization
-
-Create Metal views over the same IOSurfaces and test producer/consumer ordering
-with sentinels. Compare blocking evaluation, completion handler, private shared
-events, and OMLX-style host signaling. Include nonzero IOSurface offsets and
-explicit map/unmap lifetimes.
-
-Exit criterion: a race-free path with no CPU payload copy and measured GPU/ANE
-overlap on this OS build.
-
-Status: the blocking control passed. Metal wrote the activation through a
-texture view of the same IOSurface, ANE consumed it with zero error, and a
-compute-bound GPU GEMM overlapped both pinned ANEs without measurable slowdown.
-Replacing the host wait at the producer/consumer boundary with an efficient
-event remains open. See `docs/ANE_OVERLAP_RESULTS.md`.
-
-### RE-5 — Dual-instance scheduling and locality
-
-Run identical programs unpinned, on instance 1, on instance 2, and concurrently.
-Then run disjoint weight partitions and place Metal work beside each case.
-Measure hardware time, wall time, memory traffic, and cross-die effects.
-
-Pinned instances 1 and 2 both matched the oracle. They also read the same
-activation and weight IOSurfaces concurrently at isolated latency while a GPU
-GEMM ran beside them. More detailed cross-die locality counters remain open.
-
-Exit criterion: prove whether two requests truly occupy distinct ANEs and
-derive a per-projection split policy from measured completion time.
-
-### RE-6 — Production-shape compiler map
-
-Sweep the four H3 projections through the surviving operator, weight, mapping,
-and synchronization forms at `S=2048`, then sweep sequence tiles. Record the
-smallest successful alignment and every adjacent failure boundary.
-
-Exit criterion: a complete compatibility and performance table that can replace
-assumptions in the implementation plan.
-
-## Open questions, in priority order
-
-1. Does the private shared-event path still serialize Metal work on build 25F84?
-2. Are dynamic-weight linears lowered to the same ANE convolution kernel as
-   static weights, or to a materially slower general tensor path?
-3. Is the approximately 4 GiB constraint an aggregate program-weight aperture,
-   a single mapping limit, or a combination of compiler and loader limits?
-4. What do queue depth, explicit map/unmap, cache-inference, and chaining change
-   about repeated tiled execution?
-5. How does memory locality interact with instance-pinned ANE and Metal work?
-6. Can ANE accept BF16 boundaries or intermediates on h15g, or is FP16 the only
-   viable direct format?
 
 ## Resulting design rules
 

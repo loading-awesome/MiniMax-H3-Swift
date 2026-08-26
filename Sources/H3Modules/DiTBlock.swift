@@ -335,7 +335,9 @@ package struct AttentionLayer {
     ///   first/last-block exclusions, and guessing is worse than declining.
     package func callAsFunction(_ x: MLXArray, ropeTable: MLXArray?,
                                context: AttentionContext? = nil) -> MLXArray {
-        let qkv = matmul(x, qkvWeight.T)
+        let qkv = ANELinearBackend.isEnabled
+            ? ANELinearBackend.project(x: x, weight: qkvWeight)
+            : matmul(x, qkvWeight.T)
         let qkvParts = qkv.split(parts: 3, axis: -1)
         
         let targetShape = qkvParts[0].shape.dropLast() + [heads, headDim]
@@ -356,7 +358,13 @@ package struct AttentionLayer {
         // failure this harness exists to prevent.
         let merged = Self.sdpa(q: q, k: k, v: v, headDim: headDim, fp32: fp32Attention,
                                backend: backend, context: context)
-        return matmul(merged, outWeight.T)
+        // `attn out` contracts over `inner` rather than `hidden`, so it builds
+        // its own compiled program. Its interior partials peak at 3,925 at
+        // block 49 — 8.3x under the 2^15 cliff unscaled, 134x with the operand
+        // scale this path applies — so it needs no bound beyond what is here.
+        return ANELinearBackend.isEnabled
+            ? ANELinearBackend.project(x: merged, weight: outWeight)
+            : matmul(merged, outWeight.T)
     }
 }
 
@@ -374,7 +382,18 @@ package struct H3MLP {
     }
 
     package func callAsFunction(_ x: MLXArray) -> MLXArray {
-        let h = matmul(x, fc1.T)
+        // `fc1` is the largest GEMM in a block — 262 ms against qkv's 197 at
+        // production width — and its interior partials peak at 72 against the
+        // engine's 2^15 cliff, so it is the cheapest projection to route and
+        // the one with the most to give.
+        //
+        // `fc2` is deliberately not routed. It breaches saturation at block 49
+        // (34,649) and the failure is silent zeros, so it waits on a measured
+        // per-block bound rather than on an operand scale that is merely
+        // probably enough.
+        let h = ANELinearBackend.isEnabled
+            ? ANELinearBackend.project(x: x, weight: fc1)
+            : matmul(x, fc1.T)
         let parts = h.split(parts: 2, axis: -1)
         let gate = parts[0]
         let up = parts[1]

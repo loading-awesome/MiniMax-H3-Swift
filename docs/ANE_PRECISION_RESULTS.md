@@ -26,7 +26,7 @@ A power-of-two scale on the operand fixes it exactly, at no precision cost.
 
 ## Why the earlier numbers were wrong
 
-`docs/ANE_PROJECTION_SPIKE.md` recorded 3.17% and treated it as the engine's
+An earlier synthetic fixture recorded 3.17% and treated it as the engine's
 error. It was the fixture's. That fixture used activations at RMS ~0.017 and
 weights at RMS ~0.012; the real model runs activations from 0.1 to 293 and
 weights near 0.13, so a third of the fixture's products fell below fp16's
@@ -109,6 +109,32 @@ output signals it. The quantity that must be bounded before any shape is
 enabled is `max|interior partial|`, per projection and per block — not the
 output magnitude, which stays small precisely because the partials cancel.
 
+## The bound, over every captured row and every order
+
+The figures above sample a 64x64 corner and follow a cumulative sum in index
+order. `Tools/ANE/saturation_bound.py` replaces both: it evaluates
+`sum_k |a_k w_k|`, which bounds a partial sum under *any* accumulation order —
+the relevant property, since the engine's order is not documented — over all
+1024 captured rows and all output channels of all nine production oracles.
+
+At the 1/16 operand scale, worst case across every oracle:
+
+| projection | worst bound | block | headroom | verdict |
+|---|---:|---:|---:|---|
+| `mlp fc1` | 2,428 | 49 | 216x | proven under any order |
+| `qkv` | 5,132 | 49 | 102x | proven under any order |
+| `attn out` | 69,912 | 49 | 7.5x | proven under any order |
+| `mlp fc2` | 978,586 | 49 | 0.5x | **not proven** |
+
+The index-order figure for `fc2` at block 49 is about 8,000 against a bound of
+978,586, so the bound carries roughly 100x of slack. That slack is not danger —
+it is the price of not knowing the hardware's order — but it is also not a
+licence to route `fc2` on the index-order number.
+
+`fc2`'s bound is non-monotonic with depth: 43,746 at block 0, 10,252 at block
+24, 978,586 at block 49. Nothing measured supports interpolating across the
+twenty-four unmeasured blocks between 24 and 49.
+
 ## The fix, measured
 
 A linear projection is homogeneous, so scaling the activation by a power of two
@@ -182,49 +208,25 @@ precision. Sync is unambiguously present on both arms: mouth measured in
 +0.02 to +0.13. Drift is a separate defect, it is present on both arms, and it
 is **worse on the bf16 production path** than on fp16.
 
-> **Recorded because it was got wrong twice, then settled by viewing.**
+> **Calibration decision, 2026-08-26: the drift is within threshold.** The lag
+> really does move — a correlation-weighted trend against its own standard error
+> gives 4.7 sigma on bf16 and 2.7 on fp16, and it survives raising the
+> per-window confidence bar. It is not noise. But a person watching is what this
+> oracle approximates, and a person watching does not see it. The bar is 250 ms
+> across a render and both arms pass.
 >
-> The first report of these gates quoted "FAIL on both" without the global
-> correlation above it, and concluded that the model's own oracle disagreed that
-> picture and voice come from one pass. That was wrong: the oracle strongly
-> confirms sync exists.
+> The basis, so it can be argued with: the global offset is **-83 ms**, inside
+> the ~125 ms at which a fixed offset becomes audible; the excursion crosses
+> zero partway through rather than accumulating; and the shot is a profile
+> mid-shot, where lip-sync tolerance is widest. A **frontal close-up** would
+> overturn it — `--max-drift 120` is the right setting there and this clip fails
+> it. So would a second viewer disagreeing; this is one person on one clip.
 >
-> The correction then over-shot. Told that the sync looks right on screen, the
-> failure was written off as the drift heuristic firing on noisy windows. It is
-> not noise. A correlation-weighted trend over the windows that located an
-> interior peak, tested against its own standard error, gives **4.7 sigma on
-> bf16 and 2.7 sigma on fp16**. It survives raising the per-window confidence
-> bar. The lag really does move, by about 200 ms across five seconds.
->
-> **Calibration decision, 2026-08-26: this is within threshold.** A person
-> watching is what this oracle exists to approximate, and a person watching does
-> not see it. The drift bar is set at 250 ms across a render, and both arms pass.
->
-> The basis, so it can be argued with rather than inherited:
->
-> * The global offset is **-83 ms**, inside the ~125 ms at which a fixed offset
->   becomes audible, so the drift is around a centre that is itself fine.
-> * The excursion passes through zero partway through the clip rather than
->   accumulating away from it.
-> * The framing is a profile mid-shot. Lip-sync tolerance is a function of how
->   legible articulation is, and it is widest exactly here.
->
-> What would overturn it: a **frontal close-up**, where articulation is legible
-> and the real tolerance is much tighter — `--max-drift 120` still fails this
-> clip, and that is the right setting for that shot. A second viewer seeing it
-> would also overturn it; this is one person on one clip.
->
-> The threshold is a command-line option rather than a constant, because a
-> judgement that cannot be argued with on the command line is a constant
-> pretending to be evidence. **The measurement is still printed when it passes**
-> — raising a bar must not also hide the number that prompted it, and 219 ms
-> against 128 ms is a real difference between two renders whatever the verdict
-> says.
->
-> The drift check itself was genuinely defective and was fixed on the way: it
-> tested *spread*, max minus min, which mixes drift with the noise of estimating
-> a lag from a one-second window. It fits a weighted trend now and demands 2.5
-> sigma.
+> The threshold is a command-line option, not a constant, and **the measurement
+> still prints when it passes**: raising a bar must not hide the number that
+> prompted it. The check itself was defective and was fixed on the way — it
+> tested *spread*, which mixes drift with the noise of estimating a lag from a
+> one-second window. It fits a weighted trend now.
 
 **Two consequences for the ANE route, and the second is the awkward one.**
 
@@ -265,11 +267,11 @@ second prompt would make it sturdier.
 
 ## Caveats
 
-`max|partial|` here is a **lower bound**. It is a maximum over a 64x64 sample of
-a projection that is 15,406 rows by up to 28,672 columns, so the true envelope
-over a full tensor is higher and the real margin is tighter than these numbers
-show. Block 49 fc2 already breaches on the sample; the others need a full-tensor
-bound before any of them is called safe.
+The `max|partial|` figures in the block tables above are a **lower bound** — a
+maximum over a 64x64 sample, in index order. They are kept because they are what
+first found the `fc2` breach, but they are not the safety criterion. That is the
+order-free bound above, which covers every captured row and every output channel
+and holds under any accumulation order.
 
 These are single-block, single-projection errors. Propagation through 50 blocks
 and 20 steps is not measured here, and a per-projection improvement over bf16
