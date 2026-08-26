@@ -125,6 +125,79 @@ four orders of magnitude above the denormal boundary, so underflow rises only
 from 4.9% to 7.9% and the relative error does not move at all. **1/16 buys 15x
 headroom for free.**
 
+## Does it survive a whole trajectory?
+
+*Measured 2026-08-26. Two complete renders, identical prompt and seed 7,
+864x480 5 s 20 steps on `h3_16x9_0p4mp` at `--quality faithful` so no step
+cache confounds the comparison. Only the DiT's compute dtype differs.*
+
+Every number above is single-shot. A render is 50 blocks times 20 steps, and a
+diffusion trajectory can compound a perturbation as easily as wash one out, so
+per-projection accuracy does not settle the question on its own.
+
+| | bf16 | fp16 |
+|---|---|---|
+| speech check | **PASS**, WER 0.50, 3/3 keywords | **PASS**, WER 0.50, 3/3 keywords |
+| transcript | "Harold, you're tied. The tide is coming in fast." | "Carol, your tide, the tide is coming in fast." |
+| picture | coherent | coherent |
+
+| comparison | |
+|---|---:|
+| PSNR | 25.05 dB |
+| relative RMS | 0.1154 |
+| identical frames | 0 of 124 |
+| audio correlation | 0.728 |
+| PSNR by thirds | 24.96 / 25.34 / 25.25 dB |
+
+**Quality survives; reproducibility does not.** Both renders are clean,
+well-formed, same scene and composition, and both pass the speech gate with the
+same word error rate and all three keywords. But no frame matches, the audio
+correlates at 0.73, and the two outputs are different *samples* rather than the
+same sample carrying rounding noise.
+
+The flat profile across thirds says this is not progressive drift. The
+trajectory diverged early and stayed diverged, which is what a chaotic sampler
+does with any perturbation: a change far below the noise floor of the first
+step selects a different basin, and the sampler then renders that basin
+faithfully.
+
+**Two consequences for the ANE route, and the second is the awkward one.**
+
+The arithmetic objection is now closed at both ends. Per projection the engine
+beats bf16; end to end, an fp16-class perturbation costs no quality.
+
+But **the ANE path can never be validated by comparing against a bf16 golden
+render.** Any arithmetic change reselects the sample, so a bit-comparison or a
+PSNR gate against the existing goldens will always fail and will always fail
+for the wrong reason. Conformance for this path has to be independent quality
+measurement — speech check, face check, coherence — plus self-consistency
+across runs, and it needs its own goldens generated under its own arithmetic.
+
+It also puts a number behind a rule the plan already had. A request failure
+that silently moves one projection back to the GPU mid-render does not degrade
+that render slightly; it puts a discontinuity in the trajectory. All-or-nothing
+per render is not caution, it is the only coherent option.
+
+### What this run does not show
+
+The diagnostic runs fp16 **activations against bf16 weights**, because
+`computeDType` casts activations and the checkpoint stays bf16. That is a
+perturbation of the right magnitude but not the engine's exact arithmetic, and
+the conclusion holds only because the finding is about trajectory sensitivity
+rather than about fp16 specifically — any perturbation at this level would
+reselect the sample.
+
+The same mixed-dtype detail explains the timing, which should **not** be read
+as a hardware result: fp16 measured 75.70 s/step against bf16's 55.95 s/step,
+but that is MLX reconciling an fp16 activation with a bf16 weight on every
+matmul, an overhead this diagnostic introduced. It does not contradict
+PERF_ROADMAP's finding that MLX's bf16 and fp16 GEMM rates are identical, and
+it does not bear on the ANE plan, which keeps the GPU's shard in bf16.
+
+This is one prompt at one seed. Divergence-versus-degradation was decided by
+looking at the frames and running the speech gate, not by the PSNR, and a
+second prompt would make it sturdier.
+
 ## Caveats
 
 `max|partial|` here is a **lower bound**. It is a maximum over a 64x64 sample of

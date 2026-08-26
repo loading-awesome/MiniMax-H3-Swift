@@ -355,6 +355,19 @@ Any initialization failure falls back before sampling begins. A request failure
 after sampling begins is fatal for that render; silently changing arithmetic
 halfway through a diffusion trajectory would invalidate reproducibility.
 
+> **Measured 2026-08-26.** Two renders differing only in DiT compute dtype
+> produce *different samples of equal quality*: both pass the speech gate with
+> the same word error rate and all three keywords, and no frame matches
+> (25.05 dB, audio correlation 0.728). So the all-or-nothing rule above is not
+> caution — a mid-render arithmetic change puts a discontinuity in the
+> trajectory rather than a small error in the output.
+>
+> It also means **this path cannot be gated against the existing bf16
+> goldens.** Any comparison to them will fail, and for the wrong reason.
+> Conformance has to be independent quality measurement plus self-consistency,
+> against goldens regenerated under the ANE's own arithmetic. That is a
+> change to the Phase 5 and Phase 6 plan, not a detail.
+
 ## Work plan and gates
 
 ### Phase R — Reverse-engineer the installed stack

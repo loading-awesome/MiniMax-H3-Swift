@@ -28,6 +28,41 @@ import H3Modules
 /// make it allocate again.
 package enum PipelineRuntime {
 
+    /// The dtype the DiT block stack runs in, overridable for one specific
+    /// diagnostic and nothing else.
+    ///
+    /// Contract 8 pins production at bf16 and this does not change that: the
+    /// default is unchanged and the override has to be asked for by name. It
+    /// exists because `docs/ANE_PRECISION_RESULTS.md` measured the ANE's
+    /// arithmetic as *more* accurate than bf16 per projection — 7e-5 to 5e-4
+    /// against the bf16 GPU path's 1.66e-3 — and that result is single-shot.
+    /// A forward is 50 blocks and a render is 20 of them, so the question it
+    /// cannot answer is whether a per-projection improvement survives a
+    /// thousand evaluations of a diffusion trajectory, which can compound an
+    /// error as easily as it can wash one out.
+    ///
+    /// fp16 with a wide accumulator is the closest proxy for the engine's
+    /// datapath that runs on the GPU, so this answers the propagation question
+    /// without any private API, any bridge, or any of the integration work the
+    /// ANE route would need. If a full render holds at fp16, the arithmetic is
+    /// not what stands in the way; if it drifts, none of the rest matters.
+    ///
+    ///     H3_DIT_DTYPE=fp16 h3 render ...
+    static func diagnosticComputeDType(log: (String) -> Void) -> DType {
+        switch ProcessInfo.processInfo.environment["H3_DIT_DTYPE"] {
+        case "fp16", "float16":
+            log("DiT compute dtype overridden to fp16 — diagnostic only, "
+                + "contract 8 pins production at bf16")
+            return .float16
+        case "fp32", "float32":
+            log("DiT compute dtype overridden to fp32 — diagnostic only, "
+                + "2x residency")
+            return .float32
+        default:
+            return .bfloat16
+        }
+    }
+
     /// Where the checkpoints are.
     ///
     /// Resolved by the caller — usually from `H3Configuration` and `Catalog` —
@@ -163,7 +198,8 @@ package enum PipelineRuntime {
         mark(.sampling, "loading the DiT", completed: 0, total: request.steps)
         phase = Date()
         let weights = try H3Weights(url: checkpoints.dit)
-        let model = try H3Transformer(weights: weights, computeDType: .bfloat16,
+        let model = try H3Transformer(weights: weights,
+                                      computeDType: PipelineRuntime.diagnosticComputeDType(log: log),
                                       backend: selection.backend)
         timings.modelLoad = Date().timeIntervalSince(phase)
         reportMemory("after the DiT load", log: log)
