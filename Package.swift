@@ -94,7 +94,7 @@ let package = Package(
         .executableTarget(
             name: "h3-facecheck",
             dependencies: [.product(name: "ArgumentParser", package: "swift-argument-parser")],
-            path: "Tools", sources: ["FaceCheck.swift"]
+            path: "Tools", exclude: ["ANE", "LipSyncCheck.swift", "__pycache__", "anchor_check.py", "arm_compare.py", "audio_match.py", "coherence_check.py", "speech_check.py"], sources: ["FaceCheck.swift"]
         ),
         .executableTarget(
             name: "h3-lipsync",
@@ -102,7 +102,7 @@ let package = Package(
                 "H3Foundation", "H3Pipeline",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ],
-            path: "Tools", sources: ["LipSyncCheck.swift"]
+            path: "Tools", exclude: ["ANE", "FaceCheck.swift", "__pycache__", "anchor_check.py", "arm_compare.py", "audio_match.py", "coherence_check.py", "speech_check.py"], sources: ["LipSyncCheck.swift"]
         ),
         .testTarget(name: "H3FoundationTests", dependencies: ["H3Foundation"]),
         .testTarget(name: "H3CatalogTests", dependencies: ["H3Catalog"]),
