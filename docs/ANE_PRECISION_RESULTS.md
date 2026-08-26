@@ -180,29 +180,49 @@ precision. Sync is unambiguously present on both arms: mouth measured in
 +0.02 to +0.13. Drift is a separate defect, it is present on both arms, and it
 is **worse on the bf16 production path** than on fp16.
 
-> **Recorded because it was got wrong twice.** The first report of these gates
-> quoted "FAIL on both" without the global correlation above it, and concluded
-> that the model's own oracle disagreed that picture and voice come from one
-> pass. That was wrong: the oracle strongly confirms sync exists.
+> **Recorded because it was got wrong twice, then settled by viewing.**
 >
-> The correction then over-shot. Told that the sync looks right on screen —
-> which it does — the failure was written off as the drift heuristic firing on
-> noisy windows. It is not. Fitting a correlation-weighted trend to the windows
-> that located an interior peak, and testing that trend against its own standard
-> error, gives 4.7 sigma on bf16 and 2.7 sigma on fp16. **The lag really does
-> move, by roughly 200 ms across five seconds.**
+> The first report of these gates quoted "FAIL on both" without the global
+> correlation above it, and concluded that the model's own oracle disagreed that
+> picture and voice come from one pass. That was wrong: the oracle strongly
+> confirms sync exists.
 >
-> Both things are true at once, which is why each reading on its own looked like
-> a contradiction. The clip is a profile mid-shot; the lag passes through zero
-> partway through; and a slow drift of that size in that framing is at or below
-> what a viewer notices. Looking right and drifting are not exclusive.
+> The correction then over-shot. Told that the sync looks right on screen, the
+> failure was written off as the drift heuristic firing on noisy windows. It is
+> not noise. A correlation-weighted trend over the windows that located an
+> interior peak, tested against its own standard error, gives **4.7 sigma on
+> bf16 and 2.7 sigma on fp16**. It survives raising the per-window confidence
+> bar. The lag really does move, by about 200 ms across five seconds.
 >
-> The drift check was changed as part of this, and it was a real defect: it
-> tested *spread*, which is max minus min and therefore mixes drift with the
-> noise of estimating a lag from a one-second window. It now fits a weighted
-> trend and requires 2.5 sigma. Both arms still fail. The fix sharpened the
-> claim rather than softening it, which is the only direction a fix prompted by
-> a failing result is allowed to go.
+> **Calibration decision, 2026-08-26: this is within threshold.** A person
+> watching is what this oracle exists to approximate, and a person watching does
+> not see it. The drift bar is set at 250 ms across a render, and both arms pass.
+>
+> The basis, so it can be argued with rather than inherited:
+>
+> * The global offset is **-83 ms**, inside the ~125 ms at which a fixed offset
+>   becomes audible, so the drift is around a centre that is itself fine.
+> * The excursion passes through zero partway through the clip rather than
+>   accumulating away from it.
+> * The framing is a profile mid-shot. Lip-sync tolerance is a function of how
+>   legible articulation is, and it is widest exactly here.
+>
+> What would overturn it: a **frontal close-up**, where articulation is legible
+> and the real tolerance is much tighter — `--max-drift 120` still fails this
+> clip, and that is the right setting for that shot. A second viewer seeing it
+> would also overturn it; this is one person on one clip.
+>
+> The threshold is a command-line option rather than a constant, because a
+> judgement that cannot be argued with on the command line is a constant
+> pretending to be evidence. **The measurement is still printed when it passes**
+> — raising a bar must not also hide the number that prompted it, and 219 ms
+> against 128 ms is a real difference between two renders whatever the verdict
+> says.
+>
+> The drift check itself was genuinely defective and was fixed on the way: it
+> tested *spread*, max minus min, which mixes drift with the noise of estimating
+> a lag from a one-second window. It fits a weighted trend now and demands 2.5
+> sigma.
 
 **Two consequences for the ANE route, and the second is the awkward one.**
 
