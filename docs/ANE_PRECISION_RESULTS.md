@@ -161,6 +161,49 @@ does with any perturbation: a change far below the noise floor of the first
 step selects a different basin, and the sampler then renders that basin
 faithfully.
 
+### The four gates
+
+| gate | bf16 | fp16 |
+|---|---|---|
+| speech | PASS, WER 0.50, 3/3 keywords | PASS, WER 0.50, 3/3 keywords |
+| face | PASS, "present and stable, no flashes" | PASS, same |
+| coherence | reference | detail 0.981, accel 0.890, dssim 0.0109 |
+| lip sync — is it in sync | r **+0.628** at -83 ms, margin **+0.497** over controls | r **+0.690** at -83 ms, margin **+0.576** |
+| lip sync — does it drift | **FAIL**, 219 ms, 4.7 sigma | **FAIL**, 128 ms, 2.7 sigma |
+
+No gate separates fp16 from bf16 adversely; where they differ, fp16 is
+marginally ahead. That is the result this section is about.
+
+The lip-sync rows are two different questions and only the first bears on
+precision. Sync is unambiguously present on both arms: mouth measured in
+124/124 frames, correlation near +0.65 against timing-destroyed controls at
++0.02 to +0.13. Drift is a separate defect, it is present on both arms, and it
+is **worse on the bf16 production path** than on fp16.
+
+> **Recorded because it was got wrong twice.** The first report of these gates
+> quoted "FAIL on both" without the global correlation above it, and concluded
+> that the model's own oracle disagreed that picture and voice come from one
+> pass. That was wrong: the oracle strongly confirms sync exists.
+>
+> The correction then over-shot. Told that the sync looks right on screen —
+> which it does — the failure was written off as the drift heuristic firing on
+> noisy windows. It is not. Fitting a correlation-weighted trend to the windows
+> that located an interior peak, and testing that trend against its own standard
+> error, gives 4.7 sigma on bf16 and 2.7 sigma on fp16. **The lag really does
+> move, by roughly 200 ms across five seconds.**
+>
+> Both things are true at once, which is why each reading on its own looked like
+> a contradiction. The clip is a profile mid-shot; the lag passes through zero
+> partway through; and a slow drift of that size in that framing is at or below
+> what a viewer notices. Looking right and drifting are not exclusive.
+>
+> The drift check was changed as part of this, and it was a real defect: it
+> tested *spread*, which is max minus min and therefore mixes drift with the
+> noise of estimating a lag from a one-second window. It now fits a weighted
+> trend and requires 2.5 sigma. Both arms still fail. The fix sharpened the
+> claim rather than softening it, which is the only direction a fix prompted by
+> a failing result is allowed to go.
+
 **Two consequences for the ANE route, and the second is the awkward one.**
 
 The arithmetic objection is now closed at both ends. Per projection the engine

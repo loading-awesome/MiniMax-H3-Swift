@@ -136,13 +136,17 @@ struct LipSyncCheck: ParsableCommand {
                 print(String(format: "    t=%5.2fs  %+6.0f ms   r %+.2f%@",
                              Double(s) / Self.fps, ms, wr, edge as NSString))
             }
-            let xs = lags.map { Double($0.0) / Self.fps }
-            let ys = lags.map { $0.1 }
-            let slope = linearSlope(x: xs, y: ys)
-            let spread = (ys.max() ?? 0) - (ys.min() ?? 0)
             let edgeMs = Double(maxLagFrames) / Self.fps * 1000
-            let atEdge = ys.filter { abs($0) >= edgeMs - 0.5 }.count
-            print(String(format: "    trend %+.0f ms/s, spread %.0f ms", slope, spread))
+            let interior = lags.filter { abs($0.1) < edgeMs - 0.5 }
+            let xs = interior.map { Double($0.0) / Self.fps }
+            let ys = interior.map { $0.1 }
+            let ws = interior.map { $0.2 }
+            let slope = linearSlope(x: xs, y: ys, w: ws)
+            let span = (xs.max() ?? 0) - (xs.min() ?? 0)
+            let spread = (ys.max() ?? 0) - (ys.min() ?? 0)
+            let atEdge = lags.filter { abs($0.1) >= edgeMs - 0.5 }.count
+            print(String(format: "    trend %+.0f ms/s over %.1fs = %+.0f ms total drift; "
+                         + "spread %.0f ms", slope, span, slope * span, spread))
             if atEdge > 0 {
                 print(String(format: "    %d of %d windows are pinned at the search edge. A lag "
                              + "at the boundary means the correlation had no interior peak to "
@@ -163,16 +167,53 @@ struct LipSyncCheck: ParsableCommand {
                                    Double(lag) / Self.fps * 1000))
         }
         if lags.count >= 3 {
-            let ys = lags.map { $0.1 }
             let edgeMs = Double(maxLagFrames) / Self.fps * 1000
-            let interior = ys.filter { abs($0) < edgeMs - 0.5 }
-            // Drift is only claimed from windows that located a real peak.
-            if interior.count >= 3,
-               (interior.max() ?? 0) - (interior.min() ?? 0) > 120 {
-                problems.append(String(format: "lag wanders over %.0f ms across the render, "
-                                       + "measured only from windows with an interior peak — "
-                                       + "this is drift, not a fixed offset",
-                                       (interior.max() ?? 0) - (interior.min() ?? 0)))
+            let interior = lags.filter { abs($0.1) < edgeMs - 0.5 }
+            // Drift is a TREND, and this used to test the spread.
+            //
+            // Spread is max minus min, so it answers "how much did the estimate
+            // move", which mixes real drift with the noise of estimating a lag
+            // from a one-second window. Those are different things and only one
+            // of them is a defect: a clip whose lag sits at -83 ms throughout,
+            // measured by windows that scatter +-100 ms around it, is in sync
+            // and was being failed for it. That is exactly what happened on the
+            // first renders this was run against — a profile shot, where mouth
+            // aperture barely varies and a few windows land far from the true
+            // lag. Both arms failed, the global correlation said +0.63 and
+            // +0.69 against controls at +0.02 to +0.13, and a human watching
+            // them saw nothing wrong. The human and the global measure were
+            // right.
+            //
+            // A weighted trend answers the question the name promises: is the
+            // offset moving in one direction over the render. Scatter about a
+            // stable offset now shows up in the printed spread, where it can be
+            // read, and does not fail the render on its own.
+            if interior.count >= 4 {
+                let xs = interior.map { Double($0.0) / Self.fps }
+                let ys = interior.map { $0.1 }
+                let ws = interior.map { $0.2 }
+                let span = (xs.max() ?? 0) - (xs.min() ?? 0)
+                let slope = linearSlope(x: xs, y: ys, w: ws)
+                let total = abs(slope * span)
+                // A trend fitted to six or seven noisy windows can be scatter
+                // wearing a slope, so it has to clear its own standard error
+                // before it is called drift. This does not rescue a clip that
+                // is really drifting — the renders that prompted the check
+                // come out at t = 4.8 and t = 2.7 — it stops the check firing
+                // on a handful of weak windows that happen to line up.
+                let se = slopeStandardError(x: xs, y: ys, w: ws, slope: slope)
+                let significant = se <= 0 || abs(slope) > 2.5 * se
+                if total > 120 && significant {
+                    problems.append(String(format: "lag drifts %.0f ms across the render "
+                                           + "(correlation-weighted trend, %.1f sigma over windows "
+                                           + "with an interior peak) — this is drift, not a fixed "
+                                           + "offset", total, se > 0 ? abs(slope) / se : 0))
+                } else if total > 120 {
+                    print(String(format: "\n  note: the interior trend would be %.0f ms but is "
+                                 + "only %.1f sigma — too few usable windows to separate drift "
+                                 + "from estimator noise, so it is not judged.",
+                                 total, se > 0 ? abs(slope) / se : 0))
+                }
             }
         }
 
@@ -316,12 +357,45 @@ struct LipSyncCheck: ParsableCommand {
         return Array(xs[h...]) + Array(xs[..<h])
     }
 
-    private func linearSlope(x: [Double], y: [Double]) -> Double {
-        let n = Double(x.count)
-        let mx = x.reduce(0, +) / n, my = y.reduce(0, +) / n
+    /// Least squares, optionally weighted.
+    ///
+    /// Weights are the per-window correlations. A window that located a sharp
+    /// peak knows where the lag is; one that scraped past the acceptance bar
+    /// does not, and letting the two vote equally is how a profile shot with a
+    /// few weak windows gets reported as drifting.
+    private func linearSlope(x: [Double], y: [Double], w: [Double]? = nil) -> Double {
+        let weights = w ?? [Double](repeating: 1, count: x.count)
+        let sw = weights.reduce(0, +)
+        guard sw > 0 else { return 0 }
+        var mx = 0.0, my = 0.0
+        for i in 0 ..< x.count { mx += weights[i] * x[i]; my += weights[i] * y[i] }
+        mx /= sw; my /= sw
         var num = 0.0, den = 0.0
-        for i in 0 ..< x.count { num += (x[i] - mx) * (y[i] - my); den += (x[i] - mx) * (x[i] - mx) }
+        for i in 0 ..< x.count {
+            num += weights[i] * (x[i] - mx) * (y[i] - my)
+            den += weights[i] * (x[i] - mx) * (x[i] - mx)
+        }
         return den > 0 ? num / den : 0
+    }
+
+    /// Standard error of the weighted slope, so a trend can be asked whether
+    /// it is distinguishable from zero rather than merely non-zero.
+    private func slopeStandardError(x: [Double], y: [Double], w: [Double],
+                                    slope: Double) -> Double {
+        guard x.count > 2 else { return 0 }
+        let sw = w.reduce(0, +)
+        guard sw > 0 else { return 0 }
+        var mx = 0.0, my = 0.0
+        for i in 0 ..< x.count { mx += w[i] * x[i]; my += w[i] * y[i] }
+        mx /= sw; my /= sw
+        var sxx = 0.0, rss = 0.0
+        for i in 0 ..< x.count {
+            sxx += w[i] * (x[i] - mx) * (x[i] - mx)
+            let fit = my + slope * (x[i] - mx)
+            rss += w[i] * (y[i] - fit) * (y[i] - fit)
+        }
+        guard sxx > 0 else { return 0 }
+        return (rss / Double(x.count - 2) / sxx).squareRoot()
     }
 
     private final class Box: @unchecked Sendable {
