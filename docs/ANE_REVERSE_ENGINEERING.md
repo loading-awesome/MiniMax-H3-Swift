@@ -6,6 +6,8 @@
 - ANE compiler framework: 9.509.0
 - Date: 2026-08-26
 
+> This page records machine fingerprint and recovered ABI. For where the whole ANE question stands today, and which of its conclusions have since been corrected, see `docs/ANE_STATUS.md`.
+
 ## Conclusion
 
 The initial assumption is partly right. Core ML presents a generalized public

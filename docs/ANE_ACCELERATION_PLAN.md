@@ -1,7 +1,10 @@
 # ANE acceleration plan for the H3 DiT
 
 - Status: research plan; no production ANE backend exists yet
-- Written: 2026-08-26
+- **Current position: `docs/ANE_STATUS.md`** — read that first; this document
+  is the design and its gates, and several of its gates have since been
+  measured and corrected in place
+- Written and revised: 2026-08-26
 - Target machine: M3 Ultra, macOS 15+
 - Initial scope: the four large linear projections in each DiT block
 - Explicit non-goal: moving dense attention to ANE in the first implementation
@@ -19,10 +22,21 @@ and all existing model orchestration on MLX/Metal. Compile a small set of
 fixed-shape MIL programs once, supply one layer's weights dynamically through
 IOSurface, and join the independently produced output columns without sending
 either result through the CPU. The work proceeds through isolated probes with
-hard correctness, concurrency, copy-cost, and end-to-end gates. If dynamic
-weights require a per-dispatch staging copy, GPU and ANE do not overlap, or the
-projected full-forward gain falls below 1.20x, stop before production
-integration.
+hard correctness, concurrency, copy-cost, and end-to-end gates.
+
+> **Revised 2026-08-26, after the probes this paragraph proposed.** Two of its
+> three stop conditions have been answered and neither fires: GPU and ANE do
+> overlap, and dynamic weights need no per-dispatch staging copy. Two of its
+> assumptions were wrong and are corrected below — `kANEFAneInstanceHint` does
+> **not** pin a program to a physical die, so "both physical ANE instances"
+> above means "two concurrent submissions the load balancer places"; and the
+> full-forward projection was solved with attention overlapping the linears,
+> which the block's dependency chain forbids.
+>
+> The remaining stop condition is the live one, and the threshold moved. The
+> measured position is **1.078x**, rising to **1.214x** if the engine can be fed
+> without draining MLX's graph. The gate is 1.15x, so that single question
+> decides it. See `docs/ANE_STATUS.md`.
 
 ## Why this is worth testing
 
@@ -342,7 +356,10 @@ The backend starts as an explicit diagnostic opt-in, for example
 `H3_ANE=experimental`. It activates only when all of these are true:
 
 - supported Apple Silicon and macOS build;
-- both physical ANE instances can be acquired when dual mode is requested;
+- two concurrent submissions actually land on two dies, **verified by per-die
+  energy rather than requested by hint** — `kANEFAneInstanceHint` does not
+  choose an engine, and a design that assumes it does will silently run both
+  shards on one die;
 - every required program compiles and passes a warm-up dispatch;
 - memory allocation and Metal interop succeed;
 - the model uses a validated geometry and dtype;

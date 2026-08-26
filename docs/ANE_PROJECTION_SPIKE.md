@@ -4,6 +4,8 @@ Date: 2026-08-26
 Host: M3 Ultra, macOS build 25F84, ANE architecture `h15g`  
 Tool: `Tools/ANE/projection-spike.mm`
 
+> This page records one production QKV projection. For where the whole ANE question stands today, and which of its conclusions have since been corrected, see `docs/ANE_STATUS.md`.
+
 ## Outcome
 
 A production-shape H3 QKV projection is faster when split across the GPU and

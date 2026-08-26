@@ -4,6 +4,8 @@ Date: 2026-08-26
 Host: M3 Ultra, macOS build 25F84, ANE architecture `h15g`  
 Tool: `Tools/ANE/overlap.mm`
 
+> This page records concurrency, per-die energy, DRAM bandwidth. For where the whole ANE question stands today, and which of its conclusions have since been corrected, see `docs/ANE_STATUS.md`.
+
 ## Result
 
 Metal and both physical ANE instances execute concurrently on this host. A

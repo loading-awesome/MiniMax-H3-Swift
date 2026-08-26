@@ -4,6 +4,8 @@ Date: 2026-08-26
 Host: M3 Ultra, macOS build 25F84, ANE architecture `h15g`, two instances  
 Tool: `Tools/ANE/differential.m`
 
+> This page records weight binding and layout invariants. For where the whole ANE question stands today, and which of its conclusions have since been corrected, see `docs/ANE_STATUS.md`.
+
 ## Result
 
 The direct AppleNeuralEngine runtime accepts activation and weight tensors as
@@ -81,9 +83,14 @@ the final ownership design.
 > projections, not the most. It remains the slowest (1.81 TFLOP/s), which is a
 > separate objection.
 >
-> The production precision gate therefore needs one number nobody has measured:
-> the cancellation ratio of real DiT activations, per projection. That is a CPU
-> computation over captured block inputs and needs no ANE at all.
+> **Superseded, and then measured.** This section originally called for the
+> cancellation ratio of real activations. That was the wrong quantity: the
+> dominant error source is products falling below fp16's smallest normal and
+> being flushed to zero, not cancellation. Both have since been measured
+> against real captured block taps — underflow runs 0.02% to 6.7% and costs
+> nothing, and the engine reaches 7e-5 to 5e-4 per projection. See
+> `docs/ANE_PRECISION_RESULTS.md`. Nothing on this page is a live open
+> question any more.
 
 The static constant-weight path and both dynamic paths return **bit-identical**
 error at K=5376 (`rrms=0.0134911`, max `0.00128174`). The arithmetic is a fixed

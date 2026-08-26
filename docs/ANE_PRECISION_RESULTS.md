@@ -6,6 +6,8 @@ Tools: `Tools/ANE/underflow.py`, `Tools/ANE/numerics.m`
 Data: `parity/goldens/oracle_block00_prod` and `oracle_prod_matrix/b{00,24,49}_c{000,013,019}`
       against `MiniMax-H3-FL2VA_bf16.safetensors`
 
+> This page records precision against real tensors. For where the whole ANE question stands today, and which of its conclusions have since been corrected, see `docs/ANE_STATUS.md`.
+
 ## Result
 
 **The precision objection to the FP16 ANE path is wrong, and the real blocker is
