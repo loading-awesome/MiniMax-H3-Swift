@@ -444,3 +444,8 @@ struct FaceCheck: ParsableCommand {
         }
     }
 }
+
+// This target is a single file, which SwiftPM compiles as top-level code.
+// An `@main` type is merely declared in that mode and never invoked — the
+// binary linked, ran, printed nothing and exited 0. Call it explicitly.
+FaceCheck.main()

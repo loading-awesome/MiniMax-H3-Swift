@@ -6,7 +6,8 @@ import AVFoundation
 import ArgumentParser
 import CoreMedia
 import Vision
-import H3Core
+import H3Foundation
+import H3Pipeline
 
 /// Are the lips saying what the audio is saying, and do they stay that way?
 ///
@@ -341,3 +342,8 @@ struct LipSyncCheck: ParsableCommand {
         return box.track
     }
 }
+
+// This target is a single file, which SwiftPM compiles as top-level code.
+// An `@main` type is merely declared in that mode and never invoked — the
+// binary linked, ran, printed nothing and exited 0. Call it explicitly.
+LipSyncCheck.main()

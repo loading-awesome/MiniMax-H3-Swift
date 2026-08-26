@@ -80,6 +80,30 @@ let package = Package(
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ]
         ),
+        // The external oracles in Tools/. They ask "is the output any good"
+        // rather than "does it match a golden", which is the only question that
+        // can be asked of a render nobody has captured a reference for — and
+        // the only one that survives an arithmetic change, since a change in
+        // precision reselects the sample rather than degrading it (see
+        // `docs/ANE_PRECISION_RESULTS.md`).
+        //
+        // They are targets rather than loose files because they were neither:
+        // `LipSyncCheck` still imported `H3Core`, a module this package has not
+        // had for some time, so it could not be built by any documented means
+        // and nothing noticed.
+        .executableTarget(
+            name: "h3-facecheck",
+            dependencies: [.product(name: "ArgumentParser", package: "swift-argument-parser")],
+            path: "Tools", sources: ["FaceCheck.swift"]
+        ),
+        .executableTarget(
+            name: "h3-lipsync",
+            dependencies: [
+                "H3Foundation", "H3Pipeline",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            ],
+            path: "Tools", sources: ["LipSyncCheck.swift"]
+        ),
         .testTarget(name: "H3FoundationTests", dependencies: ["H3Foundation"]),
         .testTarget(name: "H3CatalogTests", dependencies: ["H3Catalog"]),
         .testTarget(name: "H3HardwareTests", dependencies: ["H3Hardware"]),
