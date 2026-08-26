@@ -368,6 +368,81 @@ halfway through a diffusion trajectory would invalidate reproducibility.
 > against goldens regenerated under the ANE's own arithmetic. That is a
 > change to the Phase 5 and Phase 6 plan, not a detail.
 
+## The seam, measured — and the gate this fails
+
+*2026-08-26. `H3_BIG=1 swift test --filter crossingCost`, plus
+`mlxSeam` for the two halves of a crossing at production QKV shape.*
+
+The route is bounded by how often it has to interrupt MLX, and that has now
+been measured rather than assumed.
+
+**The inbound half is free, and that was not known.** MLX exposes
+`asMTLBuffer(noCopy: true)`, which evaluates and then wraps its own backing
+bytes for 0.05 ms — but there is no constructor the other way, nothing adopts
+an `MTLBuffer`, so the obvious implementation copies the result home at **53 ms
+per projection** at production QKV. Four a block is 212 ms against the 232 ms a
+hybrid block saves, which ends the route on its own. It is avoidable: allocate
+the output as an MLXArray, take a no-copy wrapper over it, and let the join
+kernel write into MLX's memory. `metalWriteIsVisibleToMLX` confirms the
+aliasing holds.
+
+**The outbound half is the problem, and it got worse.** Re-running
+`crossingCost` today:
+
+| | recorded in PERF_ROADMAP | measured today |
+|---|---:|---:|
+| 1 crossing | 31.0 ms | **43.5 ms** |
+| 2 crossings | 29.1 ms | **39.9 ms** |
+| 4 crossings | 24.5 ms | **37.3 ms** |
+| block baseline | 1224 ms | **1157 ms** |
+
+The barrier did not get slower; **MLX got faster**. The baseline block fell 67
+ms while the cost of interrupting it did not, so the barrier is now a larger
+share of a smaller block. Routing fc2 alone, which the roadmap recorded as a
+6.6 ms win, is a 5.9 ms loss today.
+
+### What that prices
+
+A hybrid block saves 232 ms, and the four projections are a dependency chain,
+so the natural design pays four barriers:
+
+| design | block | speedup |
+|---|---:|---:|
+| 4 crossings, all projections | 1085 ms | **1.066x** |
+| 2 crossings | 1005 ms | 1.151x |
+| 1 crossing | 965 ms | 1.199x |
+
+**The natural design reaches 1.066x against a 1.15x gate**, and against the
+1.20x this document's own decision paragraph says to stop below. Four crossings
+could afford a barrier of 20.3 ms each; the measurement is 40.
+
+Routing fewer projections does not rescue it. The two largest carry 70% of the
+linear work, so two crossings on them lands at 1.077x — the saving falls with
+the work routed while the barrier falls with the crossing count, and the ratio
+barely moves.
+
+### The conclusion, and the one thing that would change it
+
+**Stop before production integration**, on this document's own gate. Nothing
+about the hardware is the reason: the engine is fast enough, both dies are
+reachable, the bandwidth is there, the arithmetic is more accurate than bf16,
+and the inbound seam is free. The route fails on how often it has to interrupt
+MLX, which is a property of MLX's laziness and of the block's dependency chain,
+and neither is negotiable from outside.
+
+It would take a design with **at most two ANE dispatches per block** to clear
+the gate. Every such design requires re-expressing the block — attention, RoPE,
+per-head norms, the packed-sequence modulation — outside MLX, which is the
+second implementation of exactly the code `FRAGILE_CONTRACTS.md` exists because
+of. `docs/PERF_ROADMAP.md` already declined that trade for a larger win than
+this one.
+
+**And the baseline is moving the wrong way.** MLX gained 67 ms a block between
+the roadmap's measurement and this one. Every such gain shrinks the ANE's
+advantage and leaves the barrier untouched, so this route gets worse with time
+rather than better. That is the strongest argument against spending a week on
+the custom primitive.
+
 ## Work plan and gates
 
 ### Phase R — Reverse-engineer the installed stack
