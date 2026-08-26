@@ -421,27 +421,78 @@ linear work, so two crossings on them lands at 1.077x — the saving falls with
 the work routed while the barrier falls with the crossing count, and the ratio
 barely moves.
 
-### The conclusion, and the one thing that would change it
+### What the barrier is made of
 
-**Stop before production integration**, on this document's own gate. Nothing
-about the hardware is the reason: the engine is fast enough, both dies are
-reachable, the bandwidth is there, the arithmetic is more accurate than bf16,
-and the inbound seam is free. The route fails on how often it has to interrupt
-MLX, which is a property of MLX's laziness and of the block's dependency chain,
-and neither is negotiable from outside.
+> **Corrected same day.** The first version of this section recommended
+> stopping, on the reasoning that four crossings land at 1.066x. Two errors sat
+> under it.
+>
+> The first is that `crossingCost` measures a **substitution** — MLX's GEMM is
+> replaced by MPSGraph's — while the ANE design is an **augmentation**: MLX
+> keeps its matmul, narrowed to the channels it still owns, and a second
+> processor works alongside. Those are not the same integration and there was no
+> basis for assuming the same cost.
+>
+> The second is that the copy home was estimated by extrapolating
+> `asMTLBuffer(noCopy: false)`, which routes through `asDataCopy()` and is
+> slower than the path the harness actually uses. That produced 150 ms against a
+> measured barrier of 149 — a match close enough to be convincing and entirely
+> coincidental.
 
-It would take a design with **at most two ANE dispatches per block** to clear
-the gate. Every such design requires re-expressing the block — attention, RoPE,
-per-head norms, the packed-sequence modulation — outside MLX, which is the
-second implementation of exactly the code `FRAGILE_CONTRACTS.md` exists because
-of. `docs/PERF_ROADMAP.md` already declined that trade for a larger win than
-this one.
+`crossingBreakdown` attributes it properly, and the harness was built for
+exactly this — its `run(_:)` exists to price the crossing without adopting the
+result, "what distinguishes dead from dead until MLX changes":
 
-**And the baseline is moving the wrong way.** MLX gained 67 ms a block between
-the roadmap's measurement and this one. Every such gain shrinks the ANE's
-advantage and leaves the barrier untouched, so this route gets worse with time
-rather than better. That is the strongest argument against spending a week on
-the custom primitive.
+| projection | MLX | MPS+copy | MPS only | copy |
+|---|---:|---:|---:|---:|
+| qkv | 195.5 | 200.0 | 189.6 | 10.5 |
+| attn out | 66.2 | 67.3 | 66.2 | 1.1 |
+| mlp fc1 | 260.5 | 266.3 | 251.9 | 14.4 |
+| mlp fc2 | 140.0 | 132.4 | 129.5 | 2.9 |
+
+**In isolation there is no barrier at all** — MPS-only runs the four GEMMs in
+637 ms against MLX's 662. In a block the same four crossings cost +66 ms while
+the GEMMs are worth 83. So the barrier is 149 ms, and it splits:
+
+| component | cost | removable |
+|---|---:|---|
+| copy home | 29 ms | **yes** — `metalWriteIsVisibleToMLX` shows a Metal write lands in an MLXArray's own backing |
+| fusion and scheduling loss | **120 ms** | only by not draining MLX |
+
+The 120 ms exists only in block context. It is the norms, modulation, RoPE and
+gating that MLX fuses around a projection, given up when the graph has to
+materialise mid-block.
+
+### Where that leaves it
+
+| design | block | speedup |
+|---|---:|---:|
+| barrier as measured | 1102 ms | 1.050x |
+| copy removed by aliasing | 1073 ms | **1.078x** |
+| fusion loss also removed | 953 ms | **1.214x** |
+
+The gate needs 1006 ms. **Everything now rests on one question**: can the engine
+be given its input without draining MLX?
+
+The drain exists because the ANE reads an IOSurface and MLX will not have
+written one until it evaluates. `MLXFast.metalKernel` compiles custom Metal
+into MLX's *own* command stream — no `eval`, no handoff — and is present in the
+pinned revision. If it can write the activation into an IOSurface, and the
+engine can be signalled off that kernel's completion rather than off a full
+graph drain, the 120 ms goes and the route clears the gate with room.
+
+That is a narrow, answerable question and it is the next experiment. It is not
+"build the bridge": it is whether a `metalKernel` can target an IOSurface and
+whether a shared event can be signalled from inside MLX's stream. Both are
+cheap to try and both are decisive.
+
+**Do not stop yet.** The hardware objections are all discharged — rate,
+residency, bandwidth, precision, coherence — and the one remaining obstacle is
+an MLX scheduling question with a named candidate mechanism.
+
+One thing does argue against, and it is not a measurement: MLX gained 67 ms a
+block between the roadmap's `crossingCost` and today's. Every such gain shrinks
+the engine's share and leaves the barrier untouched.
 
 ## Work plan and gates
 
