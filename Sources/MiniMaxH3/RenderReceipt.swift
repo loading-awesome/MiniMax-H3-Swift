@@ -48,6 +48,27 @@ public struct RenderReceipt: Codable, Sendable {
         public let verification: Verification
     }
 
+    /// The arithmetic that produced this render.
+    ///
+    /// A receipt exists so a render can be accounted for after the fact, and
+    /// until schema 4 it could not distinguish two renders from the same seed
+    /// and checkpoint that produced visibly different videos — because what
+    /// separated them was the arithmetic, and the arithmetic was not recorded.
+    /// Any change here reselects the diffusion sample rather than degrading it,
+    /// so these fields are not a performance note; they are part of what
+    /// identifies the output.
+    public struct Compute: Codable, Sendable {
+        /// `bf16` in production. `fp16` and `fp32` are diagnostic overrides.
+        public let ditDType: String
+        /// Projections computed on the Neural Engine, empty on the default
+        /// path. Observed during the render, not read from configuration.
+        public let aneRoutedProjections: [String]
+        /// Projections offered to the engine that fell back to MLX — same
+        /// numbers, no speedup, but a different run from one that never
+        /// offered.
+        public let aneDeclinedProjections: [String]
+    }
+
     public struct Output: Codable, Sendable {
         public let kind: String
         public let filename: String
@@ -63,6 +84,9 @@ public struct RenderReceipt: Codable, Sendable {
     public let environment: Environment
     public var checkpoints: [Checkpoint]
     public var outputs: [Output]
+    /// Written after the render, because what matters is what the engine
+    /// actually took, not what it was asked to take.
+    public var compute: Compute?
     public var timings: [String: TimeInterval]
     public var warnings: [String]
     public var errorCode: String?
@@ -86,7 +110,10 @@ public struct RenderReceipt: Codable, Sendable {
         // 3 adds `request.keyframeAnchors`. A v2 reader ignores it; a v3 reader
         // handed a v2 file fails on the missing key, which is what the version
         // is for.
-        schemaVersion = 3
+        // 4 adds `compute`. It is optional so a v3 file still reads, but its
+        // absence now means "unrecorded", not "default" — a v3 render could
+        // have been fp16 and nothing would say so.
+        schemaVersion = 4
         self.jobID = jobID
         status = .running
         startedAt = .now

@@ -250,6 +250,10 @@ Work here turned up defects unrelated to the engine, all fixed and committed:
   targets now.
 - The lip-sync drift check measured *spread*, which mixes drift with the noise
   of estimating a lag from a one-second window. It fits a weighted trend now.
-- Render receipts do not record the DiT's compute dtype, so two renders from
-  the same seed and checkpoint that produce different videos are
-  indistinguishable in their receipts. **Not yet fixed.**
+- Render receipts did not record the DiT's compute dtype, so two renders from
+  the same seed and checkpoint that produced different videos were
+  indistinguishable in their receipts. Receipt schema 4 adds a `compute` block
+  carrying the dtype and the projections the engine actually took — observed
+  during the render rather than read from configuration, and recorded on
+  failures too. It distinguishes a run that declined a projection from one that
+  never offered it, because those are different renders.

@@ -143,6 +143,16 @@ private enum RenderOperation {
         return ReportedError(code: "H3-9000", message: String(describing: error))
     }
 
+    /// What the DiT stack actually computed in, read from the pipeline rather
+    /// than re-derived here — two places parsing the same environment variable
+    /// is how a receipt starts describing a render that did not happen.
+    private static func observedCompute() -> RenderReceipt.Compute {
+        let profile = PipelineRuntime.ArithmeticProfile.observed()
+        return .init(ditDType: profile.ditDType,
+                     aneRoutedProjections: profile.aneRoutedProjections,
+                     aneDeclinedProjections: profile.aneDeclinedProjections)
+    }
+
     static func execute(jobID: UUID, request: RenderRequest, models: ModelSet,
                         options: RenderEngine.Options,
                         cancellation: RenderCancellation,
@@ -216,6 +226,7 @@ private enum RenderOperation {
             transaction = nil
             receipt.status = .succeeded
             receipt.finishedAt = .now
+            receipt.compute = observedCompute()
             receipt.timings = timings(result.timings)
             receipt.outputs = outputRecords(result)
             if !result.muxedAudio {
@@ -243,6 +254,7 @@ private enum RenderOperation {
             receipt.status = (error is RenderCancelled || error is CancellationError)
                 ? .cancelled : .failed
             receipt.finishedAt = .now
+            receipt.compute = observedCompute()
             receipt.errorCode = reported.code
             receipt.errorMessage = receiptSafeMessage(
                 reported.message, request: request, models: models)

@@ -48,7 +48,7 @@ package enum PipelineRuntime {
     /// not what stands in the way; if it drifts, none of the rest matters.
     ///
     ///     H3_DIT_DTYPE=fp16 h3 render ...
-    static func diagnosticComputeDType(log: (String) -> Void) -> DType {
+    package static func diagnosticComputeDType(log: (String) -> Void) -> DType {
         switch ProcessInfo.processInfo.environment["H3_DIT_DTYPE"] {
         case "fp16", "float16":
             log("DiT compute dtype overridden to fp16 — diagnostic only, "
@@ -60,6 +60,38 @@ package enum PipelineRuntime {
             return .float32
         default:
             return .bfloat16
+        }
+    }
+
+    /// How this process computed a DiT block, for the render receipt.
+    ///
+    /// Two things change the arithmetic and therefore reselect the diffusion
+    /// sample: the compute dtype, and whether projections ran on the Neural
+    /// Engine. Neither was recorded, so two renders from the same seed and
+    /// checkpoint that produced visibly different videos were indistinguishable
+    /// in their receipts — which is precisely the claim a receipt exists to
+    /// support.
+    package struct ArithmeticProfile: Sendable, Codable, Equatable {
+        /// `bf16`, `fp16` or `fp32`.
+        package let ditDType: String
+        /// Projections the engine actually computed, observed rather than
+        /// declared.
+        package let aneRoutedProjections: [String]
+        /// Projections offered to the engine that fell back to MLX. A render
+        /// that declined partway is not the render that did not offer at all.
+        package let aneDeclinedProjections: [String]
+
+        package static func observed() -> ArithmeticProfile {
+            let dtype: String
+            switch diagnosticComputeDType(log: { _ in }) {
+            case .float16: dtype = "fp16"
+            case .float32: dtype = "fp32"
+            default:       dtype = "bf16"
+            }
+            return ArithmeticProfile(
+                ditDType: dtype,
+                aneRoutedProjections: ANELinearBackend.routedProjections,
+                aneDeclinedProjections: ANELinearBackend.declinedProjections)
         }
     }
 

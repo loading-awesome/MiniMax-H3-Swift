@@ -322,6 +322,43 @@ struct ANERealPrimitiveTests {
         }
     }
 
+    /// The receipt records what the engine *did*, not what it was configured to
+    /// do, so `project` has to observe rather than declare.
+    ///
+    /// This matters because `route` can decline — an unsupported shape, a failed
+    /// compile — and a decline is deliberately silent to the caller: same
+    /// numbers, no speedup. It must not be silent to the receipt, because a
+    /// render that fell back is not the render that never offered.
+    @Test
+    func routingIsObservedNotDeclared() {
+        let k = 5376
+        let x = MLXRandom.normal([64, k]).asType(.bfloat16)
+        let good = MLXRandom.normal([21504, k]).asType(.bfloat16)
+        // 640 is a whole number of heads but too narrow to split three ways, so
+        // `plan` refuses it and `project` must fall back and say so.
+        let tooNarrow = MLXRandom.normal([640, k]).asType(.bfloat16)
+        MLX.eval(x, good, tooNarrow)
+
+        _ = ANELinearBackend.project(x: x, weight: good, label: "observed-routed")
+        _ = ANELinearBackend.project(x: x, weight: tooNarrow, label: "observed-declined")
+
+        let routed = ANELinearBackend.routedProjections
+        let declined = ANELinearBackend.declinedProjections
+
+        if ANELinearBackend.isEnabled {
+            #expect(routed.contains("observed-routed"),
+                    "a projection the engine computed must appear as routed")
+            #expect(declined.contains("observed-declined"),
+                    "a projection that fell back must appear as declined")
+        } else {
+            // Without the opt-in nothing is offered, so nothing is recorded —
+            // which is itself the right receipt for a default render.
+            #expect(routed.isEmpty && declined.isEmpty)
+        }
+        #expect(Set(routed).isDisjoint(with: declined),
+                "a projection cannot be both routed and declined")
+    }
+
     // MARK: - Does it actually pay?
 
     /// The whole point, asserted.

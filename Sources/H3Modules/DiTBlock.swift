@@ -336,7 +336,7 @@ package struct AttentionLayer {
     package func callAsFunction(_ x: MLXArray, ropeTable: MLXArray?,
                                context: AttentionContext? = nil) -> MLXArray {
         let qkv = ANELinearBackend.isEnabled
-            ? ANELinearBackend.project(x: x, weight: qkvWeight)
+            ? ANELinearBackend.project(x: x, weight: qkvWeight, label: "qkv")
             : matmul(x, qkvWeight.T)
         let qkvParts = qkv.split(parts: 3, axis: -1)
         
@@ -363,7 +363,7 @@ package struct AttentionLayer {
         // block 49 — 8.3x under the 2^15 cliff unscaled, 134x with the operand
         // scale this path applies — so it needs no bound beyond what is here.
         return ANELinearBackend.isEnabled
-            ? ANELinearBackend.project(x: merged, weight: outWeight)
+            ? ANELinearBackend.project(x: merged, weight: outWeight, label: "attn out")
             : matmul(merged, outWeight.T)
     }
 }
@@ -392,7 +392,7 @@ package struct H3MLP {
         // per-block bound rather than on an operand scale that is merely
         // probably enough.
         let h = ANELinearBackend.isEnabled
-            ? ANELinearBackend.project(x: x, weight: fc1)
+            ? ANELinearBackend.project(x: x, weight: fc1, label: "fc1")
             : matmul(x, fc1.T)
         let parts = h.split(parts: 2, axis: -1)
         let gate = parts[0]

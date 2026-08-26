@@ -252,9 +252,45 @@ public enum ANELinearBackend {
     ///
     /// Falls back to a plain `matmul` — same result, no speedup — whenever the
     /// engine cannot take the shape or a step fails.
-    public static func project(x: MLXArray, weight: MLXArray) -> MLXArray {
+    /// - Parameter label: which projection this is, recorded on the render
+    ///   receipt when the engine actually takes it. A receipt that cannot tell
+    ///   you which arithmetic produced a video cannot support the
+    ///   reproducibility claim it is written to make, and routing changes the
+    ///   arithmetic: the same seed and checkpoint give a different sample.
+    public static func project(x: MLXArray, weight: MLXArray, label: String) -> MLXArray {
         guard isEnabled else { return MLX.matmul(x, weight.transposed()) }
-        return route(x: x, qkvWeight: weight) ?? MLX.matmul(x, weight.transposed())
+        guard let routed = route(x: x, qkvWeight: weight) else {
+            // A decline is silent to the caller by design — same numbers, no
+            // speedup — but it must not be silent to the receipt, or a render
+            // that fell back looks like one that did not.
+            note(label, routed: false)
+            return MLX.matmul(x, weight.transposed())
+        }
+        note(label, routed: true)
+        return routed
+    }
+
+    nonisolated(unsafe) private static var routed: Set<String> = []
+    nonisolated(unsafe) private static var declined: Set<String> = []
+
+    private static func note(_ label: String, routed didRoute: Bool) {
+        lock.lock(); defer { lock.unlock() }
+        if didRoute { routed.insert(label) } else { declined.insert(label) }
+    }
+
+    /// Projections the engine actually computed during this process, and any
+    /// that were offered to it and fell back.
+    ///
+    /// Observed rather than declared. A list of what *should* be routed drifts
+    /// from the call sites; this is what ran.
+    public static var routedProjections: [String] {
+        lock.lock(); defer { lock.unlock() }
+        return routed.sorted()
+    }
+
+    public static var declinedProjections: [String] {
+        lock.lock(); defer { lock.unlock() }
+        return declined.subtracting(routed).sorted()
     }
 
     /// The routed path itself, with the opt-in check left out.
