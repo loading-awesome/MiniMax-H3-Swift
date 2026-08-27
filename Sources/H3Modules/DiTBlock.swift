@@ -336,7 +336,8 @@ package struct AttentionLayer {
     /// needs the numbers, so it lives in ``finishQKV``. The gap between the two
     /// is where the other CFG branch gets the GPU.
     package func beginQKV(_ x: MLXArray) -> ANELinearBackend.Pending {
-        ANELinearBackend.begin(x: x, weight: qkvWeight, label: "qkv")
+        DiTBlock.saturationProbe.record("qkv", x: x, weight: qkvWeight)
+        return ANELinearBackend.begin(x: x, weight: qkvWeight, label: "qkv")
     }
 
     package func finishQKV(_ pending: ANELinearBackend.Pending, ropeTable: MLXArray?)
@@ -346,6 +347,7 @@ package struct AttentionLayer {
 
     package func projectQKV(_ x: MLXArray, ropeTable: MLXArray?)
         -> (q: MLXArray, k: MLXArray, v: MLXArray) {
+        DiTBlock.saturationProbe.record("qkv", x: x, weight: qkvWeight)
         let qkv = ANELinearBackend.isEnabled
             ? ANELinearBackend.project(x: x, weight: qkvWeight, label: "qkv")
             : matmul(x, qkvWeight.T)
@@ -385,13 +387,15 @@ package struct AttentionLayer {
     /// block 49 — 8.3x under the 2^15 cliff unscaled, 134x with the operand
     /// scale this path applies — so it needs no bound beyond what is here.
     package func projectOut(_ merged: MLXArray) -> MLXArray {
-        ANELinearBackend.isEnabled
+        DiTBlock.saturationProbe.record("attn out", x: merged, weight: outWeight)
+        return ANELinearBackend.isEnabled
             ? ANELinearBackend.project(x: merged, weight: outWeight, label: "attn out")
             : matmul(merged, outWeight.T)
     }
 
     package func beginOut(_ merged: MLXArray) -> ANELinearBackend.Pending {
-        ANELinearBackend.begin(x: merged, weight: outWeight, label: "attn out")
+        DiTBlock.saturationProbe.record("attn out", x: merged, weight: outWeight)
+        return ANELinearBackend.begin(x: merged, weight: outWeight, label: "attn out")
     }
 
     /// `x` is `[S, hidden]` or `[B, S, hidden]`.
@@ -423,7 +427,8 @@ package struct H3MLP {
     /// Submits `fc1` and returns; `finish` completes the gate, the product and
     /// `fc2`. `fc2` is GPU work either way, so it is not worth splitting.
     package func begin(_ x: MLXArray) -> ANELinearBackend.Pending {
-        ANELinearBackend.begin(x: x, weight: fc1, label: "fc1")
+        DiTBlock.saturationProbe.record("fc1", x: x, weight: fc1)
+        return ANELinearBackend.begin(x: x, weight: fc1, label: "fc1")
     }
 
     package func finish(_ pending: ANELinearBackend.Pending) -> MLXArray {
@@ -432,7 +437,11 @@ package struct H3MLP {
 
     private func gateAndProject(_ h: MLXArray) -> MLXArray {
         let parts = h.split(parts: 2, axis: -1)
-        return matmul(silu(parts[0]) * parts[1], fc2.T)
+        let gated = silu(parts[0]) * parts[1]
+        // `fc2` is the projection the bound exists to rule on, and this is the
+        // only place its real input exists.
+        DiTBlock.saturationProbe.record("fc2", x: gated, weight: fc2)
+        return matmul(gated, fc2.T)
     }
 
     package func callAsFunction(_ x: MLXArray) -> MLXArray {
@@ -448,6 +457,10 @@ package struct H3MLP {
         if ANELinearBackend.isEnabled {
             return finish(begin(x))
         }
+        // **Also here, not only in `begin`.** A bound run has the engine off by
+        // design — the activations must come from the unrouted path — so
+        // instrumenting only the routed entry point measures `fc1` never.
+        DiTBlock.saturationProbe.record("fc1", x: x, weight: fc1)
         return gateAndProject(matmul(x, fc1.T))
     }
 }
@@ -463,7 +476,113 @@ package struct H3MLP {
 /// The reference mutates `x` in place and returns the same object. We return a
 /// new array — functionally identical, and MLX has no in-place residual to
 /// preserve.
+
+/// The order-free saturation bound, computed **during a render** instead of
+/// from captured tensors.
+///
+/// `Tools/ANE/saturation_bound.py` answers the same question offline, and it is
+/// the better instrument when the captures exist: it reads the reference's own
+/// taps. But the captures cover three blocks of fifty and 6.6% of sequence
+/// positions, and `fc2` was refused on exactly that — its bound moves 95x
+/// across the three blocks that were measured, so twenty-four unmeasured blocks
+/// is not a gap that argument survives.
+///
+/// Nothing has to be captured to close it. What the bound needs is
+/// `max over (row, channel) of sum_k |a_k| |w_k|`, which is one GEMM on the
+/// magnitudes, and every activation it wants is in hand at the moment the
+/// projection runs. Computing it inline covers **every block and every row of
+/// every step**, which is strictly more than the captures ever offered.
+///
+/// Two things this is not. It is not free — the magnitude GEMM is the same
+/// shape as the projection, so a bound run costs about double. And the
+/// activations are *ours*, from the unrouted bf16 path, not the reference's;
+/// that is the arithmetic the conformance suite pins the reference against, and
+/// it is stated here rather than glossed because a bound is only as good as the
+/// data under it.
+///
+///     H3_ANE_BOUND=/tmp/bound.json h3 render ...   (run without H3_ANE)
+package final class SaturationProbe: @unchecked Sendable {
+    package let path: String?
+    /// Set by the block loop, which is the only place that knows where it is.
+    package var block = -1
+    package var progress = 0.0
+    private let lock = NSLock()
+    /// Worst bound seen per projection, and where it was seen.
+    private var worst: [String: (bound: Double, block: Int, progress: Double)] = [:]
+
+    package init() {
+        let env = ProcessInfo.processInfo.environment
+        path = (env["H3_ANE_BOUND"]?.isEmpty == false) ? env["H3_ANE_BOUND"] : nil
+    }
+
+    package var enabled: Bool { path != nil }
+
+    /// Pieces the contraction is cut into for the split bound, alongside the
+    /// whole one. Both are reported: the whole-`k` figure is what the current
+    /// unsplit path must clear, and the per-piece figure is what a split path
+    /// must clear, because a split projection never accumulates across a piece.
+    package var splits = 8
+
+    /// `x` is `[s, k]`, `weight` is `[n, k]` — the projection's own operands.
+    package func record(_ label: String, x: MLXArray, weight: MLXArray) {
+        guard enabled, block >= 0 else { return }
+        measure(label, x: x, weight: weight, pieces: 1)
+        let k = x.dim(1)
+        if splits > 1, k % splits == 0 {
+            measure(label + " split\(splits)", x: x, weight: weight, pieces: splits)
+        }
+    }
+
+    private func measure(_ label: String, x: MLXArray, weight: MLXArray, pieces: Int) {
+        // fp32 throughout: this is a safety bound, and bf16's three digits are
+        // not enough to argue a factor-of-two margin with.
+        let kk = x.dim(1), piece = kk / pieces
+        var pieceMax: [MLXArray] = []
+        for lo in stride(from: 0, to: kk, by: piece) {
+        let a = MLX.abs(x[0..., lo ..< min(lo + piece, kk)].asType(.float32))
+        // Chunked over output channels so `[15731, 28672]` never exists whole,
+        // but reduced lazily and read **once**: an `.item()` per chunk is a GPU
+        // sync per chunk, seven of them per `fc1` call, fifty blocks a step.
+        let n = weight.dim(0), step = 4096
+        var chunkPeaks: [MLXArray] = []
+        for start in stride(from: 0, to: n, by: step) {
+            let w = MLX.abs(weight[start ..< min(start + step, n), lo ..< min(lo + piece, kk)]
+                .asType(.float32))
+            chunkPeaks.append(MLX.matmul(a, w.transposed()).max())
+        }
+        pieceMax.append(MLX.stacked(chunkPeaks).max())
+        }
+        let peak = Double(MLX.stacked(pieceMax).max().item(Float.self))
+        lock.lock()
+        if peak > (worst[label]?.bound ?? 0) {
+            worst[label] = (peak, block, progress)
+        }
+        lock.unlock()
+        write()
+    }
+
+    /// Rewritten on every improvement rather than at exit: a bound run is long
+    /// and the answer should survive it being interrupted.
+    private func write() {
+        guard let path else { return }
+        lock.lock(); let snapshot = worst; lock.unlock()
+        // 2^15, divided by the operand scale the routed path applies, is what
+        // the unscaled quantity measured here has to stay under.
+        let threshold = 32768.0 / 0.0625
+        var rows: [String] = []
+        for (label, v) in snapshot.sorted(by: { $0.key < $1.key }) {
+            rows.append("""
+                  "\(label)": { "bound": \(v.bound), "block": \(v.block),             "progress": \(v.progress), "headroom": \(threshold / v.bound),             "proven": \(v.bound < threshold) }
+            """)
+        }
+        let json = "{\n  \"threshold\": \(threshold),\n\(rows.joined(separator: ",\n"))\n}\n"
+        try? json.write(toFile: path, atomically: true, encoding: .utf8)
+    }
+}
+
 package struct DiTBlock {
+    package static let saturationProbe = SaturationProbe()
+
     package let norm1: H3RMSNorm
     package let norm2: H3RMSNorm
     package let attn: AttentionLayer

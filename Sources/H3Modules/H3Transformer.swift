@@ -298,12 +298,27 @@ package struct H3Transformer {
                            refined: refined, ropeTable: rope)
     }
 
+    /// Tells the saturation probe where it is. Only the block loop knows, and
+    /// the probe needs it to say which block produced the worst bound.
+    private func markProbe(block: Int, stepIndex: Int?, stepCount: Int?) {
+        guard DiTBlock.saturationProbe.enabled else { return }
+        DiTBlock.saturationProbe.block = block
+        if let s = stepIndex, let n = stepCount, n > 0 {
+            DiTBlock.saturationProbe.progress = Double(s) / Double(n)
+        }
+    }
+
     func applyBlocks(to h: inout MLXArray, tEmb: MLXArray, index: ModulationIndex,
                      table: MLXArray, layout: PackedLayout, plan: TimestepPlan,
                      tapsOut: inout Taps,
                      stepCache: H3StepCache?,
                      stepIndex: Int?, stepCount: Int?) {
-        let evalBlock: (DiTBlock, MLXArray, AttentionContext?) -> MLXArray = { b, xIn, ctx in
+        // The index goes through the closure rather than being marked at each
+        // call site: there are three of them, they have already been refactored
+        // once underneath a marker that was written per-site, and a probe that
+        // silently reports nothing is worse than no probe.
+        let evalBlock: (Int, DiTBlock, MLXArray, AttentionContext?) -> MLXArray = { i, b, xIn, ctx in
+            self.markProbe(block: i, stepIndex: stepIndex, stepCount: stepCount)
             if QueryTiling.isEnabled {
                 return QueryTiling.block(b, xIn, tEmb: tEmb, index: index, ropeTable: table, context: ctx)
             } else {
@@ -326,7 +341,7 @@ package struct H3Transformer {
             // and the probe signal the cache thresholds on is 0.077: the
             // approximation is 1.7x the quantity being measured. Sparsify here
             // and the cache stops thresholding on how much the step moved and
-            h = evalBlock(blocks[0], h, nil)
+            h = evalBlock(0, blocks[0], h, nil)
             if Self.tappedBlocks.contains(0) { tapsOut.blocks[0] = h }
 
             switch cache.decide(probe: h - hIn, audioRange: layout.audioRange,
@@ -337,7 +352,7 @@ package struct H3Transformer {
                 h = hIn + residual
             case .runFull:
                 for i in 1 ..< blocks.count {
-                    h = evalBlock(blocks[i], h, attentionContext(block: i, stepIndex: stepIndex,
+                    h = evalBlock(i, blocks[i], h, attentionContext(block: i, stepIndex: stepIndex,
                                                                  stepCount: stepCount, layout: layout))
                     if Self.tappedBlocks.contains(i) { tapsOut.blocks[i] = h }
                 }
@@ -345,7 +360,7 @@ package struct H3Transformer {
             }
         } else {
             for (i, block) in blocks.enumerated() {
-                h = evalBlock(block, h, attentionContext(block: i, stepIndex: stepIndex,
+                h = evalBlock(i, block, h, attentionContext(block: i, stepIndex: stepIndex,
                                                          stepCount: stepCount, layout: layout))
                 if Self.tappedBlocks.contains(i) { tapsOut.blocks[i] = h }
             }

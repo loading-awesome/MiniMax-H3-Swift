@@ -494,6 +494,82 @@ oracle that fails on the control cannot be used to pass the treatment, and
 quietly dropping it would throw away the reason for having oracles at all.
 
 
+### `fc2` is refused, and the oracles were optimistic by 4.9x
+
+The captures are on `big_daddy` — all nine, `b{00,24,49}_c{000,013,019}` — so
+the real bound ran, with `--splits`, against the real checkpoint. Unsplit it
+reproduces the published figures exactly, `fc2` at 978,586 and 0.5x of headroom.
+Split eight ways it clears with room:
+
+| projection | whole `k` | split 8 |
+|---|---:|---:|
+| `qkv` | 5,132 (102x) | 729 (720x) |
+| `attn out` | 69,912 (7.5x) | 19,358 (27x) |
+| `fc1` | 2,428 (216x) | 366 (1432x) |
+| **`fc2`** | **978,586 (0.5x, NOT PROVEN)** | **140,221 (3.7x, PROVEN)** |
+
+On the captured blocks, splitting turns `fc2` from refused into proven. **It is
+still refused, because the captured blocks are not the problem.**
+
+The tool's own closing note is that it holds three blocks of fifty and 1024 of
+15,406 rows, and that a bound over a sample is evidence rather than proof.
+Nothing has to be captured to close that: what the bound needs is one GEMM on
+the magnitudes, and every activation it wants exists at the moment the
+projection runs. `DiTBlock.SaturationProbe` computes it inline —
+`H3_ANE_BOUND=path h3 render`, engine off — over **every block, every row, every
+step**. It is checked against hand arithmetic first: with unit operands the
+whole-`k` bound is exactly `k` and a piece is exactly `k/8`.
+
+One render, 50 blocks, 15,406 rows, 20 faithful steps:
+
+| projection | whole `k` | split 8 | worst block |
+|---|---:|---:|---:|
+| `qkv` | 6,406 (82x) | 915 (573x) | 46 |
+| `attn out` | 133,365 (**3.9x**) | 54,411 (9.6x) | 44 |
+| `fc1` | 2,475 (212x) | 393 (1334x) | 49 |
+| **`fc2`** | **4,761,873 (0.1x)** | **4,520,180 (0.1x)** | **45** |
+
+**`fc2`'s real worst is 4,761,873 at block 45 — 4.9x worse than anything the
+oracles ever saw, at a block they never captured.** It exceeds the cliff by 9.1x
+whole and by 8.6x split, because splitting only helps when the magnitude is
+spread across `k`: at block 49 it bought 7x, at block 45 it buys 1.05x. That is
+the adversarial case, and it is the one that decides.
+
+So `fc2` stays on the GPU, the original refusal was right, and the reason it was
+right is not the reason anyone gave. The three-block sample was optimistic by
+almost a factor of five and missed the worst block entirely.
+
+Two things fall out of the same run. `attn out` — which *is* routed — has only
+**3.9x** of headroom whole, not the 7.5x the oracles reported; it is still
+proven under any accumulation order, and **splitting nearly triples it to
+9.6x**. The contraction split is therefore a safety argument as well as a speed
+one, on the projection that sits closest to the cliff.
+
+### Fusing the modulation buys nothing
+
+`modScaleShift` and `modGate` are four elementwise operations around a gather,
+each materialising a 169 MB `[S, hidden]` intermediate, and they are most of the
+78 ms a block spends outside its GEMMs and attention. Compiling them is exactly
+what took the partial join from 122.4 ms to 108.0, so the same trade was tried
+here and it does not repeat:
+
+| | GPU only | split-k |
+|---|---:|---:|
+| unfused | 1226.6 ms | 1034.2 ms |
+| compiled | 1232.2 ms | 1045.4 ms |
+
+Within noise, and slightly the wrong way. The join won because it had `splits`
+fp32 intermediates of 306 MB to eliminate; these chains are two or three
+operations on bf16 and MLX is evidently already close to the floor on them, or
+the gather dominates and will not fuse. The projected 58 ms is not there.
+
+**A caution about how that was nearly mismeasured.** The first comparison put
+the compiled version 8% slower — and so was the *control*, measured minutes
+after a 45-minute render. It was heat, not code. Re-measuring both arms in the
+same thermal state is what turned an 8% regression into a 1% one, and no
+performance claim on this page should be read from arms measured an hour apart.
+
+
 ### What would move it
 
 The contraction split, above. Every schedule closed on this page was closed by
