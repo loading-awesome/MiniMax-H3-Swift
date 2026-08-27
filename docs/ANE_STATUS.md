@@ -482,7 +482,57 @@ against a GPU sustaining ~18.6 TFLOP/s, and a new Metal driver moving that moves
 the balance point. **Nothing here should be quoted as a 27.0 result until it is
 re-measured.**
 
-### The fused attention graph is accepted, and numerically wrong (2026-08-27)
+### Fused attention works with an explicit softmax (2026-08-27)
+
+**This supersedes the section below it.** The fused graph's 97% error is the
+MIL `softmax` op, not the arithmetic, and replacing it with an explicit stable
+reduction fixes it at production scale.
+
+Two experiments, in order. First, `Tools/ANE/scores-spike.mm` emits `QK^T`
+alone — no softmax, no AV — so a wrong answer would mean the *matmul* fails at
+attention's N and rebuilding softmax would be wasted work:
+
+| keys x queries | matmul rel-RMS |
+|---|---:|
+| 512 | 2.572e-4 |
+| 2,048 | 2.569e-4 |
+| **15,744** | **2.568e-4** |
+
+Flat across a 30x range, at fp16 round-off. The matmul is exact at the
+production plane. (Two things that cost time and are worth recording: the score
+plane comes back **transposed** relative to what the MIL types declare, so both
+readings must be checked — an uncorrelated `sqrt(2)` rel-RMS is the signature of
+the wrong one; and the runtime requires all inputs to share a shape, so a graph
+with `q` at [T,D] and `k` at [S,D] is refused with 0x1D whatever N is.)
+
+Second, the softmax itself, replaced by:
+
+```
+m = reduce_max(scores, key axis)      w = exp(scores - m)
+d = reduce_sum(w, key axis)           y = matmul(w, v) / d
+```
+
+| | S=512 | S=15,744 |
+|---|---:|---:|
+| fused `softmax` op | 0.0217 | **0.974** |
+| **explicit reduction** | **8.75e-4** | **8.99e-4** |
+| bf16 GPU reference class | 1.66e-3 | 1.66e-3 |
+
+**Better than the GPU's own bf16 path, at the production sequence.** The
+reductions do not tile wrongly; only the fused op does. The earlier diagnosis —
+"a softmax normalised per tile" — was right about the mechanism and wrong to
+treat it as unfixable.
+
+Cost: 73.96 ms a head against 62.70 for the fused version, 1.716 TFLOP/s, and
+compile rises from 199 ms to 3.8 s (one-time per shape, cacheable). Balancing
+against the GPU's 7.45 ms a head moves about **9 of 56 heads** onto the dies,
+attention 417 ms to ~347 ms, and the render from 1.179x to roughly **1.28x**.
+
+It also reopens the ceiling. `A/G` is no longer fixed, so the branch-local model
+`forward = A/G + L/(G+R)` no longer bounds this, and the coarse two-branch
+pipeline is worth costing.
+
+### Superseded: the fused attention graph is accepted, and numerically wrong
 
 The last open approach. Attention is 37% of the block and the one term the
 ceiling model cannot overlap — `forward = A/G + L/(G+R)` — so it is the only

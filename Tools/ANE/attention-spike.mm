@@ -52,6 +52,67 @@ static NSString *EnvString(const char *name, NSString *fallback) {
     return raw && *raw ? [NSString stringWithUTF8String:raw] : fallback;
 }
 
+/// The same graph with `softmax` replaced by an explicit stable reduction.
+///
+/// `Tools/ANE/scores-spike.mm` established that `QK^T` alone is exact at the
+/// production plane — 2.568e-4 at 15,744 square, flat from 512 — while the
+/// fused graph is 97% wrong there. So the fault is the softmax, not the
+/// matmul, and the question this answers is whether it belongs to the fused
+/// `softmax` op specifically or to any reduction over an axis long enough to
+/// tile.
+///
+///     m     = reduce_max(scores, key axis)
+///     w     = exp(scores - m)
+///     d     = reduce_sum(w, key axis)
+///     y     = matmul(w, v) / d
+///
+/// The division is applied after `w @ v` rather than to `w`, which is
+/// algebraically identical and one elementwise pass cheaper on an [S,S] plane.
+static NSString *ExplicitSoftmaxAttentionMIL(int heads, int sequence, int dimension) {
+    NSMutableString *m = [NSMutableString stringWithString:MILHeader()];
+    [m appendFormat:
+        @"    func main<ios18>(tensor<fp16,[1,%d,%d,%d]> q, "
+         "tensor<fp16,[1,%d,%d,%d]> k, tensor<fp16,[1,%d,%d,%d]> v) {\n",
+        heads, sequence, dimension, heads, sequence, dimension,
+        heads, sequence, dimension];
+    [m appendString:
+        @"        tensor<int32,[4]> pk=const()[name=string(\"pk\"),"
+         "val=tensor<int32,[4]>([0,1,3,2])];\n"];
+    [m appendFormat:
+        @"        tensor<fp16,[1,%d,%d,%d]> qt=transpose(perm=pk,x=q)"
+         "[name=string(\"qt\")];\n", heads, dimension, sequence];
+    [m appendString:
+        @"        bool bf=const()[name=string(\"bf\"),val=bool(false)];\n"
+         "        bool kd=const()[name=string(\"kd\"),val=bool(true)];\n"
+         "        tensor<int32,[1]> ax=const()[name=string(\"ax\"),"
+         "val=tensor<int32,[1]>([3])];\n"];
+    [m appendFormat:
+        @"        tensor<fp16,[1,%d,%d,%d]> scores=matmul("
+         "transpose_x=bf,transpose_y=bf,x=k,y=qt)[name=string(\"scores\")];\n",
+        heads, sequence, sequence];
+    [m appendFormat:
+        @"        tensor<fp16,[1,%d,%d,1]> mx=reduce_max(axes=ax,keep_dims=kd,"
+         "x=scores)[name=string(\"mx\")];\n", heads, sequence];
+    [m appendFormat:
+        @"        tensor<fp16,[1,%d,%d,%d]> sh=sub(x=scores,y=mx)"
+         "[name=string(\"sh\")];\n", heads, sequence, sequence];
+    [m appendFormat:
+        @"        tensor<fp16,[1,%d,%d,%d]> w=exp(x=sh)[name=string(\"w\")];\n",
+        heads, sequence, sequence];
+    [m appendFormat:
+        @"        tensor<fp16,[1,%d,%d,1]> dn=reduce_sum(axes=ax,keep_dims=kd,"
+         "x=w)[name=string(\"dn\")];\n", heads, sequence];
+    [m appendFormat:
+        @"        tensor<fp16,[1,%d,%d,%d]> wv=matmul(transpose_x=bf,"
+         "transpose_y=bf,x=w,y=v)[name=string(\"wv\")];\n",
+        heads, sequence, dimension];
+    [m appendFormat:
+        @"        tensor<fp16,[1,%d,%d,%d]> y=real_div(x=wv,y=dn)"
+         "[name=string(\"y\")];\n", heads, sequence, dimension];
+    [m appendString:@"    } -> (y);\n}\n"];
+    return m;
+}
+
 static NSString *AttentionMIL(int heads, int sequence, int dimension) {
     NSMutableString *m = [NSMutableString stringWithString:MILHeader()];
     [m appendFormat:
@@ -270,7 +331,12 @@ int main(void) {
                                     @"kANEFAneInstanceHint": @1};
         NSDictionary *options1 = @{@"kANEFProcedureVariantHint": @1,
                                     @"kANEFAneInstanceHint": @2};
-        NSString *mil = AttentionMIL(heads, sequence, dimension);
+        const char *softmaxMode = getenv("H3_ATTN_SOFTMAX");
+        bool explicitSoftmax = softmaxMode && strcmp(softmaxMode, "explicit") == 0;
+        NSString *mil = explicitSoftmax
+            ? ExplicitSoftmaxAttentionMIL(heads, sequence, dimension)
+            : AttentionMIL(heads, sequence, dimension);
+        printf("softmax=%s\n", explicitSoftmax ? "explicit" : "fused");
         ExecutionOptions = options0;
 
         printf("ANE fused-attention spike H=%d S=%d D=%d mode=%s fixture=%s\n",
