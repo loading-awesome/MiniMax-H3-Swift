@@ -178,7 +178,8 @@ GOLDEN_TAPS = [
 ]
 
 
-def measure_golden(golden, checkpoint, block, rows, columns, scale=1.0):
+def measure_golden(golden, checkpoint, block, rows, columns, scale=1.0,
+                   contraction=None):
     """The real answer: real activations against real weights, no distribution
     model anywhere. Reports what fraction of the products a block actually
     computes fall below fp16's smallest normal and are flushed, how close its
@@ -202,6 +203,13 @@ def measure_golden(golden, checkpoint, block, rows, columns, scale=1.0):
         # so the scale must stay well above the denormal boundary too.
         x = x * scale
         w_all = read_bf16(checkpoint, chead, coff, key, max_rows=columns)
+        if contraction is not None:
+            lo, hi = contraction
+            if not 0 <= lo < hi <= x.shape[1]:
+                raise ValueError("--k-range %d:%d is outside K=%d for %s"
+                                 % (lo, hi, x.shape[1], name))
+            x = x[:, lo:hi]
+            w_all = w_all[:, lo:hi]
         w = np.asarray(w_all, dtype=np.float64).T          # [K, columns]
         if w.shape[0] != x.shape[1]:
             print("%-10s  shape mismatch: x K=%d, w K=%d" % (name, x.shape[1], w.shape[0]))
@@ -239,6 +247,8 @@ def main():
     ap.add_argument("--golden-columns", type=int, default=64)
     ap.add_argument("--scale", type=float, default=1.0,
                     help="power-of-two operand scale applied to the activation")
+    ap.add_argument("--k-range", metavar="START:END",
+                    help="score only this half-open contraction range")
     ap.add_argument("--checkpoint")
     ap.add_argument("--blocks", default="0,24,49")
     ap.add_argument("--validate", action="store_true")
@@ -254,8 +264,16 @@ def main():
     if args.golden:
         if not args.checkpoint:
             ap.error("--golden also needs --checkpoint for the weights")
+        contraction = None
+        if args.k_range:
+            try:
+                lo, hi = (int(v) for v in args.k_range.split(":"))
+            except (ValueError, TypeError):
+                ap.error("--k-range must be START:END")
+            contraction = (lo, hi)
         measure_golden(args.golden, args.checkpoint, args.block,
-                       args.golden_rows, args.golden_columns, args.scale)
+                       args.golden_rows, args.golden_columns, args.scale,
+                       contraction)
         return
 
     if not args.checkpoint:

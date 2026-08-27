@@ -9,6 +9,12 @@ and refuses unrecognised machines, so an OS update becomes a fallback rather
 than a crash mid-sample; `H3_ANE_ALLOW_UNVALIDATED=1` overrides that for
 research.
 
+> **Before running anything that touches the engine, read *Machine safety: the
+> driver sleep race*.** A one-head, S=512, single-threaded evaluation hard-locked
+> this machine on 2026-08-27. The hazard is a five-second driver sleep timer, not
+> the size of the work or the number of evaluations in flight, and the bridge
+> currently has no defence against it.
+
 ## The position in three lines
 
 **The 1.15x gate is cleared: 1.172x on a block, 1.179x on a real render.** A production block runs 1136.1 ms
@@ -22,6 +28,510 @@ it is measured and closed.** It works — the schedule is bit-identical and
 recovers real overlap — but it never beats the plain routed path in absolute
 time. The engine is too slow relative to the GPU for the columns it would have
 to take. See *The CFG overlap ceiling*.
+
+### Persistent MLP island: production topology executes
+
+The next tensor-parallel form keeps a device's matching `fc1` gate/up neurons,
+SwiGLU activation, and corresponding `fc2` rows together, returning one
+hidden-width partial instead of joining the 28,672-column `fc1` result. The
+first bounded spike establishes two different boundaries:
+
+- A single four-input MIL graph containing both `fc1` matmuls, SwiGLU, and
+  `fc2` **compiles and loads but is rejected at inference** with ANE status
+  `0x1d`. Replacing native `silu` with `sigmoid` and `mul` does not change the
+  refusal (`Tools/ANE/mlp-island-spike.mm`). Compiler acceptance is therefore
+  not evidence that this runtime can execute a multi-weight island.
+- Chaining the bridge's proven two-input matmul programs through retained
+  IOSurfaces **executes correctly**. One Metal dispatch now reads the separate
+  fp16 gate/up surfaces, restores the `fc1` operand scale, applies
+  `SiLU(gate) * up`, applies the downstream scale, and transposes `[S,F]` into
+  the `[F,S]` surface consumed directly by row-sharded `fc2`. At the safe
+  `S=64, K=128, F=256, H=128` fixture the complete warmed chain takes 1.06 ms
+  serially and returns relative RMS `4.12e-4` against an fp32 reference
+  (`Tools/ANE/mlp-island-chain-spike.mm`).
+
+`ANENativePackMergeTests.nativeSwiGLUTransposeFeedsNextANEProjection` varies
+both row and column, so it proves the transpose as well as the arithmetic and
+pins exact power-of-two scale/unscale behavior across the seam. Nothing from
+this spike is on the render path.
+
+The inline probe now measures that exact candidate when explicitly requested:
+
+    H3_ANE_BOUND=/path/mlp-island-bound.json \
+    H3_ANE_BOUND_MLP_ISLAND=1 \
+    h3 render ...
+
+It records per-block `fc2 island bNN ane0 split4` and `ane1 split4` entries over
+every row and faithful step, including the largest power-of-two operand scale
+that retains 2x saturation headroom. The initial plan assigns the first half of
+the 14,336 SwiGLU neurons to Metal and one 3,584-neuron quarter to each ANE;
+each ANE quarter is split into four 896-wide contractions.
+
+The final 50-block calibration is recorded at
+`/Volumes/scratch_disk/h3-gates/mlp-island-2048-calibration.json` for the exact
+`GPU=10240, ANE0=2048, ANE1=2048` partition. Of 100 ranges, 76 need no scaling,
+13 need `1/2`, three `1/4`, three `1/8`, one `1/16`, two `1/32`, one `1/64`,
+and one `1/256`. The outlier is block 39 / ANE1, whose four-piece order-free
+bound is 3,364,614 at progress 0.80; `1/256` leaves 2.49x cliff headroom.
+`Tools/ANE/mlp_island_scales.py --neurons-per-die 2048` validates completeness,
+the exact contraction ranges, power-of-two scales, minimality, and headroom
+before emitting the Swift table.
+
+A second identical faithful render captured 1,024 evenly spaced rows of the
+actual block-39 SwiGLU activation at that exact step. Scoring only the final
+ANE1 `12288..<14336` range with 256 output channels gives **4.09e-4 relative
+RMS** at `1/256`, versus 1.66e-3 for the bf16 GPU reference class. Despite
+14.51% flushed subnormal products, the scaled maximum partial is only 28.1 and
+no output is zeroed. The one-shot capture is opt-in:
+
+    H3_CAPTURE_MLP_ISLAND=/path/captures \
+    H3_CAPTURE_MLP_BLOCKS=39 H3_CAPTURE_MLP_AFTER=0.8 \
+    h3 render ...
+
+and `Tools/ANE/underflow.py --k-range 12288:14336` scores the actual shard.
+A global `1/256` remains invalid: early-block oracle captures measured
+`3.6e-3` to `4.6e-3`. The calibrated per-block/per-die table is therefore part
+of the arithmetic contract.
+
+The full topology now executes at production dimensions in
+`Tools/ANE/mlp-island-dual-spike.mm`: padded `S=15488`, `K=7168`, `H=7168`,
+gate pair, up pair, one paired Metal seam, then fc2 pair. The sequential control
+for two 3,584-neuron islands is 1,042.0 ms; the paired schedule is **520.3 ms**
+(median of three), so both dies deliver the expected 2.00x concurrency without
+a lock or timeout. That result also rejects the original 50/25/25 ownership:
+the full GPU MLP is about 435 ms, so giving half its neurons to a 520 ms ANE
+critical path is slower.
+
+Rate balancing lands near 29% total ANE ownership. Direct, unsplit diagnostics
+locate that balance, but they are not the saturation-safe execution contract:
+
+| neurons per ANE | total ANE share | unsplit paired island | estimated GPU remainder |
+|---:|---:|---:|---:|
+| 3,584 | 50.0% | 520.3 ms | 217.7 ms |
+| 2,176 | 30.4% | 320.9 ms | 303.2 ms |
+| 2,112 | 29.5% | 311.8 ms | 307.2 ms |
+| **2,048** | **28.6%** | **286.8 ms** | **311.0 ms** |
+
+The safe version is four 512-neuron pieces per die. A production piece takes
+79.16 ms as a paired gate/SwiGLU/fc2 chain, so four cost **316.6 ms**. The native
+final join—GPU bf16 partial plus eight scaled ANE fp16 partials into bf16—takes
+**19.69 ms** at production shape and has an exact conformance test. With the
+estimated 311.0 ms GPU remainder running concurrently, the MLP critical path is
+therefore about **336 ms**, or **1.29x** over the 435 ms full-GPU MLP. The
+join can likely be partly hidden by accumulating each completed piece while the
+next ANE pair runs, but that must be measured in the integrated scheduler.
+
+This cannot make the whole block 1.5x by itself—the MLP is only about 38% of
+the block—so attention remains necessary for that target.
+
+Saturation, worst-case precision, dual-die execution, and the final join are now
+green for the exact 10,240/2,048/2,048 split. The implementation gate is to
+build the four-piece block scheduler and measure GPU/ANE overlap rather than
+summing isolated timings. One prompt's
+full bound is not a universal input proof, so a production route also needs
+either a broader calibration corpus or a runtime range guard with GPU fallback.
+
+### Integrated scheduler result (2026-08-27) — measured on the wrong shape
+
+**Every number in this section is from a synthetic MLP the model does not
+contain.** See *The island had never routed*. It is kept because the
+implementation findings — the 49-entry table, the fc1 scale — are real and were
+found here. The timings are not about this model.
+
+
+The persistent island is now wired into `H3MLP` behind both
+`H3_ANE=experimental` and `H3_ANE_MLP_ISLAND=1`. It owns persistent compiled
+programs and weight surfaces, submits the ANE work on its own queue, computes
+the Metal-owned neurons concurrently on a separate MLX stream, and uses the
+native one-pass partial join. A post-submit failure quarantines the mutable
+session and recomputes the complete MLP on Metal.
+
+Conformance found two implementation errors before timing:
+
+- The first table transcription contained 49 entries, shifting every block
+  after the omitted row; block 39 received `1/2` instead of its proven
+  `1/256`. The checked table is now the exact 50-row generator output, with a
+  test pinning its count and block-39 value.
+- Reusing the generic projection's `1/16` fc1 input scale produced 1.3% error
+  in a one-piece identity-down oracle. fc1's faithful bound peaks near 72 and
+  does not require scaling. Leaving fc1 unscaled reduces the complete hybrid
+  MLP error to 0.00362 relative RMS against monolithic bf16; the hybrid result
+  is 0.00444 from the fp32 oracle against 0.00430 for the monolithic GPU path.
+  The independently calibrated per-block/per-die fc2 scales remain unchanged.
+
+The integrated timing also invalidates the sum-of-isolated-parts projection.
+Four active 512-neuron pieces per die with four-way fc1 contraction splitting
+measured only **1.061x** (536.7 ms GPU, 506.1 ms hybrid). One unsplit fc1
+contraction fell to **0.911x** under simultaneous GPU load even though it is
+faster in isolation: shared execution changes the ANE critical path. Returning
+one already-calibrated 512-neuron piece per die to Metal is the best measured
+balance so far. With three active pieces per die it measures **1.102x**
+(537.1 ms GPU, 487.4 ms hybrid) at `S=15,461`, including the final join.
+
+This is a correct experimental backend, not the route to a 1.5x deliverable.
+At the measured 38% MLP share, 1.102x on the MLP alone implies only about
+**1.036x** for a block if everything else is unchanged. The next performance
+work must move independent deliverable work onto the ANE while the GPU executes
+attention (or another stage), rather than assigning more of the same MLP and
+driving both engines into the shared-fabric critical path.
+
+### The wavefront rejects the island, and the dies are idle 76% of the block (2026-08-27) — mislabelled
+
+**The island declined every block in this run too**, so what the table below
+compares is not the island. The engine-duty measurements stand; the attribution
+does not. See *The island had never routed*.
+
+
+The island was then wired into the CFG wavefront as a split-phase submission:
+`beginMLP` submits the whole MLP and returns, the other branch's attention is
+submitted next, and `finishBlock` collects — so the ANE tail is covered by GPU
+attention instead of waited on. In the run below, `qkv` and `attn out` go back to Metal while the island holds
+the dies, on the belief that four concurrent evaluations on the private runtime
+was the load the spikes hard-locked under. **That belief is withdrawn** — see
+*The concurrency constraint is withdrawn* — so this measures the island against
+the projections rather than beside them.
+
+Measured against the same wavefront without the island, interleaved in one
+process at production width, depth 4 (`cfgStackIsland`):
+
+| schedule | per block-pair | engine busy |
+|---|---|---|
+| pipelined | 1928.7 ms | 1870 ms of 7682 ms wall (**24.3%**) |
+| pipelined + island | 2082.9 ms | 905 ms of 8286 ms wall (**10.9%**) |
+
+**0.926x — the island is a 6% regression in the integrated schedule**, and the
+two runs agree (0.943x on the first). It is not close, and the reason is on the
+right-hand column rather than in the MLP arithmetic: the island puts *less* work
+on the dies than the projection routing it displaces (905 ms against 1870 ms of
+die time), while pushing `qkv` and `attn out` — the work it evicted — back onto
+the contended GPU. Hiding the join cannot recover this. The whole join is
+19.7 ms per MLP, 39 ms a pair, against a 154 ms deficit.
+
+The engine-busy column is the number that should drive the next decision, and
+nothing before this measured it. `ANELinearBackend.EngineMeter` times what the
+engine queues actually spend inside an evaluation. In the best schedule the
+dies are working **24.3% of the block** — 3.55 TFLOP a pair, against the ~22.7
+TFLOP a branch-block of arithmetic the stack contains, so under 8% of the work.
+Saturating both dies for the whole block is what the 1.48x ceiling assumes.
+Raising duty from 24% to near 100% cannot come from more MLP: it needs the
+largest stage the ANE does not touch, which is attention.
+
+**The MLP island stays opt-in and stays off.** It is correct, its calibration
+holds, and — as measured here, evicting the projections — it is the wrong place
+to spend the dies. Whether it is the wrong place *beside* them is a different
+question, and one the eviction rule prevented anyone from asking.
+
+### The concurrency constraint is withdrawn (2026-08-27)
+
+The island evicted `qkv` and `attn out` from the engine because four concurrent
+evaluations — the island's pair plus a projection's pair — were believed to be
+what hard-locked the machine. Nothing measured that. It was inferred from a
+single dual-evaluation lock, and the sleep race is a better explanation of that
+event: dual mode is simply the first thing to touch a die that has been idle
+long enough to sleep.
+
+The inference does not survive its own evidence:
+
+- The lock **reproduced with no concurrency at all** — serial mode, one
+  compiled model, one head, S=512. Concurrency is not necessary for it.
+- **Two evaluations in flight were already measured as free**: 19.90 ms against
+  19.91 ms for one, which is the whole basis of `h3_ane_run_pair`. The dies have
+  been running concurrently in the shipping path all along.
+- Four in flight has **never been run**. It was refused, not measured.
+
+What this reopens, in the order it matters:
+
+1. **The island beside the projections.** Eviction cost 1870 ms of projection
+   die time to buy 905 ms of island die time, which is most of the 0.926x. The
+   two together are the only configuration that can raise duty above 24.3%
+   without new kernels. `CFGOverlap.islandEvictsProjections` now defaults to
+   sharing; `H3_ANE_ISLAND_EVICTS=1` restores eviction for comparison, and
+   `cfgStackIsland` measures all three.
+2. **The attention spike's dual modes**, which were gated on the same belief.
+3. **A block-level schedule with several ANE queues in flight** — the
+   rate-balancing and command-DAG steps of the plan both assume it, and both
+   were closed by an argument that has now been withdrawn.
+
+None of this is a claim that four evaluations are safe. It is a claim that the
+question is open and cheap to answer, where before it was closed by something
+that was never true. The prerequisite is the power bracket: the hazard that
+actually exists is the sleep race, and it applies to one evaluation as much as
+to four.
+
+### The island had never routed (2026-08-27)
+
+`ANEMLPIslandBackend.expectedHidden` was written as **7,168**. That is
+`innerDim` — the attention width, 56 heads x 128 — and not the MLP's hidden
+size, which is **5,376** (`H3Config.hiddenSize`). A real block arrives as
+`x [S, 5376]`, `fc1 [28672, 5376]`, `fc2 [5376, 14336]`, so the guard
+`hidden == expectedHidden` refused it, every time, in every configuration.
+
+**The island has never executed a single production block.** Everything
+attributed to it has to be reassigned:
+
+| reported | what it actually measured |
+|---|---|
+| island MLP at 1.102x, 0.00362 rel-RMS | a synthetic MLP with hidden 7,168, which this model does not contain |
+| wavefront island at 0.926x, rel-RMS 0.0126 | evicting `qkv` and `attn out` from the engine — `fc1` stayed routed via `H3MLP.begin`, which has no engine gate |
+| island die time 905 ms | `fc1` alone |
+
+The reassigned reading of the wavefront run is still worth having, because it
+measures something real: **moving `qkv` and `attn out` off the engine costs 4.3%
+and halves die time** (1906 ms to 914 ms). That is a clean result about
+allocation. It is simply not a result about the island.
+
+Two things kept this invisible, and both are worth naming:
+
+- **The conformance test built its fixture from the constant under test.**
+  `let hidden = ANEMLPIslandBackend.expectedHidden` — so the island was checked
+  against its own assumption and would have passed at any value. Six tests, all
+  green, all blind. The fixtures now come from `H3Config`, so a drifting
+  constant fails them.
+- **A decline before submission leaves nothing on the receipt.** That is correct
+  — it is not a routing failure — but it meant a schedule that had quietly
+  stopped routing looked identical to one that never tried. `beginRoute` now
+  reports the first decline under `H3_ANE_ISLAND_TRACE=1`, and the benchmark
+  fails rather than passes when both sides come out bit-identical.
+
+The constants are now derived from `H3Config` rather than restated. With that
+one change the island routes on a real block for the first time, at
+**0.00036 rel-RMS** against the plain schedule over one block-pair.
+
+### Four evaluations in flight work, and utilisation is not the lever (2026-08-27)
+
+With `expectedHidden` corrected, the island routes and the three allocations can
+finally be compared. Depth 4, production width, interleaved in one process:
+
+| schedule | per block-pair | vs baseline | engine work | wall |
+|---|---|---|---|---|
+| projections only | 2083.3 ms | — | 2009 ms | 8406 ms |
+| island + projections | 2175.2 ms | **0.958x** | **5967 ms** | 8822 ms |
+| island, evicting | 2267.7 ms | 0.919x | 3303 ms | 9210 ms |
+
+Conformance over four blocks: 0.00091 and 0.00086 rel-RMS.
+
+Two results, and the second matters more than the first.
+
+**Four concurrent evaluations are fine.** The island's pair and a projection's
+pair ran together for five minutes across three schedules, and engine work
+nearly tripled — 2009 ms to 5967 ms of die time. The machine did not lock. The
+constraint that closed this direction was never real, and it can be dropped from
+the planning. (`EngineMeter` sums both queues, so 5967 ms is die-seconds across
+two queues, not a duty cycle. What it establishes is that the work landed, not
+how it was distributed.)
+
+**And it does not help.** Nearly tripling the engine's work made the block-pair
+**slower**, by 4.2%. That is the finding that should redirect the plan.
+
+The reason is that ANE work is not free to the GPU. Every piece the island takes
+costs Metal at the seams: the fp16 transpose and upload of the activation, the
+SwiGLU/transpose seam between gate/up and down, and the eight-partial join at
+the end. The island removes 3,072 of 14,336 `fc1` neurons from the GPU — 21% of
+the MLP — and hands back three Metal passes over `[S, 5376]` and `[S, 512]`
+surfaces to get it. The GPU is the critical path, so work that shortens the ANE
+queue while lengthening the Metal queue moves the block the wrong way.
+
+This contradicts the utilisation premise the roadmap rests on. "GPU 16 TFLOP/s
+plus 7.6 on the dies gives a 1.48x ceiling" assumes the dies' share arrives free.
+It does not: it arrives with a seam, and the seam is GPU work. **The ANE only
+pays where its seams cost less than the GPU work it removes.** By that test:
+
+- `qkv`, `attn out` and `fc1` pay. One upload, one join, no intermediate seam —
+  which is why the projections-only schedule is still the best measured.
+- The MLP island does not. Three seams per piece against 21% of one stage.
+- **The planned attention island probably does not either.** The design is
+  `QK^T` on the ANE, softmax on Metal, `PV` on the ANE — two Metal seams per
+  query tile per head, over `S x S` score planes. That is far more seam traffic
+  per unit of arithmetic than the island that just lost 4.2%.
+
+The attention direction worth testing is therefore the **fused** graph — the
+question `Tools/ANE/attention-spike.mm` was written to ask, whether the compiler
+accepts `QK^T -> softmax -> AV` as one program — because a fused graph has one
+seam at each end and nothing in the middle. A three-stage attention island has
+already been measured by proxy, and the proxy lost.
+
+## Machine safety: the driver sleep race, which is not concurrency
+
+**A hard lock is reachable from a single-threaded, one-head, S=512 evaluation.
+Size and concurrency are not what makes it dangerous.** On 2026-08-27 a default
+`Tools/ANE/attention-spike.mm` run — serial mode, one compiled model, the
+configuration its own header calls the safe default — wedged the machine into a
+hard shutdown. No panic report was produced, because nothing faulted.
+
+The unified log stops dead. Its final line, and the boot 48 seconds later:
+
+```
+11:01:26.262 [ERROR] ANE1: enqueueActionBlock: Skip enqueueActionBlock \
+                          fSleepInProgress: 1 fDriverInitiatedSleep: 1
+11:01:26.262         ANE1: isANEActive: fIsPowered: 0, fSleepInProgress: 1
+11:01:26.262         ANE1: ANE_PowerOn_gated: Powering on ANE. blocking: 1
+11:01:26.262         ANE1: ANE_PowerOn_gated: Wait until ANE gets powered up \
+                          for client <private> retries=1
+11:01:26.262         ANE1: setPowerState:
+11:02:14.017 === system boot ===
+```
+
+Immediately before those lines the driver is transferring buffer ownership to
+`(name:h3-ane-attention pid:15415)` — the spike creating its program on ANE1.
+
+The mechanism the log describes:
+
+1. The program create arrives while that die's driver-initiated sleep is in
+   progress.
+2. The driver **refuses to enqueue** the action block because sleep is underway
+   — the completion that would finish the transition is discarded.
+3. The client still needs the die, so the driver calls `ANE_PowerOn_gated` with
+   `blocking: 1`.
+4. That wait sits inside the IOKit command gate, waiting for a power-up
+   notification only the action block from step 2 could deliver.
+5. The gate is never released. Every other ANE client — `aned`,
+   `localspeechrecog`, `naturallanguaged`, `mediaanalysisd`, `replayd` — is a
+   system daemon, and they serialise behind the same gate. Nothing crashes; a
+   kernel workloop thread is parked forever holding a lock the system needs.
+
+### The window is five seconds, and other processes keep it open
+
+The driver-initiated sleep timer, measured from the log:
+
+```
+11:04:19.724  ANE0/ANE1: ANE_PowerOff_gated: Client requesting power off: mediaanalysisd
+11:04:24.725  ANE0/ANE1: DriverInitiatedSleepTimerTimeOut
+```
+
+**5.001 seconds of idle.** macOS runs the ANE constantly for its own features,
+so both dies cycle awake → 5 s idle → sleep transition all day, driven by
+processes that have nothing to do with this repo. Arriving during a transition
+is not a coincidence to be avoided by being careful; it is a dice roll that any
+process touching the ANE after a pause is taking.
+
+The same `enqueueActionBlock: Skip` error appears in runs that survived — at
+10:58:26 during an identical spike run three minutes earlier. It survived
+because the dies were hot from a benchmark, so the blocking power-on returned
+immediately. Whether the skipped action is fatal depends on whether anything
+actually has to wait for it.
+
+The idle **second** die is the one that gets hit. Serial workloads keep ANE0 fed
+and give ANE1 nothing — the driver's own statistics after a boot read
+`ANE0: WorkSubmitted: 34` against `ANE1: WorkSubmitted: 0` — so ANE1 sleeps on
+its timer while the process is still running, and the next two-die program
+create lands in its transition. That, not concurrency, is why the earlier
+dual-evaluation lock happened: dual mode is simply the first thing to touch a
+die that has been idle long enough to sleep. **The header note in
+`attention-spike.mm` attributing the lock to concurrency is wrong**, and it sent
+the mitigation in the wrong direction.
+
+### What the runtime offers that this bridge never used
+
+System clients bracket their usage explicitly — the log lines are
+`Client requesting power on` and `Client requesting power off`. The private
+runtime exposes that protocol:
+
+```
+_ANEClient:            beginRealTimeTask, endRealTimeTask,
+                       loadRealTimeModel:options:qos:error:,
+                       unloadRealTimeModel:options:qos:error:,
+                       evaluateRealTimeWithModel:options:request:error:
+_ANEDaemonConnection:  beginRealTimeTaskWithReply:, endRealTimeTaskWithReply:
+```
+
+`H3ANEBridge.m` uses none of it. It drives `_ANEModel` directly —
+`compileWithQoS:`, `loadWithQoS:`, `evaluateWithQoS:`, `unloadWithQoS:` — with
+no power bracket and no keep-alive anywhere. A model is loaded once and then
+evaluated at whatever interval the schedule happens to produce, and the driver
+is free to begin sleeping between any two submissions.
+
+`_ANEStrings` lists no real-time-specific entitlement — only
+`restrictedAccessEntitlement` (`com.apple.aned.private.allow`) for the private
+mach service, `aggressivePowerSavingEntitlement`, the compiler-service and
+memory-unwire ones. That the bracket is reachable over the ordinary
+`com.apple.appleneuralengine` service is therefore **plausible and unverified**:
+`_ANEClient` has `initWithRestrictedAccessAllowed:` and `_ANEDaemonConnection`
+has both `daemonConnection` and `daemonConnectionRestricted`, and which one
+carries the real-time selectors has not been established. Establishing it means
+calling it, which is the operation that costs a reboot when it is wrong.
+
+### The bracket is entitlement-gated, and the keep-alive is what is left
+
+`-[_ANEClient beginRealTimeTask]` is the supported way to say the engine is in
+use. Measured 2026-08-27, it is not available to this process:
+
+| connection | `allowRestrictedAccess` | `beginRealTimeTask` |
+|---|---|---|
+| `sharedConnection` | no | **false**, 0.2 ms, three attempts |
+| `sharedPrivateConnection` | yes | **false**, 1.0 ms, three attempts |
+
+Sub-millisecond refusals on a connection that had just been activated, with no
+message from `aned` at all, on both the ordinary and the restricted connection.
+This is an entitlement check, not a failed operation and not a cold-connection
+ordering problem. `_ANEStrings` lists no real-time entitlement, so which one it
+wants is unknown; `com.apple.aned.private.allow` is the candidate, and it is an
+Apple-private entitlement that an ad-hoc signature cannot carry without
+disabling AMFI — a boot-arg change to the machine, which is a worse trade than
+the problem.
+
+Requiring the bracket therefore means refusing all ANE work, which was the
+bridge's behaviour for about twenty minutes and is not the right answer.
+
+What is left is to keep the timer from ever firing. The transition, not the
+sleep, is what is dangerous:
+
+```
+11:00:59.796  ANE0: setPowerStateGatedPriv: ANE sleep initiated
+11:00:59.811  ANE0: power_off_hardware: Powering off... done      (15 ms)
+11:03:08.109  ANE0: setPowerStateGatedPriv: ANE sleep initiated
+11:03:08.117  ANE0: power_off_hardware: Powering off... done      ( 8 ms)
+```
+
+**8 to 15 ms.** A fully-asleep die powers on correctly — that happens at every
+boot — so the exposure per create is that window, not the whole idle period.
+
+`h3_ane_keepalive_is_running` submits a 64x64x64 pair to both dies every two
+seconds, starting on the first `h3_ane_program_create` and running for the
+lifetime of the process. Both dies, because an idle die sleeps on its own timer
+while the other works, and the idle second die is the one that got hit. The
+keep-alive's own create goes first, so the real creates that follow — one per
+new shape, dozens across a benchmark — all happen with the timer held off.
+
+This is a reduction in exposure, not a proof of safety. What remains is the
+keep-alive's own first create, plus any real create that races it from another
+thread before the timer is running. Without the entitlement there is no way to
+close that, because there is no way to ask the driver to wait.
+
+Measured over 31 s of holding with no other work in the process
+(`Tools/ANE/power-bracket-check.m`, one create then idle):
+
+| signature | occurrences |
+|---|---|
+| `DriverInitiatedSleepTimerTimeOut` | **0** |
+| `setPowerStateGatedPriv: ANE sleep initiated` | **0** |
+| `enqueueActionBlock: Skip` | **0** |
+| driver events, ANE0 / ANE1 | 177 / 177 |
+
+All three signatures that preceded the hard lock are absent, and the two dies
+are equally active — the idle second die, which is the one that got hit, is
+being fed.
+
+What this does **not** do is pin the engine powered. The log shows it still
+power-cycling about once a tick, but through `ANE_PowerOff_gated: Client
+requesting power off` rather than `fDriverInitiatedSleep: 1`. Power-on from
+fully-off is the normal path and is what happens at every boot; the wedge needed
+a driver-initiated sleep in progress. Suppressing that timer is what the
+keep-alive does, and it is all it does. Pinning the engine powered is what the
+bracket would do, and that needs the entitlement.
+
+### The rule this leaves
+
+- **No ANE work of any size runs outside the keep-alive.** The toy shapes are
+  not the safe subset; there is no safe subset. `h3_ane_program_create` starts
+  the keep-alive before it creates anything, and returns NULL if it cannot.
+- It covers **both** dies, at two seconds against the driver's five.
+- Anything that talks to the private runtime without going through
+  `H3ANEBridge` needs the same guard. `Tools/ANE/differential.m` has it, and the
+  five spikes that include it inherit it; the two island spikes reach the engine
+  through the bridge and inherit it there.
+- The residual first-create exposure is real and unclosable without the
+  entitlement. It is one window of 8-15 ms per process, against roughly one
+  create — not one per shape, which is what it was when this machine went down.
 
 ## Discharged
 

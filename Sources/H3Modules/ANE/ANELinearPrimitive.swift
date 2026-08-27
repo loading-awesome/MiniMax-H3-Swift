@@ -292,6 +292,38 @@ public enum ANELinearBackend {
     /// So the engine gets its own thread. The MLX thread hands it work and
     /// collects the result later, and in between it is free to keep the GPU
     /// fed with the other CFG branch.
+    /// Wall time the engine queues spent inside an evaluation.
+    ///
+    /// The receipt says what routed. It cannot say whether the dies had
+    /// anything to do, and in an overlap schedule that is the question that
+    /// decides where the next piece of work should go: a schedule whose engine
+    /// is busy 90% of the block has no headroom to give, however many routes
+    /// it records.
+    ///
+    /// Both engine queues report here, so with the island and the projections
+    /// running at once the total counts concurrent work twice. That is the
+    /// honest reading — it is die-seconds, not wall-seconds — and the callers
+    /// that divide by wall time say which they mean.
+    package enum EngineMeter {
+        private static let lock = NSLock()
+        nonisolated(unsafe) private static var seconds: Double = 0
+
+        package static func reset() { lock.lock(); seconds = 0; lock.unlock() }
+
+        package static var busySeconds: Double {
+            lock.lock(); defer { lock.unlock() }
+            return seconds
+        }
+
+        static func measure(_ body: () -> Bool) -> Bool {
+            let t0 = Date()
+            let ok = body()
+            let elapsed = Date().timeIntervalSince(t0)
+            lock.lock(); seconds += elapsed; lock.unlock()
+            return ok
+        }
+    }
+
     final class Engine: @unchecked Sendable {
         static let shared = Engine()
         private let queue = DispatchQueue(label: "h3.ane.engine", qos: .userInitiated)
@@ -307,7 +339,7 @@ public enum ANELinearBackend {
 
         func submit(_ work: @escaping @Sendable () -> Bool) -> Job {
             let job = Job()
-            queue.async { job.settle(work()) }
+            queue.async { job.settle(EngineMeter.measure(work)) }
             return job
         }
     }
@@ -663,6 +695,10 @@ public enum ANELinearBackend {
         if didRoute { routed.insert(label) } else { declined.insert(label) }
     }
 
+    package static func recordRoute(_ label: String, routed: Bool) {
+        note(label, routed: routed)
+    }
+
     /// Projections the engine actually computed during this process, and any
     /// that were offered to it and fell back.
     ///
@@ -813,12 +849,22 @@ public enum ANELinearBackend {
     /// Everything before the submission is GPU work on the calling thread and
     /// has to happen here: the activation must be materialised and copied into
     /// the engine's surface before the engine can read it.
-    package static func begin(x: MLXArray, weight: MLXArray, label: String) -> Pending {
+    ///
+    /// - Parameter engine: false routes to the GPU even with the backend on.
+    ///   The caller is saying something else owns the dies for this stretch —
+    ///   the MLP island does — and the decline is recorded, because with the
+    ///   backend on it is a real routing decision the receipt should carry.
+    package static func begin(x: MLXArray, weight: MLXArray, label: String,
+                              engine: Bool = true) -> Pending {
         // Without the opt-in nothing is offered, so nothing is recorded. A
         // decline noted here would put entries on the receipt of a render that
         // never went near the engine, and the receipt's whole job is to say
         // which arithmetic produced the output.
         guard isEnabled else { return Pending(.plain(MLX.matmul(x, weight.transposed()))) }
+        guard engine else {
+            note(label, routed: false)
+            return Pending(.plain(MLX.matmul(x, weight.transposed())))
+        }
         guard let body = start(x: x, weight: weight, share: share(for: label)) else {
             note(label, routed: false)
             return Pending(.plain(MLX.matmul(x, weight.transposed())))

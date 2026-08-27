@@ -301,7 +301,7 @@ package struct H3Transformer {
     /// Tells the saturation probe where it is. Only the block loop knows, and
     /// the probe needs it to say which block produced the worst bound.
     private func markProbe(block: Int, stepIndex: Int?, stepCount: Int?) {
-        guard DiTBlock.saturationProbe.enabled else { return }
+        guard DiTBlock.saturationProbe.needsContext else { return }
         DiTBlock.saturationProbe.block = block
         if let s = stepIndex, let n = stepCount, n > 0 {
             DiTBlock.saturationProbe.progress = Double(s) / Double(n)

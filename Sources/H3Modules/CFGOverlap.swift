@@ -34,6 +34,32 @@ import H3Foundation
 /// ``DiTBlock.callAsFunction`` and `CFGOverlapTests` pins that bit-for-bit.
 enum CFGOverlap {
 
+    /// Whether the island pushes `qkv` and `attn out` back to Metal instead of
+    /// sharing the dies with them. **Off by default, and this is a reversal.**
+    ///
+    /// It used to be on, and justified as machine safety: four concurrent
+    /// evaluations on the private runtime — the island's pair plus a
+    /// projection's pair — was believed to be the load the spikes hard-locked
+    /// under. That reasoning is withdrawn. The lock reproduced on 2026-08-27 in
+    /// a serial, single-model, one-head evaluation with no concurrency in it at
+    /// all, and the log shows a driver power-state race instead: a program
+    /// create landing inside the five-second idle sleep transition. Concurrency
+    /// was never necessary for it, and two evaluations in flight were already
+    /// measured as free (19.90 ms against 19.91 for one). Four was never
+    /// measured at all. See `docs/ANE_STATUS.md`, "Machine safety".
+    ///
+    /// Evicting cost real throughput: the island contributed 905 ms of die time
+    /// while displacing 1870 ms of projection routing, which is most of why the
+    /// wavefront measured 0.926x with it on. Sharing is the configuration that
+    /// can raise engine duty above the measured 24.3%, which is the number that
+    /// decides whether the ANE can reach its share of a 1.5x render.
+    ///
+    /// `H3_ANE_ISLAND_EVICTS=1` restores the old behaviour so the two can be
+    /// measured against each other rather than argued about.
+    static var islandEvictsProjections: Bool {
+        ProcessInfo.processInfo.environment["H3_ANE_ISLAND_EVICTS"] == "1"
+    }
+
     /// One block of both CFG branches, engine and GPU busy at the same time.
     ///
     /// Lives on the schedule rather than on the transformer so it can be
@@ -44,13 +70,19 @@ enum CFGOverlap {
                       tEmbC: MLXArray, tEmbU: MLXArray,
                       indexC: ModulationIndex, indexU: ModulationIndex,
                       ropeC: MLXArray?, ropeU: MLXArray?,
-                      contextC: AttentionContext?, contextU: AttentionContext?)
+                      contextC: AttentionContext?, contextU: AttentionContext?,
+                      blockIndex: Int? = nil,
+                      island: Bool = ANEMLPIslandBackend.isEnabled,
+                      engine: Bool? = nil)
         -> (MLXArray, MLXArray) {
+        let engine = engine ?? !(island && islandEvictsProjections)
         // Both `qkv` projections go to the engine before either is collected.
         // Collecting the first one immediately is the synchronous path, and
         // measures like it.
-        let startC = block.beginAttention(cond, tEmb: tEmbC, index: indexC)
-        let startU = block.beginAttention(uncond, tEmb: tEmbU, index: indexU)
+        let startC = block.beginAttention(cond, tEmb: tEmbC, index: indexC,
+                                          engine: engine)
+        let startU = block.beginAttention(uncond, tEmb: tEmbU, index: indexU,
+                                          engine: engine)
 
         // `asyncEval`, not `eval`: hand the GPU the cond attention and walk
         // away, so the engine has that window to finish the uncond `qkv`.
@@ -71,16 +103,18 @@ enum CFGOverlap {
         // So cond's post-attention work goes in first, and uncond's attention
         // is submitted once it is queued — where it covers `fc1`, the largest
         // engine job in the block.
-        let postC = block.beginPost(prepC, merged: mergedC)
-        let mlpC = block.beginMLP(postC, index: indexC)
+        let postC = block.beginPost(prepC, merged: mergedC, engine: engine)
+        let mlpC = block.beginMLP(postC, index: indexC, blockIndex: blockIndex,
+                                  island: island)
 
         let mergedU = block.attend(prepU, context: contextU)
         MLX.asyncEval(mergedU)
 
         let cOut = block.finishBlock(mlpC, index: indexC)
 
-        let postU = block.beginPost(prepU, merged: mergedU)
-        let mlpU = block.beginMLP(postU, index: indexU)
+        let postU = block.beginPost(prepU, merged: mergedU, engine: engine)
+        let mlpU = block.beginMLP(postU, index: indexU, blockIndex: blockIndex,
+                                  island: island)
         let uOut = block.finishBlock(mlpU, index: indexU)
 
         MLX.eval(cOut, uOut)
@@ -126,12 +160,15 @@ enum CFGOverlap {
                          cond: inout Branch, uncond: inout Branch,
                          contextC: (Int) -> AttentionContext?,
                          contextU: (Int) -> AttentionContext?,
-                         tap: (Int, MLXArray) -> Void) {
+                         tap: (Int, MLXArray) -> Void,
+                         island: Bool = ANEMLPIslandBackend.isEnabled,
+                         engine engineOverride: Bool? = nil) {
         guard !range.isEmpty else { return }
+        let engine = engineOverride ?? !(island && islandEvictsProjections)
 
         // Prologue: put the conditional branch half a block ahead.
         cond.start = blocks[range.lowerBound].beginAttention(
-            cond.h, tEmb: cond.tEmb, index: cond.index)
+            cond.h, tEmb: cond.tEmb, index: cond.index, engine: engine)
         var uncondBlock = range.lowerBound - 1      // the block uncond is finishing
 
         for i in range {
@@ -147,9 +184,15 @@ enum CFGOverlap {
             //    441 ms it does not depend on.
             if uncondBlock >= range.lowerBound, let prepU = uncond.prep,
                let mergedU = uncond.merged {
-                let postU = blocks[uncondBlock].beginPost(prepU, merged: mergedU)
-                let mlpU = blocks[uncondBlock].beginMLP(postU, index: uncond.index)
-                // 3. Cond's attention goes in now, so it covers uncond's `fc1`.
+                let postU = blocks[uncondBlock].beginPost(prepU, merged: mergedU,
+                                                          engine: engine)
+                let mlpU = blocks[uncondBlock].beginMLP(postU, index: uncond.index,
+                                                        blockIndex: uncondBlock,
+                                                        island: island)
+                // 3. Cond's attention goes in now, so it covers uncond's MLP —
+                //    `fc1` on the plain backend, and on the island the whole
+                //    ANE tail, which is why the island's submission must not
+                //    wait inside `beginMLP`.
                 let mergedC = block.attend(prepC, context: contextC(i))
                 MLX.asyncEval(mergedC)
                 cond.prep = prepC
@@ -164,13 +207,15 @@ enum CFGOverlap {
 
             // 4. Uncond starts block i on the engine, under cond's attention.
             let startU = block.beginAttention(uncond.h, tEmb: uncond.tEmb,
-                                              index: uncond.index)
+                                              index: uncond.index, engine: engine)
             let prepU = block.finishAttention(startU, ropeTable: uncond.table)
 
             // 5. Cond finishes block i on the engine, with uncond's attention
             //    submitted between its elementwise and its `fc1` wait.
-            let postC = block.beginPost(cond.prep!, merged: cond.merged!)
-            let mlpC = block.beginMLP(postC, index: cond.index)
+            let postC = block.beginPost(cond.prep!, merged: cond.merged!,
+                                        engine: engine)
+            let mlpC = block.beginMLP(postC, index: cond.index, blockIndex: i,
+                                      island: island)
 
             let mergedU = block.attend(prepU, context: contextU(i))
             MLX.asyncEval(mergedU)
@@ -184,14 +229,17 @@ enum CFGOverlap {
             // 6. Cond's next block goes on the engine under uncond's attention.
             if i + 1 < range.upperBound {
                 cond.start = blocks[i + 1].beginAttention(
-                    cond.h, tEmb: cond.tEmb, index: cond.index)
+                    cond.h, tEmb: cond.tEmb, index: cond.index, engine: engine)
             }
         }
 
         // Epilogue: uncond is still half a block behind.
         if let prepU = uncond.prep, let mergedU = uncond.merged {
-            let postU = blocks[uncondBlock].beginPost(prepU, merged: mergedU)
-            let mlpU = blocks[uncondBlock].beginMLP(postU, index: uncond.index)
+            let postU = blocks[uncondBlock].beginPost(prepU, merged: mergedU,
+                                                      engine: engine)
+            let mlpU = blocks[uncondBlock].beginMLP(postU, index: uncond.index,
+                                                    blockIndex: uncondBlock,
+                                                    island: island)
             uncond.h = blocks[uncondBlock].finishBlock(mlpU, index: uncond.index)
             uncond.prep = nil
             uncond.merged = nil
@@ -216,7 +264,8 @@ extension H3Transformer {
                                           tEmbC: cond.tEmb, tEmbU: uncond.tEmb,
                                           indexC: cond.index, indexU: uncond.index,
                                           ropeC: cond.table, ropeU: uncond.table,
-                                          contextC: contextC, contextU: contextU)
+                                          contextC: contextC, contextU: contextU,
+                                          blockIndex: i)
             cond.h = c
             uncond.h = u
             if Self.tappedBlocks.contains(i) { condTaps.blocks[i] = c }

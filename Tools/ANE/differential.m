@@ -6,6 +6,7 @@
 #import <Foundation/Foundation.h>
 #import <IOSurface/IOSurface.h>
 #import <objc/message.h>
+#import <objc/runtime.h>
 #import <dlfcn.h>
 #import <mach/mach_time.h>
 #include <math.h>
@@ -40,6 +41,23 @@ typedef struct {
     float relativeRMS;
     float cosine;
 } Metrics;
+
+/// Keeps the engine awake for the lifetime of a spike, shared by every spike
+/// that includes this file.
+///
+/// The driver sleeps five seconds after its last work, and a model load landing
+/// inside that 8-15 ms sleep *transition* wedges the machine — no panic, no
+/// recovery, hard shutdown. See "Machine safety: the driver sleep race" in
+/// docs/ANE_STATUS.md.
+///
+/// `-[_ANEClient beginRealTimeTask]` is the supported way to prevent it and is
+/// entitlement-gated; it refuses this process on both connections. So the
+/// defence is the same one `H3ANEBridge` uses: submit trivial work more often
+/// than the driver's timer, so the timer never fires and no transition is ever
+/// open for a load to land in.
+///
+/// Defined below `Build`, which it uses; declared here because `Build` calls it.
+static bool SpikeKeepEngineAwake(void);
 
 static Class DescriptorClass;
 static Class ModelClass;
@@ -195,6 +213,10 @@ static BuiltModel Build(NSString *mil, NSDictionary *weights) {
         ((void(*)(id,SEL,id))objc_msgSend)(result.model, @selector(setModelURL:),
             [NSURL fileURLWithPath:result.directory]);
     }
+    if (!SpikeKeepEngineAwake()) {
+        result.error = @"ANE keep-alive unavailable; not loading (see docs/ANE_STATUS.md)";
+        return result;
+    }
     error = nil;
     result.compiled = ((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(result.model,
         @selector(compileWithQoS:options:error:), 21, ExecutionOptions, &error);
@@ -211,6 +233,72 @@ static void Destroy(BuiltModel model) {
     if (model.loaded) ((BOOL(*)(id,SEL,unsigned int,NSError**))objc_msgSend)(model.model,
         @selector(unloadWithQoS:error:), 21, &error);
     if (model.directory) [NSFileManager.defaultManager removeItemAtPath:model.directory error:nil];
+}
+
+static BOOL Evaluate(id model, NSArray *inputs, IOSurfaceRef output, IOSurfaceRef weightsBuffer,
+                     NSNumber *procedureIndex, NSString **errorText);
+
+/// Best effort on the supported bracket, then the keep-alive that actually
+/// works. Returns false only if the engine could not be held awake at all, in
+/// which case the caller must not load: an engine that cannot be kept awake is
+/// one no spike should keep creating programs on.
+static bool SpikeKeepEngineAwake(void) {
+    static bool running = false;
+    static bool settingUp = false;
+    if (running) return true;
+    // Re-entrancy: the keep-alive builds its own model through `Build`, which
+    // calls this. The nested call must not recurse or refuse.
+    if (settingUp) return true;
+    settingUp = true;
+
+    // Free when it fails, and correct the moment a signed build can take it.
+    Class clientClass = NSClassFromString(@"_ANEClient");
+    if (clientClass &&
+        class_respondsToSelector(object_getClass(clientClass), @selector(sharedConnection)) &&
+        class_respondsToSelector(clientClass, @selector(beginRealTimeTask))) {
+        id client = ((id(*)(Class,SEL))objc_msgSend)(clientClass, @selector(sharedConnection));
+        if (client && ((BOOL(*)(id,SEL))objc_msgSend)(client, @selector(beginRealTimeTask))) {
+            fprintf(stderr, "ANE power bracket held.\n");
+            settingUp = false; running = true; return true;
+        }
+    }
+
+    // This load is the one exposed operation in the process. Everything after
+    // it happens with the driver's idle timer held off.
+    static BuiltModel keeper;
+    keeper = Build(SeparateMIL(), @{});
+    if (!keeper.loaded) {
+        fprintf(stderr, "ANE keep-alive could not load (%s); refusing to run.\n",
+                keeper.error.UTF8String ?: "unknown");
+        settingUp = false;
+        return false;
+    }
+    static IOSurfaceRef ka = NULL, kw = NULL, ko = NULL;
+    ka = NewSurface(TensorBytes(K, S));
+    kw = NewSurface(TensorBytes(K, N));
+    ko = NewSurface(TensorBytes(N, S));
+    if (!ka || !kw || !ko) {
+        fprintf(stderr, "ANE keep-alive surfaces failed; refusing to run.\n");
+        settingUp = false;
+        return false;
+    }
+
+    static dispatch_source_t timer;
+    dispatch_queue_t queue = dispatch_queue_create("h3.spike.keepalive", DISPATCH_QUEUE_SERIAL);
+    timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
+    // Two seconds against the driver's five.
+    dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 0),
+                              2ull * NSEC_PER_SEC, NSEC_PER_SEC / 4);
+    dispatch_source_set_event_handler(timer, ^{
+        NSString *error = nil;
+        Evaluate(keeper.model, @[(__bridge id)ka, (__bridge id)kw], ko, NULL, @0, &error);
+    });
+    dispatch_resume(timer);
+
+    settingUp = false;
+    running = true;
+    fprintf(stderr, "ANE keep-alive running (2 s, both dies via the driver's own scheduling).\n");
+    return true;
 }
 
 static BOOL EvaluateWithOptions(id model, NSArray *inputs, IOSurfaceRef output, IOSurfaceRef weightsBuffer,

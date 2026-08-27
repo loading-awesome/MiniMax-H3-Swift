@@ -188,4 +188,142 @@ struct ANENativePackMergeTests {
                 "native fused SwiGLU must preserve the existing bf16 arithmetic exactly")
         print("ANENativePackMergeTest PASS: Native FC1 Fused SwiGLU Merge matches the gate/up oracle.")
     }
+
+    @Test
+    func nativeSwiGLUTransposeFeedsNextANEProjection() throws {
+        let s = 64, ffn = 32
+        guard let gate = h3_ane_tensor_create(Int32(s), Int32(ffn)),
+              let up = h3_ane_tensor_create(Int32(s), Int32(ffn)),
+              let destination = h3_ane_tensor_create(Int32(ffn), Int32(s)) else {
+            Issue.record("Failed to allocate persistent-MLP seam tensors")
+            return
+        }
+        defer {
+            h3_ane_tensor_free(gate)
+            h3_ane_tensor_free(up)
+            h3_ane_tensor_free(destination)
+        }
+
+        let gatePtr = h3_ane_tensor_ptr(gate)!.assumingMemoryBound(to: Float16.self)
+        let upPtr = h3_ane_tensor_ptr(up)!.assumingMemoryBound(to: Float16.self)
+        for row in 0 ..< s {
+            for col in 0 ..< ffn {
+                // Different values along both axes make the destination index
+                // an oracle for [S,F] -> [F,S], rather than merely its shape.
+                let g = Float(1 + row % 3) / 16
+                let u = Float(2 + col % 5) / 16
+                gatePtr[row * ffn + col] = Float16(g)
+                upPtr[row * ffn + col] = Float16(u)
+            }
+        }
+
+        let ok = h3_ane_swiglu_transpose_fp16(
+            gate, up, destination, Int32(s), Int32(ffn), 16, 1.0 / 16.0, nil)
+        #expect(ok, "persistent-MLP Metal seam must execute")
+
+        let dst = h3_ane_tensor_ptr(destination)!.assumingMemoryBound(to: Float16.self)
+        for row in 0 ..< s {
+            for col in 0 ..< ffn {
+                let g = Float(1 + row % 3)
+                let u = Float(2 + col % 5)
+                let expected = Float16((g / (1 + exp(-g))) * u / 16)
+                let actual = dst[col * s + row]
+                #expect(actual == expected,
+                        "SwiGLU transpose mismatch at row \(row), col \(col)")
+            }
+        }
+    }
+
+    @Test
+    func nativePairedSwiGLUTransposeUsesPerDieScales() throws {
+        let s = 64, ffn = 32
+        guard let gate0 = h3_ane_tensor_create(Int32(s), Int32(ffn)),
+              let up0 = h3_ane_tensor_create(Int32(s), Int32(ffn)),
+              let dst0 = h3_ane_tensor_create(Int32(ffn), Int32(s)),
+              let gate1 = h3_ane_tensor_create(Int32(s), Int32(ffn)),
+              let up1 = h3_ane_tensor_create(Int32(s), Int32(ffn)),
+              let dst1 = h3_ane_tensor_create(Int32(ffn), Int32(s)) else {
+            Issue.record("Failed to allocate paired persistent-MLP seam tensors")
+            return
+        }
+        defer {
+            for tensor in [gate0, up0, dst0, gate1, up1, dst1] {
+                h3_ane_tensor_free(tensor)
+            }
+        }
+
+        for (gate, up, bias) in [(gate0, up0, 0), (gate1, up1, 3)] {
+            let gp = h3_ane_tensor_ptr(gate)!.assumingMemoryBound(to: Float16.self)
+            let up = h3_ane_tensor_ptr(up)!.assumingMemoryBound(to: Float16.self)
+            for row in 0 ..< s {
+                for col in 0 ..< ffn {
+                    gp[row * ffn + col] = Float16(Float(1 + (row + bias) % 4) / 16)
+                    up[row * ffn + col] = Float16(Float(2 + (col + bias) % 5) / 16)
+                }
+            }
+        }
+
+        let ok = h3_ane_swiglu_transpose_pair_fp16(
+            gate0, up0, dst0, 1.0 / 16.0,
+            gate1, up1, dst1, 1.0 / 256.0,
+            Int32(s), Int32(ffn), 16, nil)
+        #expect(ok, "paired persistent-MLP Metal seam must execute")
+
+        for (dstTensor, bias, scale) in [(dst0, 0, Float(1.0 / 16.0)),
+                                         (dst1, 3, Float(1.0 / 256.0))] {
+            let dst = h3_ane_tensor_ptr(dstTensor)!.assumingMemoryBound(to: Float16.self)
+            for row in 0 ..< s {
+                for col in 0 ..< ffn {
+                    let g = Float(1 + (row + bias) % 4)
+                    let u = Float(2 + (col + bias) % 5)
+                    let expected = Float16((g / (1 + exp(-g))) * u * scale)
+                    #expect(dst[col * s + row] == expected,
+                            "paired seam mismatch for bias \(bias), row \(row), col \(col)")
+                }
+            }
+        }
+    }
+
+    @Test
+    func nativeMLPIslandPartialJoinMatchesCanonicalSum() throws {
+        let s = 64, hidden = 32
+        let maybe0 = (0 ..< 4).map { _ in h3_ane_tensor_create(Int32(s), Int32(hidden)) }
+        let maybe1 = (0 ..< 4).map { _ in h3_ane_tensor_create(Int32(s), Int32(hidden)) }
+        guard maybe0.allSatisfy({ $0 != nil }), maybe1.allSatisfy({ $0 != nil }) else {
+            Issue.record("Failed to allocate MLP-island partial tensors")
+            return
+        }
+        let ane0 = maybe0.map { $0! }, ane1 = maybe1.map { $0! }
+        defer { (ane0 + ane1).forEach(h3_ane_tensor_free) }
+
+        for piece in 0 ..< 4 {
+            let p0 = h3_ane_tensor_ptr(ane0[piece])!.assumingMemoryBound(to: Float16.self)
+            let p1 = h3_ane_tensor_ptr(ane1[piece])!.assumingMemoryBound(to: Float16.self)
+            for i in 0 ..< s * hidden {
+                p0[i] = Float16(Float(piece + 1) / 16)
+                p1[i] = Float16(Float(2 * (piece + 1)) / 256)
+            }
+        }
+        let gpuBits = UInt16(Float(1.25).bitPattern >> 16)
+        let gpu = [UInt16](repeating: gpuBits, count: s * hidden)
+        var dst = [UInt16](repeating: 0, count: s * hidden)
+        let ok = gpu.withUnsafeBytes { gpuRaw in
+            dst.withUnsafeMutableBytes { dstRaw in
+                ane0.withUnsafeBufferPointer { p0 in
+                    ane1.withUnsafeBufferPointer { p1 in
+                        h3_ane_merge_mlp_island_partials(
+                            gpuRaw.baseAddress!, p0.baseAddress!, 16,
+                            p1.baseAddress!, 256, dstRaw.baseAddress!,
+                            Int32(s), Int32(hidden), nil)
+                    }
+                }
+            }
+        }
+        #expect(ok, "persistent-MLP final partial join must execute")
+        let expected = Float(31.25)
+        for bits in dst {
+            #expect(Float(bitPattern: UInt32(bits) << 16) == expected,
+                    "partial join must sum GPU + four pieces from each die before bf16 rounding")
+        }
+    }
 }

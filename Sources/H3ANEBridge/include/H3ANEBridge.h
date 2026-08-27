@@ -22,6 +22,45 @@ extern "C" {
 
 bool h3_ane_is_available(void);
 
+#pragma mark - Power bracket
+
+/// Declares to the ANE daemon that this process is using the engine, so the
+/// driver does not initiate its five-second idle sleep underneath us.
+///
+/// **This is the supported defence, and it does not work here.** Measured
+/// 2026-08-27: `-[_ANEClient beginRealTimeTask]` returns false on both
+/// `sharedConnection` and `sharedPrivateConnection`, in under a millisecond,
+/// on retries. It is entitlement-gated and this process does not have the
+/// entitlement. Kept because it is the right call to make, it is free when it
+/// fails, and it starts working the moment the process is signed for it.
+///
+/// The defence that is actually load-bearing is the keep-alive below.
+bool h3_ane_power_acquire(void);
+
+/// Ends the bracket. Registered with `atexit`, so callers do not have to.
+void h3_ane_power_release(void);
+
+bool h3_ane_power_is_held(void);
+
+/// Whether trivial work is being submitted to both dies often enough that the
+/// driver never starts its idle sleep.
+///
+/// **This is a machine-safety mechanism, not an optimisation.** A program
+/// create that lands inside the driver's sleep *transition* — 8 to 15 ms wide,
+/// opened five seconds after the engine's last work — makes the driver skip the
+/// action block that completes the transition, and the blocking, gated power-on
+/// it then issues waits forever inside the IOKit command gate every other ANE
+/// client needs. Nothing faults, so there is no panic: the machine stops. A
+/// one-head S=512 evaluation reached this on 2026-08-27. See "Machine safety:
+/// the driver sleep race" in `docs/ANE_STATUS.md`.
+///
+/// It starts on the first `h3_ane_program_create` and runs for the lifetime of
+/// the process. A fully-asleep die powers on correctly, so what this removes is
+/// the transition, and with it every create after the first. `h3_ane_program_create`
+/// returns NULL if the keep-alive cannot be established, because an engine that
+/// cannot be held awake is one this bridge will not keep creating on.
+bool h3_ane_keepalive_is_running(void);
+
 #pragma mark - Tensors
 
 typedef struct H3ANETensor H3ANETensor;
@@ -120,6 +159,49 @@ bool h3_ane_merge_fc1_swiglu(const void* _Nonnull gpuSuffixBF16,
                              void* _Nonnull dstBF16,
                              int s, int nGpu, int nAne0, int nAne1,
                              void* _Nullable commandQueue);
+
+/// Persistent-MLP seam: reads separate fp16 `[S,F]` gate/up ANE outputs,
+/// applies `SiLU(gate) * up`, and writes fp16 `[F,S]` directly into the input
+/// surface for a row-sharded fc2 program. `inputUnscale` restores any scaling
+/// applied before fc1; `outputScale` prepares the activation for fc2.
+bool h3_ane_swiglu_transpose_fp16(H3ANETensor* _Nonnull gateTensor,
+                                  H3ANETensor* _Nonnull upTensor,
+                                  H3ANETensor* _Nonnull dstTensor,
+                                  int s, int ffn,
+                                  float inputUnscale, float outputScale,
+                                  void* _Nullable commandQueue);
+
+/// Encodes both ANE islands' SwiGLU seams into one Metal command buffer. The
+/// two ranges may use different calibrated fc2 scales, but have the same shape.
+bool h3_ane_swiglu_transpose_pair_fp16(
+    H3ANETensor* _Nonnull gate0, H3ANETensor* _Nonnull up0,
+    H3ANETensor* _Nonnull dst0, float outputScale0,
+    H3ANETensor* _Nonnull gate1, H3ANETensor* _Nonnull up1,
+    H3ANETensor* _Nonnull dst1, float outputScale1,
+    int s, int ffn, float inputUnscale,
+    void* _Nullable commandQueue);
+
+/// Split-contraction form of the persistent seam. Each gate/up array contains
+/// four fp16 partials over disjoint contraction ranges. They are accumulated
+/// in fp32 before SwiGLU, improving both ANE throughput and long-dot accuracy.
+bool h3_ane_swiglu_transpose_pair_split4_fp16(
+    H3ANETensor* _Nonnull const* _Nonnull gate0,
+    H3ANETensor* _Nonnull const* _Nonnull up0,
+    H3ANETensor* _Nonnull dst0, float outputScale0,
+    H3ANETensor* _Nonnull const* _Nonnull gate1,
+    H3ANETensor* _Nonnull const* _Nonnull up1,
+    H3ANETensor* _Nonnull dst1, float outputScale1,
+    int s, int ffn, float inputUnscale,
+    void* _Nullable commandQueue);
+
+/// Final persistent-island join. Adds the GPU's bf16 partial and four fp16
+/// fc2 piece outputs from each die, unscaling each die only once, into bf16.
+bool h3_ane_merge_mlp_island_partials(
+    const void* _Nonnull gpuPartialBF16,
+    H3ANETensor* _Nonnull const* _Nonnull ane0Partials, float ane0Unscale,
+    H3ANETensor* _Nonnull const* _Nonnull ane1Partials, float ane1Unscale,
+    void* _Nonnull dstBF16, int s, int hidden,
+    void* _Nullable commandQueue);
 
 #ifdef __cplusplus
 }

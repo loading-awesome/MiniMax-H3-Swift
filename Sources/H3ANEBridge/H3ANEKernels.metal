@@ -141,3 +141,65 @@ kernel void h3_merge_fc1_swiglu(
 
     dst_bf16[row * ffn_dim + col] = h3_bf16_rne(out_val);
 }
+
+// Persistent MLP seam. Gate and up remain in their ANE output surfaces; the
+// result is transposed into the input orientation preferred by the next ANE
+// matmul, so no MLX-owned full-width fc1 tensor exists between the projections.
+kernel void h3_swiglu_transpose_fp16(
+    device const half* gate_fp16 [[buffer(0)]],
+    device const half* up_fp16   [[buffer(1)]],
+    device half* dst_fp16        [[buffer(2)]],
+    constant uint& s             [[buffer(3)]],
+    constant uint& ffn           [[buffer(4)]],
+    constant float& input_unscale [[buffer(5)]],
+    constant float& output_scale [[buffer(6)]],
+    uint2 gid                    [[thread_position_in_grid]]
+) {
+    uint row = gid.y;
+    uint col = gid.x;
+    if (row >= s || col >= ffn) return;
+
+    float gate = float(gate_fp16[row * ffn + col]) * input_unscale;
+    float up = float(up_fp16[row * ffn + col]) * input_unscale;
+    float tail = 1.0f / (1.0f + exp(abs(gate)));
+    float sigmoid_gate = gate < 0.0f ? tail : 1.0f - tail;
+    dst_fp16[col * s + row] = half((gate * sigmoid_gate * up) * output_scale);
+}
+
+kernel void h3_swiglu_transpose_split4_fp16(
+    device const half* g0 [[buffer(0)]], device const half* g1 [[buffer(1)]],
+    device const half* g2 [[buffer(2)]], device const half* g3 [[buffer(3)]],
+    device const half* u0 [[buffer(4)]], device const half* u1 [[buffer(5)]],
+    device const half* u2 [[buffer(6)]], device const half* u3 [[buffer(7)]],
+    device half* dst [[buffer(8)]], constant uint& s [[buffer(9)]],
+    constant uint& ffn [[buffer(10)]], constant float& input_unscale [[buffer(11)]],
+    constant float& output_scale [[buffer(12)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    uint row = gid.y, col = gid.x;
+    if (row >= s || col >= ffn) return;
+    uint i = row * ffn + col;
+    float gate = (float(g0[i]) + float(g1[i]) + float(g2[i]) + float(g3[i])) * input_unscale;
+    float up = (float(u0[i]) + float(u1[i]) + float(u2[i]) + float(u3[i])) * input_unscale;
+    float tail = 1.0f / (1.0f + exp(abs(gate)));
+    float sigmoid_gate = gate < 0.0f ? tail : 1.0f - tail;
+    dst[col * s + row] = half((gate * sigmoid_gate * up) * output_scale);
+}
+
+kernel void h3_merge_mlp_island_partials(
+    device const ushort* gpu [[buffer(0)]],
+    device const half* a00 [[buffer(1)]], device const half* a01 [[buffer(2)]],
+    device const half* a02 [[buffer(3)]], device const half* a03 [[buffer(4)]],
+    device const half* a10 [[buffer(5)]], device const half* a11 [[buffer(6)]],
+    device const half* a12 [[buffer(7)]], device const half* a13 [[buffer(8)]],
+    device ushort* dst [[buffer(9)]],
+    constant uint& s [[buffer(10)]], constant uint& hidden [[buffer(11)]],
+    constant float& unscale0 [[buffer(12)]], constant float& unscale1 [[buffer(13)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    uint row = gid.y, col = gid.x;
+    if (row >= s || col >= hidden) return;
+    uint i = row * hidden + col;
+    float value = as_type<float>(uint(gpu[i]) << 16);
+    value += (float(a00[i]) + float(a01[i]) + float(a02[i]) + float(a03[i])) * unscale0;
+    value += (float(a10[i]) + float(a11[i]) + float(a12[i]) + float(a13[i])) * unscale1;
+    dst[i] = h3_bf16_rne(value);
+}

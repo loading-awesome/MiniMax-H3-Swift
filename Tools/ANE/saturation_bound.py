@@ -91,7 +91,7 @@ def read_f32(path, header, offset0, name):
                      offset=offset0 + begin, shape=(r, c))
 
 
-def order_free_bound(a, w, chunk=512, splits=1):
+def order_free_bound(a, w, chunk=512, splits=1, contraction=None):
     """max over (row, channel) of sum_k |a_k| |w_k| — one GEMM on magnitudes.
 
     Chunked over output channels so a [1024, 28672] intermediate never has to
@@ -110,18 +110,37 @@ def order_free_bound(a, w, chunk=512, splits=1):
     so the bound is monotone in `splits` and `splits=1` remains the conservative
     answer if the routed path ever stops splitting.
     """
-    absa = np.abs(np.asarray(a, dtype=np.float32))
-    k = absa.shape[1]
+    full_k = a.shape[1]
+    start, end = contraction if contraction is not None else (0, full_k)
+    assert 0 <= start < end <= full_k, "invalid contraction range %d:%d for k=%d" % (
+        start, end, full_k)
+    absa = np.abs(np.asarray(a[:, start:end], dtype=np.float32))
+    k = end - start
     assert k % splits == 0, "contraction %d does not divide into %d pieces" % (k, splits)
     piece = k // splits
     worst = 0.0
     for lo in range(0, k, piece):
         hi = lo + piece
         ap = absa[:, lo:hi]
-        for start in range(0, w.shape[0], chunk):
-            block = np.abs(np.asarray(w[start:start + chunk, lo:hi], dtype=np.float32))
+        for channel_start in range(0, w.shape[0], chunk):
+            block = np.abs(np.asarray(
+                w[channel_start:channel_start + chunk,
+                  contraction[0] + lo:contraction[0] + hi]
+                if contraction is not None else
+                w[channel_start:channel_start + chunk, lo:hi],
+                dtype=np.float32))
             worst = max(worst, float(np.max(ap @ block.T)))
     return worst
+
+
+def parse_range(text):
+    try:
+        start, end = (int(v) for v in text.split(":", 1))
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError("range must be START:END")
+    if start < 0 or end <= start:
+        raise argparse.ArgumentTypeError("range must satisfy 0 <= START < END")
+    return start, end
 
 
 def index_order_max(a, w, rows, channels, step=1024):
@@ -159,7 +178,14 @@ def main():
                     help="pieces the contraction is cut into before the engine "
                          "sees it; the bound is then over the worst piece "
                          "(default 1, the unsplit projection)")
+    ap.add_argument("--only", action="append", choices=[row[0] for row in TAPS],
+                    help="measure only this projection; repeat to select several")
+    ap.add_argument("--k-range", type=parse_range,
+                    help="restrict the contraction to START:END before splitting; "
+                         "intended for a persistent device shard")
     args = ap.parse_args()
+    if args.k_range and not args.only:
+        ap.error("--k-range requires at least one --only projection")
 
     oracles = sorted(glob.glob(os.path.join(args.oracles, "*", "oracle.safetensors")))
     if not oracles:
@@ -176,6 +202,9 @@ def main():
         print("Contraction cut into %d pieces; the bound is over the worst "
               "single piece, because a split projection never accumulates "
               "across one." % args.splits)
+    if args.k_range:
+        print("Contraction restricted to [%d,%d), the exact neuron range owned "
+              "by this device shard." % args.k_range)
     print()
 
     verdicts = {}
@@ -193,6 +222,8 @@ def main():
               % ("projection", "rows", "cols", "bound", "headroom", "index", "scale", "verdict"))
 
         for name, tap, wkey in TAPS:
+            if args.only and name not in args.only:
+                continue
             key = wkey.format(b=block)
             if tap not in ghead or key not in chead:
                 print("  %-10s missing" % name)
@@ -200,10 +231,17 @@ def main():
             a = read_f32(path, ghead, goff, tap)
             w = read_bf16(args.checkpoint, chead, coff, key)
 
+            contraction = args.k_range
+            if contraction and contraction[1] > a.shape[1]:
+                print("  %-10s range %d:%d exceeds contraction %d"
+                      % (name, contraction[0], contraction[1], a.shape[1]))
+                continue
+            contraction_width = ((contraction[1] - contraction[0])
+                                 if contraction else a.shape[1])
             splits = args.splits
-            while splits > 1 and a.shape[1] % splits:
+            while splits > 1 and contraction_width % splits:
                 splits //= 2
-            bound = order_free_bound(a, w, splits=splits)
+            bound = order_free_bound(a, w, splits=splits, contraction=contraction)
             headroom = threshold / bound if bound > 0 else float("inf")
             safe = bound < threshold
 

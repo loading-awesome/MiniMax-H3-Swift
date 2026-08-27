@@ -168,4 +168,97 @@ struct CFGOverlapBenchTests {
         print(String(format: "  attention is %.1f%% of the block — the only window the engine has\n",
                      100 * aMs / whole))
     }
+
+    /// The wavefront with the MLP island, sharing the dies against evicting.
+    ///
+    ///     H3_ANE=experimental H3_BIG=1 swift test --filter cfgStackIsland
+    ///
+    /// Three schedules, because the interesting question changed. The island
+    /// used to push `qkv` and `attn out` back to Metal on a machine-safety
+    /// argument that is now withdrawn (`CFGOverlap.islandEvictsProjections`),
+    /// so what matters is whether the dies can carry the island *and* the
+    /// projections at once — four evaluations in flight, which nothing has ever
+    /// measured.
+    ///
+    /// The engine-busy column is the point. Wall time says which schedule wins
+    /// today; duty says whether there is headroom left to allocate at all, and
+    /// at 24.3% the answer decides where the next stage goes.
+    ///
+    /// The island is not bit-identical — fp16 on the engine against bf16 on
+    /// Metal — so conformance is a relative-RMS bound, not equality.
+    @Test(.enabled(if: ProcessInfo.processInfo.environment["H3_BIG"] != nil))
+    func cfgStackIsland() {
+        // Diagnosis runs want one block and no timing; the default is the
+        // measurement. `H3_BIG_ROUNDS=0` stops after the conformance check.
+        let env = ProcessInfo.processInfo.environment
+        let depth = env["H3_BIG_DEPTH"].flatMap(Int.init) ?? 4
+        let rounds = env["H3_BIG_ROUNDS"].flatMap(Int.init) ?? 3
+        let f = Self.pair()
+        var blocks = [f.block]
+        for seed in 1 ..< depth {
+            blocks.append(CompiledBlockTests.productionBlock(seed: UInt64(11 + seed)).block)
+        }
+        print("\n  ANE routing: \(ANELinearBackend.isEnabled ? "ON" : "off")"
+              + "   island opt-in \(ANEMLPIslandBackend.isEnabled ? "ON" : "off")"
+              + "   depth \(depth)")
+
+        func run(island: Bool, engine: Bool) -> [MLXArray] {
+            var cond = CFGOverlap.Branch(h: f.xC, tEmb: f.tEmb, table: f.rope,
+                                         index: f.index, start: nil, prep: nil, merged: nil)
+            var uncond = CFGOverlap.Branch(h: f.xU, tEmb: f.tEmb, table: f.rope,
+                                           index: f.index, start: nil, prep: nil, merged: nil)
+            CFGOverlap.pipeline(blocks, range: 0 ..< depth, cond: &cond, uncond: &uncond,
+                                contextC: { _ in nil }, contextU: { _ in nil },
+                                tap: { _, _ in }, island: island, engine: engine)
+            return [cond.h, uncond.h]
+        }
+        // Projections on the engine, no island — the schedule production runs.
+        let plain = { run(island: false, engine: true) }
+        // The island beside the projections: four evaluations in flight.
+        let shared = { run(island: true, engine: true) }
+        // The island instead of the projections, which is what measured 0.926x.
+        let evicting = { run(island: true, engine: false) }
+
+        let a = plain(), b = shared()
+        MLX.eval(a, b)
+        var routed = false
+        for (i, name) in [(0, "cond"), (1, "uncond")] {
+            let diff = (a[i] - b[i]).asType(.float32)
+            let rel = MLX.sqrt(MLX.mean(diff * diff)).item(Float.self)
+                / MLX.sqrt(MLX.mean(a[i].asType(.float32) * a[i].asType(.float32))).item(Float.self)
+            print(String(format: "  %@ rel-RMS after %d blocks  %.5f", name, depth, rel))
+            if rel > 0 { routed = true }
+            #expect(rel < 0.02, "\(name) branch drifted past the island's error budget")
+        }
+        // Bit-identical means the island declined every block and this measured
+        // one schedule twice. A failed benchmark, not a passing one.
+        #expect(routed, "the island declined every block — nothing was measured")
+
+        guard rounds > 0 else { return }
+        let vsShared = BenchmarkSupport.interleavedArrays(rounds: rounds, first: plain, second: shared)
+        let vsEvict = BenchmarkSupport.interleavedArrays(rounds: rounds, first: plain, second: evicting)
+        let plainMs = (vsShared.first + vsEvict.first) / 2 * 1000
+        let sharedMs = vsShared.second * 1000, evictMs = vsEvict.second * 1000
+        print(String(format: "\n  projections only     %8.1f ms  (%.1f a pair)",
+                     plainMs, plainMs / Double(depth)))
+        print(String(format: "  island + projections %8.1f ms  (%.1f a pair)  %.3fx",
+                     sharedMs, sharedMs / Double(depth), plainMs / sharedMs))
+        print(String(format: "  island, evicting     %8.1f ms  (%.1f a pair)  %.3fx",
+                     evictMs, evictMs / Double(depth), plainMs / evictMs))
+
+        // Duty is what says whether anything is left to allocate.
+        for (label, body) in [("projections only", plain),
+                              ("island + projections", shared),
+                              ("island, evicting", evicting)] {
+            ANELinearBackend.EngineMeter.reset()
+            let t0 = Date()
+            MLX.eval(body())
+            let wall = Date().timeIntervalSince(t0)
+            let busy = ANELinearBackend.EngineMeter.busySeconds
+            print(String(format: "  %@ engine busy %6.0f ms of %6.0f ms wall  (%.1f%%)",
+                         label.padding(toLength: 21, withPad: " ", startingAt: 0),
+                         busy * 1000, wall * 1000, 100 * busy / wall))
+        }
+        print("")
+    }
 }

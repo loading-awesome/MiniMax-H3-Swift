@@ -290,6 +290,205 @@ struct ANERealPrimitiveTests {
         #expect(rel < 4e-3, "native fused fc1/SwiGLU changed the MLP: relRMS \(rel)")
     }
 
+    @Test
+    func persistentMLPIslandMatchesCompleteGPUMLP() {
+        let s = 64
+        // From the model, never from the backend's own constant. Deriving the
+        // fixture from the value under test is what hid a wrong `expectedHidden`
+        // through a passing conformance suite.
+        let hidden = H3Config().hiddenSize
+        let ffn = H3Config().ffnHidden
+        MLXRandom.seed(39)
+        let x = (MLXRandom.normal([s, hidden]) * 0.5).asType(.bfloat16)
+        let fc1 = (MLXRandom.normal([2 * ffn, hidden]) * 0.02).asType(.bfloat16)
+        let fc2 = (MLXRandom.normal([hidden, ffn]) * 0.02).asType(.bfloat16)
+        MLX.eval(x, fc1, fc2)
+
+        guard let actual = ANEMLPIslandBackend.route(
+            x: x, fc1: fc1, fc2: fc2, blockIndex: 0
+        ) else {
+            Issue.record("persistent MLP island declined its production widths")
+            return
+        }
+        let full = MLX.matmul(x, fc1.transposed())
+        let halves = full.split(parts: 2, axis: -1)
+        let reference = MLX.matmul(silu(halves[0]) * halves[1], fc2.transposed())
+        let full32 = MLX.matmul(x.asType(.float32), fc1.asType(.float32).transposed())
+        let halves32 = full32.split(parts: 2, axis: -1)
+        let oracle = MLX.matmul(silu(halves32[0]) * halves32[1],
+                                fc2.asType(.float32).transposed())
+        guard let plan = ANEMLPIslandBackend.partition(ffn: ffn) else {
+            Issue.record("production MLP partition was refused")
+            return
+        }
+        func partial(_ range: Range<Int>) -> MLXArray {
+            let gate = MLX.matmul(x, fc1[range].transposed())
+            let upRange = (ffn + range.lowerBound) ..< (ffn + range.upperBound)
+            let up = MLX.matmul(x, fc1[upRange].transposed())
+            return MLX.matmul(silu(gate) * up, fc2[0..., range].transposed())
+        }
+        var gpuOwned = partial(plan.gpu).asType(.float32)
+        var aneExpected = MLXArray.zeros([s, hidden], dtype: .float32)
+        var aneOracle = MLXArray.zeros([s, hidden], dtype: .float32)
+        for die in [plan.ane0, plan.ane1] {
+            for piece in 0 ..< ANEMLPIslandBackend.pieces {
+                let lower = die.lowerBound + piece * ANEMLPIslandBackend.neuronsPerPiece
+                let range = lower ..< (lower + ANEMLPIslandBackend.neuronsPerPiece)
+                if piece < ANEMLPIslandBackend.activePieces {
+                    aneExpected = aneExpected + partial(range).asType(.float32)
+                } else {
+                    gpuOwned = gpuOwned + partial(range).asType(.float32)
+                }
+                let gate32 = MLX.matmul(x.asType(.float32),
+                    fc1[range].asType(.float32).transposed())
+                let upRange = (ffn + range.lowerBound) ..< (ffn + range.upperBound)
+                let up32 = MLX.matmul(x.asType(.float32),
+                    fc1[upRange].asType(.float32).transposed())
+                if piece < ANEMLPIslandBackend.activePieces {
+                    aneOracle = aneOracle + MLX.matmul(
+                        silu(gate32) * up32,
+                        fc2[0..., range].asType(.float32).transposed())
+                }
+            }
+        }
+        let gpuOwnedBF16 = gpuOwned.asType(.bfloat16)
+        let partitioned = (gpuOwned + aneExpected).asType(.bfloat16)
+        let aneActual = actual.asType(.float32) - gpuOwnedBF16.asType(.float32)
+        MLX.eval(actual, reference, oracle, partitioned, aneExpected, aneActual, aneOracle)
+        let rel = Self.relRMS(reference, actual)
+        let splitVsReference = Self.relRMS(reference, partitioned)
+        let islandVsSplit = Self.relRMS(partitioned, actual)
+        let gpuVsFP32 = Self.relRMS(oracle, reference.asType(.float32))
+        let splitVsFP32 = Self.relRMS(oracle, partitioned.asType(.float32))
+        let islandVsFP32 = Self.relRMS(oracle, actual.asType(.float32))
+        let aneRel = Self.relRMS(aneExpected, aneActual)
+        let aneGPUVsFP32 = Self.relRMS(aneOracle, aneExpected)
+        let aneActualVsFP32 = Self.relRMS(aneOracle, aneActual)
+        let expectedNorm = MLX.sqrt(MLX.sum(aneExpected * aneExpected))
+        let actualNorm = MLX.sqrt(MLX.sum(aneActual * aneActual))
+        let normRatio = (actualNorm / expectedNorm).item(Float.self)
+        let correlation = (MLX.sum(aneExpected * aneActual) /
+                           (expectedNorm * actualNorm)).item(Float.self)
+        print("MLP island: vs bf16=\(rel), split-vs-bf16=\(splitVsReference), " +
+              "island-vs-split=\(islandVsSplit), GPU-vs-fp32=\(gpuVsFP32), " +
+              "split-vs-fp32=\(splitVsFP32), island-vs-fp32=\(islandVsFP32), " +
+              "ANE-rel=\(aneRel), ANE-GPU-vs-fp32=\(aneGPUVsFP32), " +
+              "ANE-actual-vs-fp32=\(aneActualVsFP32), ANE-norm-ratio=\(normRatio), " +
+              "ANE-correlation=\(correlation)")
+        #expect(rel < 5e-3, "persistent MLP island changed the complete MLP: relRMS \(rel)")
+    }
+
+    @Test
+    func persistentMLPPartitionMatchesCalibratedRanges() {
+        guard let plan = ANEMLPIslandBackend.partition(ffn: 14_336) else {
+            Issue.record("production MLP partition was refused"); return
+        }
+        #expect(plan.gpu == 0 ..< 10_240)
+        #expect(plan.ane0 == 10_240 ..< 12_288)
+        #expect(plan.ane1 == 12_288 ..< 14_336)
+        #expect(ANEMLPIslandBackend.fc2Scales.count == 50)
+        for (a, b) in ANEMLPIslandBackend.fc2Scales {
+            for scale in [a, b] {
+                let reciprocal = 1 / scale
+                #expect(scale > 0 && scale <= 1)
+                #expect(reciprocal.rounded() == reciprocal)
+                let integer = Int(reciprocal.rounded())
+                #expect(integer.nonzeroBitCount == 1, "fc2 scale must be a power of two")
+            }
+        }
+        #expect(ANEMLPIslandBackend.fc2Scales[39].1 == 1.0 / 256.0)
+    }
+
+    @Test
+    func persistentMLPIslandSinglePieceConformance() {
+        let s = 64
+        // From the model, never from the backend's own constant. Deriving the
+        // fixture from the value under test is what hid a wrong `expectedHidden`
+        // through a passing conformance suite.
+        let hidden = H3Config().hiddenSize
+        let ffn = H3Config().ffnHidden
+        let lower = 10_240
+        let width = ANEMLPIslandBackend.neuronsPerPiece
+        MLXRandom.seed(40)
+        let x = (MLXRandom.normal([s, hidden]) * 0.5).asType(.bfloat16)
+        let gatePiece = (MLXRandom.normal([width, hidden]) * 0.02).asType(.bfloat16)
+        let upPiece = (MLXRandom.normal([width, hidden]) * 0.02).asType(.bfloat16)
+        var selector = [Float](repeating: 0, count: hidden * width)
+        for i in 0 ..< width { selector[i * width + i] = 1 }
+        let downPiece = MLXArray(selector, [hidden, width]).asType(.bfloat16)
+        let zeroBefore = MLXArray.zeros([lower, hidden], dtype: .bfloat16)
+        let zeroAfter = MLXArray.zeros([ffn - lower - width, hidden], dtype: .bfloat16)
+        let gate = concatenated([zeroBefore, gatePiece, zeroAfter], axis: 0)
+        let up = concatenated([zeroBefore, upPiece, zeroAfter], axis: 0)
+        let fc1 = concatenated([gate, up], axis: 0)
+        let fc2 = concatenated([
+            MLXArray.zeros([hidden, lower], dtype: .bfloat16), downPiece,
+            MLXArray.zeros([hidden, ffn - lower - width], dtype: .bfloat16),
+        ], axis: 1)
+        MLX.eval(x, fc1, fc2)
+
+        guard let actual = ANEMLPIslandBackend.route(
+            x: x, fc1: fc1, fc2: fc2, blockIndex: 0
+        ) else {
+            Issue.record("single-piece MLP island declined")
+            return
+        }
+        let gateOut = MLX.matmul(x, gatePiece.transposed())
+        let upOut = MLX.matmul(x, upPiece.transposed())
+        let reference = MLX.matmul(silu(gateOut) * upOut, downPiece.transposed())
+        let gate32 = MLX.matmul(x.asType(.float32), gatePiece.asType(.float32).transposed())
+        let up32 = MLX.matmul(x.asType(.float32), upPiece.asType(.float32).transposed())
+        let oracle = MLX.matmul(silu(gate32) * up32,
+                                downPiece.asType(.float32).transposed())
+        MLX.eval(actual, reference, oracle)
+        let rel = Self.relRMS(reference, actual)
+        let gpuVsFP32 = Self.relRMS(oracle, reference.asType(.float32))
+        let aneVsFP32 = Self.relRMS(oracle, actual.asType(.float32))
+        print("MLP island single piece: vs-bf16=\(rel), GPU-vs-fp32=\(gpuVsFP32), " +
+              "ANE-vs-fp32=\(aneVsFP32)")
+        #expect(rel < 5e-3, "one persistent ANE chain changed its MLP partial: relRMS \(rel)")
+    }
+
+    @Test
+    func persistentMLPDownProjectionConformance() {
+        let s = 64, k = ANEMLPIslandBackend.neuronsPerPiece
+        let n = ANEMLPIslandBackend.expectedHidden
+        MLXRandom.seed(41)
+        let x = (MLXRandom.normal([s, k]) * 0.5).asType(.bfloat16)
+        let w = (MLXRandom.normal([n, k]) * 0.02).asType(.bfloat16)
+        let xPacked = MLX.contiguous(x.transposed().asType(.float16))
+        let wPacked = MLX.contiguous(w.transposed().asType(.float16))
+        MLX.eval(x, w, xPacked, wPacked)
+        guard let program = h3_ane_program_create(Int32(s), Int32(k), Int32(n)),
+              let xt = h3_ane_tensor_create(Int32(k), Int32(s)),
+              let wt = h3_ane_tensor_create(Int32(k), Int32(n)),
+              let yt = h3_ane_tensor_create(Int32(s), Int32(n)) else {
+            Issue.record("down projection allocation failed")
+            return
+        }
+        defer {
+            h3_ane_tensor_free(xt); h3_ane_tensor_free(wt); h3_ane_tensor_free(yt)
+            h3_ane_program_free(program)
+        }
+        let xOK = xPacked.asData(access: .noCopyIfContiguous).data.withUnsafeBytes {
+            h3_ane_tensor_write(xt, $0.baseAddress!, Int32(k), Int32(s))
+        }
+        let wOK = wPacked.asData(access: .noCopyIfContiguous).data.withUnsafeBytes {
+            h3_ane_tensor_write(wt, $0.baseAddress!, Int32(k), Int32(n))
+        }
+        #expect(xOK && wOK)
+        #expect(h3_ane_run(program, xt, wt, yt, 1))
+        let actual = MLXArray(rawPointer: h3_ane_tensor_ptr(yt)!, [s, n],
+                              dtype: .float16) { }.asType(.bfloat16)
+        let reference = MLX.matmul(x, w.transposed())
+        let oracle = MLX.matmul(x.asType(.float32), w.asType(.float32).transposed())
+        MLX.eval(actual, reference, oracle)
+        let rel = Self.relRMS(reference, actual)
+        let aneVsFP32 = Self.relRMS(oracle, actual.asType(.float32))
+        print("MLP island down: vs-bf16=\(rel), ANE-vs-fp32=\(aneVsFP32)")
+        #expect(rel < Self.tolerance)
+    }
+
     /// The shard plan keeps heads and 64-byte rows intact, and leaves the
     /// engine roughly its measured share of the work.
     @Test
@@ -415,6 +614,45 @@ struct ANERealPrimitiveTests {
     }
 
     // MARK: - Does it actually pay?
+
+    /// Measures the complete production-width MLP, including the final join,
+    /// with the GPU and both ANE dies doing their assigned neuron ranges at the
+    /// same time. Compilation and persistent weight upload are warmed outside
+    /// the samples. Opt-in because the fixture holds several GB of surfaces.
+    @Test(.enabled(if: ProcessInfo.processInfo.environment["H3_BIG"] != nil))
+    func persistentMLPIslandBeatsCompleteGPUMatmul() {
+        let s = 15_461
+        // From the model, never from the backend's own constant. Deriving the
+        // fixture from the value under test is what hid a wrong `expectedHidden`
+        // through a passing conformance suite.
+        let hidden = H3Config().hiddenSize
+        let ffn = H3Config().ffnHidden
+        MLXRandom.seed(42)
+        let x = (MLXRandom.normal([s, hidden]) * 0.5).asType(.bfloat16)
+        let fc1 = (MLXRandom.normal([2 * ffn, hidden]) * 0.02).asType(.bfloat16)
+        let fc2 = (MLXRandom.normal([hidden, ffn]) * 0.02).asType(.bfloat16)
+        MLX.eval(x, fc1, fc2)
+
+        func plain() -> MLXArray {
+            let projected = MLX.matmul(x, fc1.transposed())
+            let halves = projected.split(parts: 2, axis: -1)
+            return MLX.matmul(silu(halves[0]) * halves[1], fc2.transposed())
+        }
+        func island() -> MLXArray {
+            guard let value = ANEMLPIslandBackend.route(
+                x: x, fc1: fc1, fc2: fc2, blockIndex: 0
+            ) else { preconditionFailure("production MLP island declined") }
+            return value
+        }
+
+        MLX.eval(island())
+        let measured = BenchmarkSupport.interleaved(rounds: 2, first: plain, second: island)
+        let speedup = measured.first / measured.second
+        print(String(format: "MLP island S=%d: GPU %.1f ms, hybrid %.1f ms, %.3fx",
+                     s, measured.first * 1_000, measured.second * 1_000, speedup))
+        #expect(speedup > 1.05,
+                "persistent MLP island does not pay: GPU \(measured.first * 1_000) ms, hybrid \(measured.second * 1_000) ms, \(speedup)x")
+    }
 
     /// The whole point, asserted.
     ///

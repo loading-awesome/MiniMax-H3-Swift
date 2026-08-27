@@ -6,8 +6,10 @@
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <IOSurface/IOSurface.h>
+#import <math.h>
 #import <stdatomic.h>
 #import <sys/sysctl.h>
+#import <os/lock.h>
 
 // The private surface holds only what this bridge actually calls. Everything
 // is reached through `objc_msgSend` with an explicit prototype cast, because
@@ -17,6 +19,7 @@ static Class DescriptorClass = nil;
 static Class ModelClass = nil;
 static Class RequestClass = nil;
 static Class IOSurfaceObjectClass = nil;
+static Class ClientClass = nil;
 
 static NSString *SysctlString(const char *name) {
     size_t length = 0;
@@ -192,6 +195,7 @@ bool h3_ane_is_available(void) {
         ModelClass           = NSClassFromString(@"_ANEInMemoryModel");
         RequestClass         = NSClassFromString(@"_ANERequest");
         IOSurfaceObjectClass = NSClassFromString(@"_ANEIOSurfaceObject");
+        ClientClass          = NSClassFromString(@"_ANEClient");
         available =
             ClassHasClassSelector(DescriptorClass, @selector(modelWithMILText:weights:optionsPlist:)) &&
             ClassHasClassSelector(ModelClass, @selector(inMemoryModelWithDescriptor:)) &&
@@ -205,6 +209,198 @@ bool h3_ane_is_available(void) {
             ClassHasInstanceSelector(ModelClass, @selector(evaluateWithQoS:options:request:error:));
     });
     return available;
+}
+
+#pragma mark - Power bracket
+
+/// `+[_ANEClient sharedConnection]`. Not retained: it is the framework's own
+/// singleton and outlives this process's interest in it, which matches how the
+/// rest of this file holds runtime objects.
+static id gPowerClient = nil;
+static bool gPowerHeld = false;
+static os_unfair_lock gPowerLock = OS_UNFAIR_LOCK_INIT;
+
+bool h3_ane_power_is_held(void) {
+    os_unfair_lock_lock(&gPowerLock);
+    bool held = gPowerHeld;
+    os_unfair_lock_unlock(&gPowerLock);
+    return held;
+}
+
+static void H3ANEPowerReleaseAtExit(void) { h3_ane_power_release(); }
+
+bool h3_ane_power_acquire(void) {
+    if (!h3_ane_is_available()) return false;
+    if (!ClassHasClassSelector(ClientClass, @selector(sharedConnection)) ||
+        !ClassHasInstanceSelector(ClientClass, @selector(beginRealTimeTask))) return false;
+
+    os_unfair_lock_lock(&gPowerLock);
+    if (gPowerHeld) { os_unfair_lock_unlock(&gPowerLock); return true; }
+
+    bool ok = false;
+    @try {
+        if (!gPowerClient) {
+            gPowerClient = ((id(*)(Class, SEL))objc_msgSend)(
+                ClientClass, @selector(sharedConnection));
+        }
+        if (gPowerClient) {
+            ok = ((BOOL(*)(id, SEL))objc_msgSend)(
+                gPowerClient, @selector(beginRealTimeTask));
+        }
+    } @catch (NSException *exception) {
+        NSLog(@"[H3ANEBridge] private runtime exception while taking the power "
+              @"bracket: %@", exception);
+        ok = false;
+    }
+
+    if (ok) {
+        gPowerHeld = true;
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{ atexit(H3ANEPowerReleaseAtExit); });
+    } else {
+        // Measured 2026-08-27: refused on both `sharedConnection` and
+        // `sharedPrivateConnection`, in under a millisecond, on retries. The
+        // bracket is entitlement-gated and this process does not have it, so
+        // the keep-alive below is the defence instead.
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{
+            NSLog(@"[H3ANEBridge] ANE power bracket refused (no entitlement); "
+                  @"holding the engine awake with the keep-alive instead.");
+        });
+    }
+    os_unfair_lock_unlock(&gPowerLock);
+    return ok;
+}
+
+void h3_ane_power_release(void) {
+    os_unfair_lock_lock(&gPowerLock);
+    if (gPowerHeld && gPowerClient) {
+        @try {
+            ((BOOL(*)(id, SEL))objc_msgSend)(gPowerClient, @selector(endRealTimeTask));
+        } @catch (NSException *exception) {
+            NSLog(@"[H3ANEBridge] private runtime exception while releasing the "
+                  @"power bracket: %@", exception);
+        }
+    }
+    gPowerHeld = false;
+    os_unfair_lock_unlock(&gPowerLock);
+}
+
+#pragma mark - Keep-alive
+
+/// Why this exists, and why it is not optional.
+///
+/// The driver sleeps five seconds after its last work, and a program create
+/// landing inside that sleep *transition* wedges the machine — the driver skips
+/// the action block that completes the transition, and the blocking, gated
+/// power-on it then issues waits forever inside the command gate every other
+/// ANE client needs. Nothing faults, so there is no panic. See "Machine safety"
+/// in `docs/ANE_STATUS.md`.
+///
+/// The supported way to prevent that is `-[_ANEClient beginRealTimeTask]`,
+/// which declares the engine in use. It is entitlement-gated and refuses this
+/// process (measured on both connections, sub-millisecond, on retries), so the
+/// bracket is unavailable and this is what is left: submit trivial work to both
+/// dies more often than the five-second timer, so the timer never fires while
+/// this process intends to use the engine, so no transition is ever open for a
+/// create to land in.
+///
+/// **The residual risk is the keep-alive's own first create**, plus any real
+/// create that races it from another thread before the timer is running. The
+/// transition is 8-15 ms wide and a fully-asleep die powers on correctly, so
+/// the exposure is that window against a handful of creates at startup rather
+/// than against every create in the session — one per new shape, dozens across
+/// a benchmark. That is a large reduction in dice rolls, not a proof, and it is
+/// the best available without the entitlement.
+static dispatch_source_t gKeepAliveTimer = nil;
+static bool gKeepAliveSettingUp = false;
+static H3ANEProgram *gKeepAliveP0 = NULL, *gKeepAliveP1 = NULL;
+static H3ANETensor *gKeepAliveX = NULL, *gKeepAliveW = NULL;
+static H3ANETensor *gKeepAliveY0 = NULL, *gKeepAliveY1 = NULL;
+static os_unfair_lock gKeepAliveLock = OS_UNFAIR_LOCK_INIT;
+
+/// Small enough to be free, large enough to be a legal program: 64x64x64 fp16
+/// is 8 KB a surface and runs in microseconds.
+#define H3_ANE_KEEPALIVE_DIM 64
+/// Under the driver's five-second idle timer with room for a late tick.
+#define H3_ANE_KEEPALIVE_SECONDS 2.0
+
+bool h3_ane_keepalive_is_running(void) {
+    os_unfair_lock_lock(&gKeepAliveLock);
+    bool running = gKeepAliveTimer != nil;
+    os_unfair_lock_unlock(&gKeepAliveLock);
+    return running;
+}
+
+static void H3ANEKeepAliveTearDown(void) {
+    if (gKeepAliveTimer) { dispatch_source_cancel(gKeepAliveTimer); gKeepAliveTimer = nil; }
+    if (gKeepAliveP0) { h3_ane_program_free(gKeepAliveP0); gKeepAliveP0 = NULL; }
+    if (gKeepAliveP1) { h3_ane_program_free(gKeepAliveP1); gKeepAliveP1 = NULL; }
+    if (gKeepAliveX)  { h3_ane_tensor_free(gKeepAliveX);  gKeepAliveX = NULL; }
+    if (gKeepAliveW)  { h3_ane_tensor_free(gKeepAliveW);  gKeepAliveW = NULL; }
+    if (gKeepAliveY0) { h3_ane_tensor_free(gKeepAliveY0); gKeepAliveY0 = NULL; }
+    if (gKeepAliveY1) { h3_ane_tensor_free(gKeepAliveY1); gKeepAliveY1 = NULL; }
+}
+
+/// Starts the keep-alive if it is not already running. Returns false only if
+/// the engine could not be set up at all, in which case the caller must not
+/// create programs either — an engine that cannot hold itself awake is one this
+/// bridge will not keep creating on.
+static bool H3ANEKeepAliveEnsure(void) {
+    os_unfair_lock_lock(&gKeepAliveLock);
+    if (gKeepAliveTimer) { os_unfair_lock_unlock(&gKeepAliveLock); return true; }
+    if (gKeepAliveSettingUp) { os_unfair_lock_unlock(&gKeepAliveLock); return true; }
+    gKeepAliveSettingUp = true;
+    os_unfair_lock_unlock(&gKeepAliveLock);
+
+    // Best effort, and free when it works: if the bracket ever becomes
+    // reachable the keep-alive becomes belt and braces rather than the belt.
+    h3_ane_power_acquire();
+
+    const int d = H3_ANE_KEEPALIVE_DIM;
+    bool ok = false;
+    // This is the one exposed create in the process. It goes first, so every
+    // real create that follows happens with the idle timer held off.
+    gKeepAliveP0 = h3_ane_program_create(d, d, d);
+    gKeepAliveP1 = h3_ane_program_create(d, d, d);
+    gKeepAliveX  = h3_ane_tensor_create(d, d);
+    gKeepAliveW  = h3_ane_tensor_create(d, d);
+    gKeepAliveY0 = h3_ane_tensor_create(d, d);
+    gKeepAliveY1 = h3_ane_tensor_create(d, d);
+    ok = gKeepAliveP0 && gKeepAliveP1 && gKeepAliveX && gKeepAliveW
+        && gKeepAliveY0 && gKeepAliveY1;
+
+    os_unfair_lock_lock(&gKeepAliveLock);
+    gKeepAliveSettingUp = false;
+    if (!ok) {
+        NSLog(@"[H3ANEBridge] keep-alive setup failed; refusing to create programs. "
+              @"See docs/ANE_STATUS.md, 'Machine safety'.");
+        H3ANEKeepAliveTearDown();
+        os_unfair_lock_unlock(&gKeepAliveLock);
+        return false;
+    }
+
+    dispatch_queue_t queue = dispatch_queue_create("h3.ane.keepalive", DISPATCH_QUEUE_SERIAL);
+    gKeepAliveTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
+    dispatch_source_set_timer(gKeepAliveTimer,
+                              dispatch_time(DISPATCH_TIME_NOW, 0),
+                              (uint64_t)(H3_ANE_KEEPALIVE_SECONDS * NSEC_PER_SEC),
+                              NSEC_PER_SEC / 4);
+    dispatch_source_set_event_handler(gKeepAliveTimer, ^{
+        // Both dies: an idle die sleeps on its own timer even while the other
+        // is busy, and the idle second die is the one that got hit.
+        if (!h3_ane_run_pair(gKeepAliveP0, gKeepAliveX, gKeepAliveW, gKeepAliveY0,
+                             gKeepAliveP1, gKeepAliveX, gKeepAliveW, gKeepAliveY1)) {
+            static dispatch_once_t once;
+            dispatch_once(&once, ^{
+                NSLog(@"[H3ANEBridge] keep-alive tick failed; the engine is no longer "
+                      @"being held awake.");
+            });
+        }
+    });
+    dispatch_resume(gKeepAliveTimer);
+    os_unfair_lock_unlock(&gKeepAliveLock);
+    return true;
 }
 
 #pragma mark - Programs
@@ -309,6 +505,12 @@ H3ANEForm h3_ane_program_form(H3ANEProgram *p) { return p ? p->form : H3ANEFormM
 
 H3ANEProgram* h3_ane_program_create_form(int s, int k, int n, H3ANEForm form) {
     if (!h3_ane_is_available() || s <= 0 || k <= 0 || n <= 0) return NULL;
+    // Before anything else reaches the driver: a create landing inside the
+    // idle sleep transition is what takes the machine down, and the keep-alive
+    // is what stops that transition from ever starting while this process is
+    // using the engine. Its own setup creates through this function, hence the
+    // reentrancy flag rather than a second create path.
+    if (!H3ANEKeepAliveEnsure()) return NULL;
 
     H3ANEProgram *p = NULL;
     @try {
@@ -539,6 +741,9 @@ static id<MTLCommandQueue> gCommandQueue = nil;
 static id<MTLComputePipelineState> gPackPipelineState = nil;
 static id<MTLComputePipelineState> gMergeAttnPipelineState = nil;
 static id<MTLComputePipelineState> gMergeFC1PipelineState = nil;
+static id<MTLComputePipelineState> gSwiGLUTransposePipelineState = nil;
+static id<MTLComputePipelineState> gSwiGLUTransposeSplit4PipelineState = nil;
+static id<MTLComputePipelineState> gMergeMLPIslandPipelineState = nil;
 static dispatch_once_t gMetalOnceToken;
 
 static bool InitMetalKernels(void) {
@@ -629,6 +834,57 @@ static bool InitMetalKernels(void) {
             "    float sigmoid_g = h3_bf16_value(g < 0.0f ? tail : 1.0f - tail);\n"
             "    float silu_g = h3_bf16_value(g * sigmoid_g);\n"
             "    dst_bf16[row * ffn_dim + col] = h3_bf16_rne(silu_g * u);\n"
+            "}\n"
+            "kernel void h3_swiglu_transpose_fp16(\n"
+            "    device const half* gate_fp16 [[buffer(0)]],\n"
+            "    device const half* up_fp16   [[buffer(1)]],\n"
+            "    device half* dst_fp16        [[buffer(2)]],\n"
+            "    constant uint& s             [[buffer(3)]],\n"
+            "    constant uint& ffn           [[buffer(4)]],\n"
+            "    constant float& input_unscale [[buffer(5)]],\n"
+            "    constant float& output_scale [[buffer(6)]],\n"
+            "    uint2 gid                    [[thread_position_in_grid]]\n"
+            ") {\n"
+            "    uint row = gid.y; uint col = gid.x;\n"
+            "    if (row >= s || col >= ffn) return;\n"
+            "    float gate = ((float)gate_fp16[row * ffn + col]) * input_unscale;\n"
+            "    float up = ((float)up_fp16[row * ffn + col]) * input_unscale;\n"
+            "    float tail = 1.0f / (1.0f + exp(abs(gate)));\n"
+            "    float sigmoid_gate = gate < 0.0f ? tail : 1.0f - tail;\n"
+            "    dst_fp16[col * s + row] = (half)((gate * sigmoid_gate * up) * output_scale);\n"
+            "}\n"
+            "kernel void h3_swiglu_transpose_split4_fp16(\n"
+            "    device const half* g0 [[buffer(0)]], device const half* g1 [[buffer(1)]],\n"
+            "    device const half* g2 [[buffer(2)]], device const half* g3 [[buffer(3)]],\n"
+            "    device const half* u0 [[buffer(4)]], device const half* u1 [[buffer(5)]],\n"
+            "    device const half* u2 [[buffer(6)]], device const half* u3 [[buffer(7)]],\n"
+            "    device half* dst [[buffer(8)]], constant uint& s [[buffer(9)]],\n"
+            "    constant uint& ffn [[buffer(10)]], constant float& iu [[buffer(11)]],\n"
+            "    constant float& os [[buffer(12)]], uint2 gid [[thread_position_in_grid]]) {\n"
+            "    uint row=gid.y, col=gid.x; if(row>=s || col>=ffn) return;\n"
+            "    uint i=row*ffn+col;\n"
+            "    float g=((float)g0[i]+(float)g1[i]+(float)g2[i]+(float)g3[i])*iu;\n"
+            "    float u=((float)u0[i]+(float)u1[i]+(float)u2[i]+(float)u3[i])*iu;\n"
+            "    float tail=1.0f/(1.0f+exp(abs(g)));\n"
+            "    float sigmoid_g=g<0.0f?tail:1.0f-tail;\n"
+            "    dst[col*s+row]=(half)((g*sigmoid_g*u)*os);\n"
+            "}\n"
+            "kernel void h3_merge_mlp_island_partials(\n"
+            "    device const ushort* gpu [[buffer(0)]],\n"
+            "    device const half* a00 [[buffer(1)]], device const half* a01 [[buffer(2)]],\n"
+            "    device const half* a02 [[buffer(3)]], device const half* a03 [[buffer(4)]],\n"
+            "    device const half* a10 [[buffer(5)]], device const half* a11 [[buffer(6)]],\n"
+            "    device const half* a12 [[buffer(7)]], device const half* a13 [[buffer(8)]],\n"
+            "    device ushort* dst [[buffer(9)]], constant uint& s [[buffer(10)]],\n"
+            "    constant uint& hidden [[buffer(11)]],\n"
+            "    constant float& u0 [[buffer(12)]], constant float& u1 [[buffer(13)]],\n"
+            "    uint2 gid [[thread_position_in_grid]]) {\n"
+            "    uint row=gid.y, col=gid.x; if(row>=s || col>=hidden) return;\n"
+            "    uint i=row*hidden+col;\n"
+            "    float v=as_type<float>(((uint)gpu[i])<<16);\n"
+            "    v += ((float)a00[i]+(float)a01[i]+(float)a02[i]+(float)a03[i])*u0;\n"
+            "    v += ((float)a10[i]+(float)a11[i]+(float)a12[i]+(float)a13[i])*u1;\n"
+            "    dst[i]=h3_bf16_rne(v);\n"
             "}\n";
 
         id<MTLLibrary> lib = [gMetalDevice newLibraryWithSource:metalSource options:nil error:&error];
@@ -637,13 +893,27 @@ static bool InitMetalKernels(void) {
         id<MTLFunction> fnPack = [lib newFunctionWithName:@"h3_pack_bf16_to_fp16_transpose"];
         id<MTLFunction> fnAttn = [lib newFunctionWithName:@"h3_merge_attn_out"];
         id<MTLFunction> fnFC1  = [lib newFunctionWithName:@"h3_merge_fc1_swiglu"];
+        id<MTLFunction> fnSwiGLUTranspose =
+            [lib newFunctionWithName:@"h3_swiglu_transpose_fp16"];
+        id<MTLFunction> fnSwiGLUTransposeSplit4 =
+            [lib newFunctionWithName:@"h3_swiglu_transpose_split4_fp16"];
+        id<MTLFunction> fnMergeMLPIsland =
+            [lib newFunctionWithName:@"h3_merge_mlp_island_partials"];
 
         if (fnPack) gPackPipelineState = [gMetalDevice newComputePipelineStateWithFunction:fnPack error:nil];
         if (fnAttn) gMergeAttnPipelineState = [gMetalDevice newComputePipelineStateWithFunction:fnAttn error:nil];
         if (fnFC1)  gMergeFC1PipelineState  = [gMetalDevice newComputePipelineStateWithFunction:fnFC1 error:nil];
+        if (fnSwiGLUTranspose) gSwiGLUTransposePipelineState =
+            [gMetalDevice newComputePipelineStateWithFunction:fnSwiGLUTranspose error:nil];
+        if (fnSwiGLUTransposeSplit4) gSwiGLUTransposeSplit4PipelineState =
+            [gMetalDevice newComputePipelineStateWithFunction:fnSwiGLUTransposeSplit4 error:nil];
+        if (fnMergeMLPIsland) gMergeMLPIslandPipelineState =
+            [gMetalDevice newComputePipelineStateWithFunction:fnMergeMLPIsland error:nil];
     });
 
-    return (gMetalDevice && gCommandQueue && gPackPipelineState && gMergeAttnPipelineState && gMergeFC1PipelineState);
+    return (gMetalDevice && gCommandQueue && gPackPipelineState && gMergeAttnPipelineState &&
+            gMergeFC1PipelineState && gSwiGLUTransposePipelineState &&
+            gSwiGLUTransposeSplit4PipelineState && gMergeMLPIslandPipelineState);
 }
 
 bool h3_ane_pack_bf16_to_fp16_transpose(const void *srcBF16, H3ANETensor *dstTensor, int s, int k, void *commandQueue) {
@@ -785,4 +1055,195 @@ bool h3_ane_merge_fc1_swiglu(const void *gpuSuffixBF16, H3ANETensor *ane0Tensor,
     [cmd commit];
     [cmd waitUntilCompleted];
     return (cmd.status == MTLCommandBufferStatusCompleted);
+}
+
+static bool ValidateSwiGLUTensors(H3ANETensor *gateTensor, H3ANETensor *upTensor,
+                                  H3ANETensor *dstTensor, int s, int ffn) {
+    if (!gateTensor || !upTensor || !dstTensor || s <= 0 || ffn <= 0 ||
+        gateTensor->rows != s || gateTensor->width != ffn ||
+        upTensor->rows != s || upTensor->width != ffn ||
+        dstTensor->rows != ffn || dstTensor->width != s ||
+        !h3_ane_tensor_is_dense(gateTensor) || !h3_ane_tensor_is_dense(upTensor) ||
+        !h3_ane_tensor_is_dense(dstTensor)) return false;
+    return true;
+}
+
+static bool EncodeSwiGLUTranspose(id<MTLCommandBuffer> cmd,
+                                  H3ANETensor *gateTensor, H3ANETensor *upTensor,
+                                  H3ANETensor *dstTensor, int s, int ffn,
+                                  float inputUnscale, float outputScale) {
+    if (gateTensor->rows != s || gateTensor->width != ffn ||
+        upTensor->rows != s || upTensor->width != ffn ||
+        dstTensor->rows != ffn || dstTensor->width != s ||
+        !h3_ane_tensor_is_dense(gateTensor) || !h3_ane_tensor_is_dense(upTensor) ||
+        !h3_ane_tensor_is_dense(dstTensor)) return false;
+    void *gatePtr = h3_ane_tensor_ptr(gateTensor);
+    void *upPtr = h3_ane_tensor_ptr(upTensor);
+    void *dstPtr = h3_ane_tensor_ptr(dstTensor);
+    if (!gatePtr || !upPtr || !dstPtr) return false;
+
+    size_t sourceBytes = gateTensor->rows * gateTensor->rowBytes;
+    size_t dstBytes = dstTensor->rows * dstTensor->rowBytes;
+    id<MTLBuffer> gateBuf = [gMetalDevice newBufferWithBytesNoCopy:gatePtr
+        length:sourceBytes options:MTLResourceStorageModeShared deallocator:nil];
+    id<MTLBuffer> upBuf = [gMetalDevice newBufferWithBytesNoCopy:upPtr
+        length:sourceBytes options:MTLResourceStorageModeShared deallocator:nil];
+    id<MTLBuffer> dstBuf = [gMetalDevice newBufferWithBytesNoCopy:dstPtr
+        length:dstBytes options:MTLResourceStorageModeShared deallocator:nil];
+    if (!gateBuf || !upBuf || !dstBuf) return false;
+
+    uint uS = (uint)s, uFFN = (uint)ffn;
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    [enc setComputePipelineState:gSwiGLUTransposePipelineState];
+    [enc setBuffer:gateBuf offset:0 atIndex:0];
+    [enc setBuffer:upBuf offset:0 atIndex:1];
+    [enc setBuffer:dstBuf offset:0 atIndex:2];
+    [enc setBytes:&uS length:sizeof(uint) atIndex:3];
+    [enc setBytes:&uFFN length:sizeof(uint) atIndex:4];
+    [enc setBytes:&inputUnscale length:sizeof(float) atIndex:5];
+    [enc setBytes:&outputScale length:sizeof(float) atIndex:6];
+    MTLSize group = MTLSizeMake(16, 16, 1);
+    MTLSize grid = MTLSizeMake((ffn + 15) / 16 * 16, (s + 15) / 16 * 16, 1);
+    [enc dispatchThreads:grid threadsPerThreadgroup:group];
+    [enc endEncoding];
+    return true;
+}
+
+bool h3_ane_swiglu_transpose_fp16(H3ANETensor *gateTensor, H3ANETensor *upTensor,
+                                  H3ANETensor *dstTensor, int s, int ffn,
+                                  float inputUnscale, float outputScale,
+                                  void *commandQueue) {
+    if (!ValidateSwiGLUTensors(gateTensor, upTensor, dstTensor, s, ffn) ||
+        !isfinite(inputUnscale) || !isfinite(outputScale) || !InitMetalKernels()) return false;
+    id<MTLCommandQueue> queue = commandQueue ?
+        (__bridge id<MTLCommandQueue>)commandQueue : gCommandQueue;
+    id<MTLCommandBuffer> cmd = [queue commandBuffer];
+    if (!EncodeSwiGLUTranspose(cmd, gateTensor, upTensor, dstTensor, s, ffn,
+                              inputUnscale, outputScale)) return false;
+    [cmd commit]; [cmd waitUntilCompleted];
+    return cmd.status == MTLCommandBufferStatusCompleted;
+}
+
+bool h3_ane_swiglu_transpose_pair_fp16(
+    H3ANETensor *gate0, H3ANETensor *up0, H3ANETensor *dst0, float outputScale0,
+    H3ANETensor *gate1, H3ANETensor *up1, H3ANETensor *dst1, float outputScale1,
+    int s, int ffn, float inputUnscale, void *commandQueue) {
+    if (!ValidateSwiGLUTensors(gate0, up0, dst0, s, ffn) ||
+        !ValidateSwiGLUTensors(gate1, up1, dst1, s, ffn) ||
+        !isfinite(inputUnscale) || !isfinite(outputScale0) ||
+        !isfinite(outputScale1) || !InitMetalKernels()) return false;
+    id<MTLCommandQueue> queue = commandQueue ?
+        (__bridge id<MTLCommandQueue>)commandQueue : gCommandQueue;
+    id<MTLCommandBuffer> cmd = [queue commandBuffer];
+    if (!EncodeSwiGLUTranspose(cmd, gate0, up0, dst0, s, ffn,
+                              inputUnscale, outputScale0) ||
+        !EncodeSwiGLUTranspose(cmd, gate1, up1, dst1, s, ffn,
+                              inputUnscale, outputScale1)) return false;
+    [cmd commit]; [cmd waitUntilCompleted];
+    return cmd.status == MTLCommandBufferStatusCompleted;
+}
+
+static bool EncodeSwiGLUTransposeSplit4(id<MTLCommandBuffer> cmd,
+                                        H3ANETensor *const *gate,
+                                        H3ANETensor *const *up,
+                                        H3ANETensor *dst, int s, int ffn,
+                                        float inputUnscale, float outputScale) {
+    if (!gate || !up || !dst || dst->rows != ffn || dst->width != s ||
+        !h3_ane_tensor_is_dense(dst)) return false;
+    id<MTLBuffer> buffers[9];
+    for (int i = 0; i < 4; ++i) {
+        if (!gate[i] || !up[i] || gate[i]->rows != s || gate[i]->width != ffn ||
+            up[i]->rows != s || up[i]->width != ffn ||
+            !h3_ane_tensor_is_dense(gate[i]) || !h3_ane_tensor_is_dense(up[i])) return false;
+        size_t gateBytes = gate[i]->rows * gate[i]->rowBytes;
+        size_t upBytes = up[i]->rows * up[i]->rowBytes;
+        buffers[i] = [gMetalDevice newBufferWithBytesNoCopy:h3_ane_tensor_ptr(gate[i])
+            length:gateBytes options:MTLResourceStorageModeShared deallocator:nil];
+        buffers[4 + i] = [gMetalDevice newBufferWithBytesNoCopy:h3_ane_tensor_ptr(up[i])
+            length:upBytes options:MTLResourceStorageModeShared deallocator:nil];
+        if (!buffers[i] || !buffers[4 + i]) return false;
+    }
+    buffers[8] = [gMetalDevice newBufferWithBytesNoCopy:h3_ane_tensor_ptr(dst)
+        length:dst->rows * dst->rowBytes options:MTLResourceStorageModeShared deallocator:nil];
+    if (!buffers[8]) return false;
+    uint uS = (uint)s, uFFN = (uint)ffn;
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    [enc setComputePipelineState:gSwiGLUTransposeSplit4PipelineState];
+    for (int i = 0; i < 9; ++i) [enc setBuffer:buffers[i] offset:0 atIndex:i];
+    [enc setBytes:&uS length:sizeof(uint) atIndex:9];
+    [enc setBytes:&uFFN length:sizeof(uint) atIndex:10];
+    [enc setBytes:&inputUnscale length:sizeof(float) atIndex:11];
+    [enc setBytes:&outputScale length:sizeof(float) atIndex:12];
+    MTLSize group = MTLSizeMake(16, 16, 1);
+    MTLSize grid = MTLSizeMake((ffn + 15) / 16 * 16, (s + 15) / 16 * 16, 1);
+    [enc dispatchThreads:grid threadsPerThreadgroup:group];
+    [enc endEncoding];
+    return true;
+}
+
+bool h3_ane_swiglu_transpose_pair_split4_fp16(
+    H3ANETensor *const *gate0, H3ANETensor *const *up0,
+    H3ANETensor *dst0, float outputScale0,
+    H3ANETensor *const *gate1, H3ANETensor *const *up1,
+    H3ANETensor *dst1, float outputScale1,
+    int s, int ffn, float inputUnscale, void *commandQueue) {
+    if (s <= 0 || ffn <= 0 || !isfinite(inputUnscale) ||
+        !isfinite(outputScale0) || !isfinite(outputScale1) || !InitMetalKernels()) return false;
+    id<MTLCommandQueue> queue = commandQueue ?
+        (__bridge id<MTLCommandQueue>)commandQueue : gCommandQueue;
+    id<MTLCommandBuffer> cmd = [queue commandBuffer];
+    if (!EncodeSwiGLUTransposeSplit4(cmd, gate0, up0, dst0, s, ffn,
+                                    inputUnscale, outputScale0) ||
+        !EncodeSwiGLUTransposeSplit4(cmd, gate1, up1, dst1, s, ffn,
+                                    inputUnscale, outputScale1)) return false;
+    [cmd commit]; [cmd waitUntilCompleted];
+    return cmd.status == MTLCommandBufferStatusCompleted;
+}
+
+bool h3_ane_merge_mlp_island_partials(
+    const void *gpuPartialBF16, H3ANETensor *const *ane0Partials, float ane0Unscale,
+    H3ANETensor *const *ane1Partials, float ane1Unscale,
+    void *dstBF16, int s, int hidden, void *commandQueue) {
+    if (!gpuPartialBF16 || !ane0Partials || !ane1Partials || !dstBF16 ||
+        s <= 0 || hidden <= 0 || !isfinite(ane0Unscale) || !isfinite(ane1Unscale) ||
+        !InitMetalKernels()) return false;
+    for (int i = 0; i < 4; ++i) {
+        if (!ane0Partials[i] || !ane1Partials[i] ||
+            ane0Partials[i]->rows < s || ane0Partials[i]->width != hidden ||
+            ane1Partials[i]->rows < s || ane1Partials[i]->width != hidden ||
+            !h3_ane_tensor_is_dense(ane0Partials[i]) ||
+            !h3_ane_tensor_is_dense(ane1Partials[i])) return false;
+    }
+    size_t bytes = (size_t)s * hidden * 2;
+    id<MTLBuffer> gpu = [gMetalDevice newBufferWithBytesNoCopy:(void *)gpuPartialBF16
+        length:bytes options:MTLResourceStorageModeShared deallocator:nil];
+    id<MTLBuffer> dst = [gMetalDevice newBufferWithBytesNoCopy:dstBF16
+        length:bytes options:MTLResourceStorageModeShared deallocator:nil];
+    if (!gpu || !dst) return false;
+    id<MTLCommandQueue> queue = commandQueue ?
+        (__bridge id<MTLCommandQueue>)commandQueue : gCommandQueue;
+    id<MTLCommandBuffer> cmd = [queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    [enc setComputePipelineState:gMergeMLPIslandPipelineState];
+    [enc setBuffer:gpu offset:0 atIndex:0];
+    for (int i = 0; i < 4; ++i) {
+        id<MTLBuffer> b0 = [gMetalDevice newBufferWithBytesNoCopy:h3_ane_tensor_ptr(ane0Partials[i])
+            length:bytes options:MTLResourceStorageModeShared deallocator:nil];
+        id<MTLBuffer> b1 = [gMetalDevice newBufferWithBytesNoCopy:h3_ane_tensor_ptr(ane1Partials[i])
+            length:bytes options:MTLResourceStorageModeShared deallocator:nil];
+        if (!b0 || !b1) return false;
+        [enc setBuffer:b0 offset:0 atIndex:(NSUInteger)(1 + i)];
+        [enc setBuffer:b1 offset:0 atIndex:(NSUInteger)(5 + i)];
+    }
+    [enc setBuffer:dst offset:0 atIndex:9];
+    uint uS=(uint)s, uHidden=(uint)hidden;
+    [enc setBytes:&uS length:sizeof(uint) atIndex:10];
+    [enc setBytes:&uHidden length:sizeof(uint) atIndex:11];
+    [enc setBytes:&ane0Unscale length:sizeof(float) atIndex:12];
+    [enc setBytes:&ane1Unscale length:sizeof(float) atIndex:13];
+    MTLSize group=MTLSizeMake(16,16,1);
+    MTLSize grid=MTLSizeMake((hidden+15)/16*16,(s+15)/16*16,1);
+    [enc dispatchThreads:grid threadsPerThreadgroup:group]; [enc endEncoding];
+    [cmd commit]; [cmd waitUntilCompleted];
+    return cmd.status == MTLCommandBufferStatusCompleted;
 }
