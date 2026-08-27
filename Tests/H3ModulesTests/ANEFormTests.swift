@@ -114,6 +114,128 @@ struct ANEFormTests {
         let yRows: Int, yWidth: Int
     }
 
+    /// Rate against the **contraction** dimension, which no sweep has touched.
+    ///
+    /// Every measurement of this engine so far has cut the work by output
+    /// column or by sequence tile at the model's own `k`. Tensor parallelism on
+    /// NVIDIA splits either axis — columns *or* the contraction — and splitting
+    /// `k` is the one this bridge has never tried. It is not free: two half-`k`
+    /// products must be summed, which costs a pass over the output and changes
+    /// the accumulation. It is only worth paying if the engine is materially
+    /// faster at a smaller `k`.
+    @Test(.enabled(if: ProcessInfo.processInfo.environment["H3_BIG"] != nil))
+    func contractionSweep() {
+        let s = Self.s, n = Self.n
+        print("\n  s=\(s) n=\(n), rate is both dies under h3_ane_run_pair\n")
+        print("  " + "k".padding(toLength: 10, withPad: " ", startingAt: 0)
+              + "TFLOP".padding(toLength: 10, withPad: " ", startingAt: 0)
+              + "ms".padding(toLength: 10, withPad: " ", startingAt: 0) + "TF/s")
+        for k in [1344, 2688, 5376, 7168, 10_752, 14_336] {
+            let flops = 2.0 * Double(s) * Double(k) * Double(n)
+            let form = Form(name: "matmul", raw: H3ANEFormMatmul,
+                            wRows: k, wWidth: n, yRows: s, yWidth: n)
+            guard let ms = Self.measure(form: form, s: s, k: k, n: n) else {
+                print(String(format: "  %-10d refused", k)); continue
+            }
+            print(String(format: "  %-10d%-10.3f%-10.1f%.2f",
+                         k, flops / 1e12, ms * 1000, 2 * flops / ms / 1e12))
+        }
+        print("")
+    }
+
+    /// Split the contraction, sum the partials, and check both the numbers and
+    /// the clock.
+    ///
+    /// `contractionSweep` says the engine is 2.65x faster doing `k = 5376` as
+    /// four chunks of 1344 than as one contraction. That is only a lever if the
+    /// chunks actually compute the projection: a compiler that quietly skipped
+    /// work would look exactly this fast. So the split is checked against MLX,
+    /// against the single full-`k` call, and timed in the same test.
+    @Test(.enabled(if: ProcessInfo.processInfo.environment["H3_BIG"] != nil))
+    func splitContraction() {
+        for k in [5376, 7168, 14_336] { splitAt(k: k) }
+    }
+
+    func splitAt(k: Int) {
+        let s = Self.s, n = Self.n
+        let xv = Self.halves(k * s, seed: 0x2545_F491_4F6C_DD1D)   // [k, s]
+        let wv = Self.halves(k * n, seed: 0x9E37_79B9_7F4A_7C15)   // [k, n]
+
+        // The engine's own layout makes this natural: `x` is [k, s] and `w` is
+        // [k, n], both row-major, so a slice of the contraction is a slice of
+        // whole rows in each — contiguous, no gather.
+        func run(chunks: Int) -> (MLXArray, Double)? {
+            let kc = k / chunks
+            var programs: [OpaquePointer] = [], tensors: [OpaquePointer] = []
+            defer {
+                for p in programs { h3_ane_program_free(p) }
+                for t in tensors { h3_ane_tensor_free(t) }
+            }
+            var parts: [(OpaquePointer, OpaquePointer, OpaquePointer, OpaquePointer,
+                         OpaquePointer, OpaquePointer)] = []
+            for c in 0 ..< chunks {
+                guard let p0 = h3_ane_program_create(Int32(s), Int32(kc), Int32(n)),
+                      let p1 = h3_ane_program_create(Int32(s), Int32(kc), Int32(n)),
+                      let x0 = h3_ane_tensor_create(Int32(kc), Int32(s)),
+                      let w0 = h3_ane_tensor_create(Int32(kc), Int32(n)),
+                      let y0 = h3_ane_tensor_create(Int32(s), Int32(n)),
+                      let y1 = h3_ane_tensor_create(Int32(s), Int32(n))
+                else { return nil }
+                programs += [p0, p1]; tensors += [x0, w0, y0, y1]
+                let xs = Array(xv[(c * kc * s) ..< ((c + 1) * kc * s)])
+                let ws = Array(wv[(c * kc * n) ..< ((c + 1) * kc * n)])
+                guard Self.write(x0, xs, rows: kc, width: s),
+                      Self.write(w0, ws, rows: kc, width: n) else { return nil }
+                parts.append((p0, p1, x0, w0, y0, y1))
+            }
+            // Both dies get half the chunk's output columns in the real plan;
+            // here each die runs the whole chunk so the rate is comparable with
+            // `contractionSweep`, which does the same.
+            func once() -> Bool {
+                for p in parts where !h3_ane_run_pair(p.0, p.2, p.3, p.4, p.1, p.2, p.3, p.5) {
+                    return false
+                }
+                return true
+            }
+            guard once() else { return nil }
+            var v: [Double] = []
+            for _ in 0 ..< 5 { let t = Date(); _ = once(); v.append(Date().timeIntervalSince(t)) }
+
+            var acc = Self.read(parts[0].4, rows: s, width: n).asType(.float32)
+            for p in parts.dropFirst() {
+                acc = acc + Self.read(p.4, rows: s, width: n).asType(.float32)
+            }
+            MLX.eval(acc)
+            return (acc, Self.median(v) * 1000)
+        }
+
+        let reference = MLX.matmul(
+            MLXArray(xv.map { Float($0) }, [k, s]).transposed(),
+            MLXArray(wv.map { Float($0) }, [k, n]))
+        MLX.eval(reference)
+
+        print("\n  k=\(k) n=\(n) s=\(s), split into chunks of k\n")
+        print("  chunks   k each        ms     TF/s    rel RMS vs MLX")
+        let flops = 2.0 * Double(s) * Double(k) * Double(n)
+        for chunks in [1, 2, 4, 8] where k % chunks == 0 && (k / chunks) % 64 == 0 {
+            guard let (out, ms) = run(chunks: chunks) else {
+                print("  \(chunks): refused"); continue
+            }
+            let rel = Self.relRMS(reference, out)
+            print(String(format: "  %6d   %6d   %7.1f   %6.2f    %.3e",
+                         chunks, k / chunks, ms, 2 * flops / (ms / 1000) / 1e12, rel))
+            #expect(rel < 5e-3, "splitting the contraction into \(chunks) changed the result")
+        }
+        print("")
+    }
+
+    static func relRMS(_ reference: MLXArray, _ actual: MLXArray) -> Float {
+        let r = reference.asType(.float32), a = actual.asType(.float32)
+        let d = r - a
+        return MLX.sqrt(MLX.mean(d * d)).item(Float.self)
+            / MLX.sqrt(MLX.mean(r * r)).item(Float.self)
+    }
+
     static func forms(k: Int, n: Int, s: Int) -> [Form] {
         [Form(name: "matmul", raw: H3ANEFormMatmul, wRows: k, wWidth: n, yRows: s, yWidth: n),
          Form(name: "conv", raw: H3ANEFormConv, wRows: n, wWidth: k, yRows: n, yWidth: s)]
@@ -238,7 +360,7 @@ struct ANEFormTests {
             for col in 0 ..< n { wNK[col * k + row] = wKN[row * n + col] }
         }
 
-        struct Form {
+    struct Form {
             let name: String
             let raw: H3ANEForm
             let wRows: Int, wWidth: Int

@@ -266,11 +266,83 @@ they are exact and correct; the fused merge stays behind
 `H3_ANE_NATIVE_FUSED_SWIGLU=1` and must not be enabled until it has an oracle.
 Neither is on a production path.
 
+### The contraction axis, which nothing had swept
+
+Every measurement on this page cut the engine's work by **output column** or by
+**sequence tile**. Tensor parallelism splits either of those *or the
+contraction*, and the contraction is the one axis this bridge had never tried.
+It is where the engine was hiding:
+
+| k | TF/s, both dies | ms |
+|---|---:|---:|
+| 1344 | **20.61** | 12.6 |
+| 2688 | 14.93 | 34.8 |
+| 5376 (`qkv`, `fc1`) | 7.80 | 133.4 |
+| 7168 (`attn out`) | 7.81 | 177.6 |
+| 14336 (`fc2`) | 3.98 | 697.1 |
+
+The rate roughly halves each time `k` doubles past ~2688, which is the
+signature of an engine spilling its accumulator and re-streaming rather than one
+that is compute-bound. So do the split by hand — chunk the contraction, run each
+chunk, sum the partials. Both operands are `k`-major in the engine's own layout,
+so a chunk is a contiguous row range of each and costs no gather.
+
+Checked against an fp32 MLX reference, at every production contraction:
+
+| k | chunks | ms | TF/s | rel RMS vs fp32 |
+|---|---:|---:|---:|---:|
+| 5376 | 1 | 134.7 | 7.72 | 1.695e-04 |
+| 5376 | 4 | **50.3** | **20.69** | **8.743e-05** |
+| 7168 | 1 | 178.0 | 7.79 | 2.526e-04 |
+| 7168 | 8 | **55.7** | **24.89** | **9.162e-05** |
+| 14336 | 1 | 695.5 | 3.99 | 2.522e-04 |
+| 14336 | 8 | **135.5** | **20.47** | **9.033e-05** |
+
+2.7x to 5.1x faster, and **more accurate every time it is split** — summing
+partials in fp32 is a better accumulation than one long fp16 chain, so the error
+falls as the chunks shrink. At 9e-05 the routed path is roughly 19x closer to
+fp32 than the bf16 GPU path it replaces.
+
+**This inverts the premise of everything above.** The engine was 0.41 of the
+GPU; split, it is 20–25 TFLOP/s against the GPU's 19.4, which makes the two
+devices peers. The heterogeneous ceiling that closed the CFG overlap and the
+query tiling — `(rate_GPU + rate_ANE) / rate_GPU`, 1.41x — is not 1.41x any
+more.
+
+Recomputing the block, with attention and the elementwise pinned to the GPU:
+
+| | ceiling | |
+|---|---:|---:|
+| today, 7.8 TF/s, `fc2` excluded | 833 ms | 1.40x |
+| split-k at 20 TF/s, `fc2` excluded | 643 ms | 1.82x |
+| split-k at 20 TF/s, `fc2` included | **575 ms** | **2.03x** |
+
+Two things that were settled are now open again, and both should be re-run
+before anything is built:
+
+  * **`fc2` may be routable.** It is off the engine because its interior
+    partials reach 34,649 against a 2^15 cliff that returns silent zeros.
+    Splitting the contraction eight ways divides the accumulated partial by
+    about eight — to roughly 4,300, some 7.6x under the cliff. That is a claim
+    about a bound, so `Tools/ANE/saturation_bound.py` has to settle it rather
+    than this paragraph.
+  * **The native merge kernels are useful after all.** They were measured
+    worthless against a single shard pair. Split-k produces `c` partials per
+    projection that must be summed, and a merge kernel that accumulates all of
+    them in one pass is the difference between one pass over the output and
+    `c-1` of them.
+
+None of this is implemented in the routed path. What is measured is the engine's
+rate and its arithmetic; the block ceiling above is arithmetic, not a
+measurement, and the two schedules already closed on this page are a standing
+reminder of the distance between those.
+
 ### What would move it
 
-Nothing on this path. The CFG overlap and the query tiling were the two
-schedules the arithmetic allowed; both are measured and closed, and so is the
-native seam that was the last hypothesis for why tiling underdelivered. The engine would have to reach ~9.3 TFLOP/s — 18% above
+The contraction split, above. Every schedule closed on this page was closed by
+the same number — an engine at 0.41 of the GPU's rate — and that number was an
+artifact of contracting 5,376 or 14,336 deep in one call rather than a property
+of the hardware. The engine would have to reach ~9.3 TFLOP/s — 18% above
 anything measured here — before overlapping beats not overlapping, and 1.5x on
 a guided step needs the pair under 1560 ms, which is below the GPU-only floor of
 1288.6 ms plus any engine share at all. The levers that remain all change the
