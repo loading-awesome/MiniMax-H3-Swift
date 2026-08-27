@@ -150,7 +150,8 @@ private enum RenderOperation {
         let profile = PipelineRuntime.ArithmeticProfile.observed()
         return .init(ditDType: profile.ditDType,
                      aneRoutedProjections: profile.aneRoutedProjections,
-                     aneDeclinedProjections: profile.aneDeclinedProjections)
+                     aneDeclinedProjections: profile.aneDeclinedProjections,
+                     aneCFGOverlap: profile.aneCFGOverlap)
     }
 
     static func execute(jobID: UUID, request: RenderRequest, models: ModelSet,

@@ -67,6 +67,22 @@ public struct RenderReceipt: Codable, Sendable {
         /// numbers, no speedup, but a different run from one that never
         /// offered.
         public let aneDeclinedProjections: [String]
+        /// GPU attention on one CFG branch ran beside engine linears on the
+        /// other. Optional so a v4 file still reads, and **nil means
+        /// unrecorded, not false** — which is why the schema version moves
+        /// rather than this field being quietly added to v4. Two files both
+        /// claiming 4 with different shapes is the ambiguity the version exists
+        /// to prevent, and the arithmetic fields are part of what identifies
+        /// the output.
+        public let aneCFGOverlap: Bool?
+
+        public init(ditDType: String, aneRoutedProjections: [String],
+                    aneDeclinedProjections: [String], aneCFGOverlap: Bool? = nil) {
+            self.ditDType = ditDType
+            self.aneRoutedProjections = aneRoutedProjections
+            self.aneDeclinedProjections = aneDeclinedProjections
+            self.aneCFGOverlap = aneCFGOverlap
+        }
     }
 
     public struct Output: Codable, Sendable {
@@ -113,7 +129,10 @@ public struct RenderReceipt: Codable, Sendable {
         // 4 adds `compute`. It is optional so a v3 file still reads, but its
         // absence now means "unrecorded", not "default" — a v3 render could
         // have been fp16 and nothing would say so.
-        schemaVersion = 4
+        // 5 adds `compute.aneCFGOverlap`. Optional, so a v4 file still reads,
+        // but a v4 file cannot say whether the CFG branches were overlapped and
+        // a v5 file can.
+        schemaVersion = 5
         self.jobID = jobID
         status = .running
         startedAt = .now

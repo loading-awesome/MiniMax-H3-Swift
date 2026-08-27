@@ -80,6 +80,8 @@ package enum PipelineRuntime {
         /// Projections offered to the engine that fell back to MLX. A render
         /// that declined partway is not the render that did not offer at all.
         package let aneDeclinedProjections: [String]
+        /// GPU attention on one CFG branch ran beside engine linears on the other.
+        package let aneCFGOverlap: Bool
 
         package static func observed() -> ArithmeticProfile {
             let dtype: String
@@ -91,7 +93,8 @@ package enum PipelineRuntime {
             return ArithmeticProfile(
                 ditDType: dtype,
                 aneRoutedProjections: ANELinearBackend.routedProjections,
-                aneDeclinedProjections: ANELinearBackend.declinedProjections)
+                aneDeclinedProjections: ANELinearBackend.declinedProjections,
+                aneCFGOverlap: ANELinearBackend.overlappedCFG)
         }
     }
 

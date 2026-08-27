@@ -224,16 +224,18 @@ struct RenderEngineTests {
                                machine: "test", availableMemoryBytes: 0))
         original.compute = .init(ditDType: "bf16",
                                  aneRoutedProjections: ["fc1", "qkv"],
-                                 aneDeclinedProjections: ["attn out"])
+                                 aneDeclinedProjections: ["attn out"],
+                                 aneCFGOverlap: true)
 
         let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
         let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
         let decoded = try decoder.decode(RenderReceipt.self,
                                          from: try encoder.encode(original))
-        #expect(decoded.schemaVersion == 4)
+        #expect(decoded.schemaVersion == 5)
         #expect(decoded.compute?.ditDType == "bf16")
         #expect(decoded.compute?.aneRoutedProjections == ["fc1", "qkv"])
         #expect(decoded.compute?.aneDeclinedProjections == ["attn out"])
+        #expect(decoded.compute?.aneCFGOverlap == true)
     }
 
     @Test("stable error codes do not depend on prose")
