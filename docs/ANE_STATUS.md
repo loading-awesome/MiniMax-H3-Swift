@@ -570,6 +570,47 @@ same thermal state is what turned an 8% regression into a 1% one, and no
 performance claim on this page should be read from arms measured an hour apart.
 
 
+### Sub-process dispatch: the GPU is already saturated by one process
+
+The schedules all failed on the same shape of limit — one MLX thread runs every
+upload, gather and collect between engine jobs, and mlx-swift serialises every
+`eval` behind one process-wide recursive lock. Both of those are *intra*-process,
+so the obvious question is whether separate processes escape them.
+
+They do escape them, and it does not matter. Two processes running the same
+8192³ bf16 GEMM, in independent build trees so nothing serialises them:
+
+| | ms | TFLOP/s |
+|---|---:|---:|
+| one process alone | 59.5 | **18.5** |
+| two concurrent, process A | 124.2 | 8.8 |
+| two concurrent, process B | 124.4 | 8.8 |
+
+Each runs at half the rate; aggregate is 17.6 TFLOP/s against 18.5 for one.
+**Concurrency returns 0.95x, not 2x.** A single MLX process already saturates
+this GPU, so there is no idle compute for another process to reclaim — the
+contention costs about 5%.
+
+That closes the direction for compute-bound work, which is 92% of a block. The
+only thing sub-processes could still reach is the GPU-*idle* window while the
+engine runs, which is exactly what query tiling and the CFG pipeline attacked
+from inside one process, and the floor there is 906 ms — 1.254x — whoever fills
+it.
+
+**Two ways this was nearly measured wrong**, both worth remembering:
+
+- Running `swift test` N times in parallel does not run N processes in parallel.
+  SwiftPM locks the build directory, so four "concurrent" runs each reported the
+  same 1203 ms per block and looked like 4x throughput. Wall clock gave it away:
+  41.1 s for four against 10.5 s for one. They ran one after another. The second
+  build tree above is what makes the comparison real, and it needs
+  `bootstrap-metal.sh` run against it or MLX dies with a missing metallib.
+- Two full renders cannot be used for this at all. The runtime refuses them —
+  `H3-4002`, one render at a time, because two 66 GB models cannot be safely
+  oversubscribed against a 98.7 GB planned peak. That refusal is correct and it
+  is not the thing being measured here.
+
+
 ### What would move it
 
 The contraction split, above. Every schedule closed on this page was closed by
