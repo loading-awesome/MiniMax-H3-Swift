@@ -320,12 +320,11 @@ Recomputing the block, with attention and the elementwise pinned to the GPU:
 Two things that were settled are now open again, and both should be re-run
 before anything is built:
 
-  * **`fc2` may be routable.** It is off the engine because its interior
-    partials reach 34,649 against a 2^15 cliff that returns silent zeros.
-    Splitting the contraction eight ways divides the accumulated partial by
-    about eight — to roughly 4,300, some 7.6x under the cliff. That is a claim
-    about a bound, so `Tools/ANE/saturation_bound.py` has to settle it rather
-    than this paragraph.
+  * **`fc2` is still not routable**, and splitting does not change that. The
+    tool now computes the split bound, but the oracle captures it needs are not
+    in this checkout, and the coverage objection that kept `fc2` out survives
+    the better margin anyway. See *Splitting the contraction does not settle
+    `fc2` either*.
   * **The native merge kernels are useful after all.** They were measured
     worthless against a single shard pair. Split-k produces `c` partials per
     projection that must be summed, and a merge kernel that accumulates all of
@@ -396,6 +395,53 @@ failure, to gain 33 ms a block. No.
 That is a capture job, not a code job, and it is the honest prerequisite for
 reconsidering `fc2`. Reaching a gate by guessing at a silent-corruption
 threshold is not reaching it.
+
+#### Splitting the contraction does not settle `fc2` either
+
+Split-k changes what the bound is *about*. A split projection never accumulates
+across a piece — each piece is its own evaluation and the partials are summed
+afterwards on the GPU in fp32 — so the quantity that must clear the cliff is the
+worst single piece. `saturation_bound.py --splits N` computes exactly that, and
+its split logic is checked against brute force including the adversarial case
+where all the magnitude sits in one piece and splitting correctly buys nothing.
+
+**It could not be run.** The nine oracle captures the bound needs
+(`parity/goldens/oracle_prod_matrix/b{00,24,49}_c{000,013,019}`) are not in this
+checkout, and there is no in-tree generator — they come from the reference run.
+A bound over invented activations is not a bound, so no number was produced.
+
+What the real checkpoint *can* answer is the weight half. `fc2`'s weight L1 is
+close to flat across the contraction at block 49 — over all 5,376 output
+channels, at eight pieces, the median piece carries 0.1285 of the row's total
+against an ideal 0.1250, and the worst channel carries 0.1419:
+
+| pieces | k each | ideal | median | worst channel |
+|---:|---:|---:|---:|---:|
+| 2 | 7168 | 0.5000 | 0.5023 | 0.5156 |
+| 4 | 3584 | 0.2500 | 0.2534 | 0.2655 |
+| 8 | 1792 | 0.1250 | 0.1285 | 0.1419 |
+| 16 | 896 | 0.0625 | 0.0655 | 0.0777 |
+
+So on the weight side the mechanism works. If the activation magnitudes were
+flat across `k` as well, block 49's bound of 978,586 would fall to about
+138,861 at eight pieces — 3.8x of headroom where there is now 0.54x, which is
+the difference between "exceeds by 1.9x" and "clears".
+
+**That projection is not the bound and must not be used as one.** `fc2`'s input
+is the SwiGLU output, which is gated: a large fraction of its channels are near
+zero and the surviving magnitude may well concentrate rather than spread. The
+weight profile cannot see that. Only the captures can.
+
+And the margin was never the whole objection. The captures cover three of fifty
+blocks and 6.6% of sequence positions, the quantity moves 95x across the three
+blocks that were measured, and the failure returns zero with nothing downstream
+able to see it. Splitting the contraction improves the margin; it does not
+improve the sampling. Even at 3.8x, extrapolating across 24 unmeasured blocks of
+a quantity that has already been seen to move by 95x is the same bad trade in
+better clothes.
+
+**`fc2` remains off the engine, and the prerequisite is unchanged: oracles for
+every block.** Still a capture job, not a code job.
 
 ### What it costs in memory
 

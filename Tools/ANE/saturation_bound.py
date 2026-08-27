@@ -91,17 +91,36 @@ def read_f32(path, header, offset0, name):
                      offset=offset0 + begin, shape=(r, c))
 
 
-def order_free_bound(a, w, chunk=512):
+def order_free_bound(a, w, chunk=512, splits=1):
     """max over (row, channel) of sum_k |a_k| |w_k| — one GEMM on magnitudes.
 
     Chunked over output channels so a [1024, 28672] intermediate never has to
     exist at once for `fc1`.
+
+    `splits` is the number of pieces the **contraction** is cut into before the
+    engine sees it. A split projection never accumulates across a piece — each
+    piece is its own evaluation and the partials are summed afterwards, on the
+    GPU, in fp32 — so the quantity that must clear the cliff is the worst single
+    piece, not the whole contraction. With `splits=1` this is exactly what it
+    was.
+
+    This is not an approximation of the old bound: it is the same order-free
+    argument applied to the accumulation the hardware actually performs when the
+    contraction is cut. Splitting cannot make any piece larger than the whole,
+    so the bound is monotone in `splits` and `splits=1` remains the conservative
+    answer if the routed path ever stops splitting.
     """
     absa = np.abs(np.asarray(a, dtype=np.float32))
+    k = absa.shape[1]
+    assert k % splits == 0, "contraction %d does not divide into %d pieces" % (k, splits)
+    piece = k // splits
     worst = 0.0
-    for start in range(0, w.shape[0], chunk):
-        block = np.abs(np.asarray(w[start:start + chunk], dtype=np.float32))
-        worst = max(worst, float(np.max(absa @ block.T)))
+    for lo in range(0, k, piece):
+        hi = lo + piece
+        ap = absa[:, lo:hi]
+        for start in range(0, w.shape[0], chunk):
+            block = np.abs(np.asarray(w[start:start + chunk, lo:hi], dtype=np.float32))
+            worst = max(worst, float(np.max(ap @ block.T)))
     return worst
 
 
@@ -136,6 +155,10 @@ def main():
     ap.add_argument("--index-rows", type=int, default=4,
                     help="rows to also measure in index order, for slack (0 to skip)")
     ap.add_argument("--index-channels", type=int, default=256)
+    ap.add_argument("--splits", type=int, default=1,
+                    help="pieces the contraction is cut into before the engine "
+                         "sees it; the bound is then over the worst piece "
+                         "(default 1, the unsplit projection)")
     args = ap.parse_args()
 
     oracles = sorted(glob.glob(os.path.join(args.oracles, "*", "oracle.safetensors")))
@@ -148,7 +171,12 @@ def main():
     # quantity this tool measures is 2^15 divided by the scale.
     threshold = MAC_SATURATION / args.scale
     print("Order-free saturation bound — operand scale %g, so unscaled partials "
-          "must stay under %.0f\n" % (args.scale, threshold))
+          "must stay under %.0f" % (args.scale, threshold))
+    if args.splits > 1:
+        print("Contraction cut into %d pieces; the bound is over the worst "
+              "single piece, because a split projection never accumulates "
+              "across one." % args.splits)
+    print()
 
     verdicts = {}
     needed = {}
@@ -172,7 +200,10 @@ def main():
             a = read_f32(path, ghead, goff, tap)
             w = read_bf16(args.checkpoint, chead, coff, key)
 
-            bound = order_free_bound(a, w)
+            splits = args.splits
+            while splits > 1 and a.shape[1] % splits:
+                splits //= 2
+            bound = order_free_bound(a, w, splits=splits)
             headroom = threshold / bound if bound > 0 else float("inf")
             safe = bound < threshold
 
