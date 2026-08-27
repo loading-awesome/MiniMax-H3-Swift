@@ -716,6 +716,52 @@ deterministic: it needs the driver, or another client, to act in the window.
 Testing that needs a soak with per-client driver logging and a failure to
 examine, not another four-minute run.
 
+### The panic reproduces, with the fault deferred ~8-10 minutes (2026-08-27)
+
+Three DART panics, all byte-identical:
+
+```
+sptm_t8110dart_clear_err: dart (dart-ane0:46): DART instance 1:
+  Unrecoverable secondary error 0x80080008
+backtrace: com.apple.sptm, com.apple.driver.AppleT8110DART
+```
+
+| # | boot | panic | preceding ANE work | delay |
+|---|---|---|---|---|
+| 1 | 11:48:53 | 12:08:45 | `ane-hold` started 12:07:33 | +72 s |
+| 2 | 12:09:10 | 12:48:37 | `pair-stress` ended 12:40:13 | **+504 s** |
+| 3 | 12:48:59 | 13:08:25 | `pair-stress` ended 12:58:42 | **+583 s** |
+
+**Panics 2 and 3 are the same experiment, run twice.** The second was a
+deliberate replication of the first: `pair-stress 240 2000`, then the `probe`,
+then idle. It reproduced. That makes this a deterministic mechanism with a
+variable delay, not the random hardware event it looked like.
+
+Identical error codes are the other half of that argument. Random corruption —
+a stray write, an electrical fault — gives varied failure addresses and varied
+codes. The same DART, the same instance, and `0x80080008` three times means the
+hardware takes the same fault path every time.
+
+**The fault is deferred and fires while the machine is idle.** At the moment of
+panics 2 and 3 there had been no ANE driver activity for minutes; the last
+flushed log lines are ordinary system chatter. Whatever the work leaves behind
+surfaces eight to ten minutes later, with nothing running.
+
+Two methodological lessons, both learned the expensive way:
+
+- **A clean run proves nothing.** Every clean result recorded above —
+  1.3 million pairs, the 200 ms sweep, the 2 s sweep — was measuring a window
+  that closes before the fault arrives. They are not safety evidence.
+- **The replication was nearly called a negative.** The watch was stopped at
+  +553 s because the first panic came at +504 s. The machine panicked 30 s
+  later. Anything watching for this needs to run well past 600 s before
+  concluding anything, and the variance is not yet bounded.
+
+The fused attention graph is **not** implicated: it never executed in any of the
+three, exiting 127 on a missing binary both times it was invoked. Its apparent
+correlation with panics 2 and 3 was coincidence — the deferred clock was already
+running from the preceding stress run.
+
 ### The rule this leaves
 
 - **Nothing runs on the engine.** As of the DART panic there is no configuration
