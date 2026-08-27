@@ -519,8 +519,69 @@ a driver-initiated sleep in progress. Suppressing that timer is what the
 keep-alive does, and it is all it does. Pinning the engine powered is what the
 bracket would do, and that needs the entitlement.
 
+### Three watchdog resets, and what the hang actually is
+
+By the end of 2026-08-27 this machine had hard reset three times: 08:02, 11:02,
+11:49. It had never done so before that day. All three fell during ANE testing.
+
+The reset is **not** a power fault, and the owner's account settles it: hard
+shutdown followed by **self-recovery**, with nobody touching the power button.
+
+| evidence | reading |
+|---|---|
+| self-recovery, no human | the reset was automatic |
+| no panic report, ever | nothing faulted — a stuck thread does not panic |
+| `panicmedic-telemetry` in NVRAM | the OS was unresponsive and was reset for it |
+| 35 s, 48 s, 61 s from last log line to boot | not a power drop, which reboots in seconds; this is lost log tail plus watchdog timeout plus early boot |
+| `wdog` in all three `ResetCounter` records | consistent, though identical strings across three same-class events prove little on their own |
+
+The mechanism is a kernel workloop thread parked forever holding a gate, which
+stops the kernel making forward progress, which the watchdog answers by
+resetting the machine. For the 11:02 reset it is caught in the act — the log
+stops mid-sequence inside `ANE_PowerOn_gated: Wait until ANE gets powered up`,
+with the skipped enqueue two lines above. The other two have no ANE line at the
+end, which is weaker evidence than it looks: the unified log writes
+asynchronously and a wedged kernel never flushes its tail.
+
+The 11:49 reset came **2.5 minutes after** the benchmark process exited, with
+the last ANE event being a clean, normal sleep. That is the important detail for
+what to do about it. Once a process using the engine exits, the dies idle, five
+seconds later a transition opens — and macOS touches the ANE constantly for its
+own features. The access that lands in the window does not have to be ours, and
+in that case there is nothing of ours in the log at all.
+
+### Holding the engine for a session, and what that does not buy
+
+`Tools/ANE/ane-hold.m` runs for a whole work session and suppresses the idle
+timer for its duration. It creates one 64x64x64 program through the shipping
+bridge — which starts the bridge's own keep-alive — so what it holds is exactly
+what a render holds rather than a second mechanism that could drift.
+
+The scope is the point. A per-process keep-alive dies with its process, which is
+precisely when the window opens. One holder across a session collapses many
+transitions into one.
+
+**It does not pin the power plane, and nothing available to this process can.**
+`-[_ANEClient beginRealTimeTask]` is entitlement-gated and refuses on both
+connections. The engine still power-cycles under client-requested power-off —
+about eleven times in a 31 s measurement — and whether *that* transition path
+can race has not been established. This narrows the window; it does not close
+it.
+
+### The wired memory was not a leak
+
+`swiftpm-testing-helper` was observed holding 702 MB wired with 4 programs open,
+which invites a leak diagnosis. It is not one. After the process exited the
+driver reports `Programs Open:0 Wired-Memory:0` for it, with
+`ANE_UserClientClose_gated_block_invoke` on both dies. The island holds
+persistent compiled programs and weight surfaces by design; four open programs
+with weights wired is the intended steady state, and it is released on exit.
+
 ### The rule this leaves
 
+- **`Tools/ANE/ane-hold.m` runs for the whole session, started before any ANE
+  work and left running.** Per-process protection is not enough: the exposed
+  transition opens after a process exits.
 - **No ANE work of any size runs outside the keep-alive.** The toy shapes are
   not the safe subset; there is no safe subset. `h3_ane_program_create` starts
   the keep-alive before it creates anything, and returns NULL if it cannot.
