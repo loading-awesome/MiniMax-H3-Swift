@@ -482,6 +482,49 @@ against a GPU sustaining ~18.6 TFLOP/s, and a new Metal driver moving that moves
 the balance point. **Nothing here should be quoted as a 27.0 result until it is
 re-measured.**
 
+### The multi-weight MLP island executes; 0x1D was a sizing error (2026-08-27)
+
+**This corrects the finding at the top of this document.** The four-input MIL
+graph containing both `fc1` matmuls, SwiGLU and `fc2` was recorded as
+"compiles and loads but is rejected at inference with ANE status `0x1d`", and
+the conclusion drawn was that *"compiler acceptance is therefore not evidence
+that this runtime can execute a multi-weight island"*. That conclusion is wrong.
+
+macOS 27 decodes `0x1D`:
+
+```
+Code=42 "Inference failed — IOSurface smaller than the model expects
+         (re-check inputBufferSize/outputBufferSize from the load reply)"
+         underlying=0x1D
+```
+
+It is a **buffer-size error**, not an architectural rejection. Oversizing every
+surface in `Tools/ANE/mlp-island-spike.mm` makes the same graph run:
+
+| surface multiplier | result |
+|---|---|
+| 1x, 2x, 3x | `0x1D` |
+| **4x** | **`evaluate=OK`** |
+
+So the runtime does execute a multi-weight island with dynamic weights, and the
+direction that was closed on this evidence should not have been.
+
+Two things remain before it means anything. The arithmetic is still wrong
+(`rel_rms` 1.016, uncorrelated) because the surfaces are merely *large enough*
+rather than correctly *laid out* — the engine writes at a stride the spike does
+not read at, the same class of mismatch as the transposed score plane in
+`scores-spike.mm`. And the exact rule is not established: 4x is the measured
+boundary for this graph, and it is consistent with a minimum minor-axis extent
+of 256 elements — `xs`/`ys` have a minor axis of 64 and need 4x, `ds` has 128
+and needs 2x — but that is inference from one shape, not a measurement.
+
+The runtime exposes `+[_ANEIOSurfaceObject createIOSurfaceWithWidth:pixel_size:
+height:bytesPerElement:]`, which this bridge has never used: every surface here
+is allocated by `IOSurfaceCreate` against our own `rows x align64(width*2)`
+guess. That factory, or the load reply the error names, is where the real answer
+is. Production shapes are unaffected — their minor axes are all well above any
+plausible floor — but nothing has verified that, it is only arithmetic.
+
 ### Fused attention works with an explicit softmax (2026-08-27)
 
 **This supersedes the section below it.** The fused graph's 97% error is the

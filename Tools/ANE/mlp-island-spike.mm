@@ -185,11 +185,20 @@ int main(void) {
         float *expected = (float *)calloc((size_t)Hidden * Sequence, sizeof(float));
         FillFixture(x, gate, up, down); Reference(x, gate, up, down, expected);
 
-        IOSurfaceRef xs = NewSurface(TensorBytes(Hidden, Sequence));
-        IOSurfaceRef gs = NewSurface(TensorBytes(Hidden, Intermediate));
-        IOSurfaceRef us = NewSurface(TensorBytes(Hidden, Intermediate));
-        IOSurfaceRef ds = NewSurface(TensorBytes(Intermediate, Hidden));
-        IOSurfaceRef ys = NewSurface(TensorBytes(Hidden, Sequence));
+        // `H3_MLP_PAD=n` oversizes every surface. On macOS 27 this graph's
+        // 0x1D decodes as "IOSurface smaller than the model expects", so the
+        // rejection recorded in docs/ANE_STATUS.md as evidence that the runtime
+        // cannot execute a multi-weight island may only ever have been a
+        // sizing error. If a multiplier makes it run, that is the answer.
+        const char *padRaw = getenv("H3_MLP_PAD");
+        size_t pad = padRaw ? (size_t)strtol(padRaw, NULL, 10) : 1;
+        if (pad < 1) pad = 1;
+        printf("surface_pad=%zux\n", pad);
+        IOSurfaceRef xs = NewSurface(TensorBytes(Hidden, Sequence) * pad);
+        IOSurfaceRef gs = NewSurface(TensorBytes(Hidden, Intermediate) * pad);
+        IOSurfaceRef us = NewSurface(TensorBytes(Hidden, Intermediate) * pad);
+        IOSurfaceRef ds = NewSurface(TensorBytes(Intermediate, Hidden) * pad);
+        IOSurfaceRef ys = NewSurface(TensorBytes(Hidden, Sequence) * pad);
         WriteTensor(xs, x, Hidden, Sequence);
         WriteTensor(gs, gate, Hidden, Intermediate);
         WriteTensor(us, up, Hidden, Intermediate);
