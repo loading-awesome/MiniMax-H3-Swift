@@ -357,6 +357,45 @@ struct ANEFormTests {
         return (relRMS(reference, gpu), routed[1]!, routed[4]!)
     }
 
+    /// What the engine's surfaces actually cost, measured rather than computed.
+    ///
+    /// `mlxPeakBytes` on a render receipt cannot see any of this: the engine's
+    /// activation and output surfaces are IOSurfaces, outside MLX's allocator,
+    /// so a receipt reports the same 87.2 GB whether the engine ran or not. The
+    /// status page carries a figure derived from the shard plan; this measures
+    /// the same thing against the process's resident set, which is the number
+    /// that decides whether a machine fits.
+    @Test(.enabled(if: ProcessInfo.processInfo.environment["H3_BIG"] != nil))
+    func engineSurfacesCostWhatTheyClaim() {
+        func residentGB() -> Double {
+            var info = mach_task_basic_info()
+            var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size
+                                               / MemoryLayout<natural_t>.size)
+            let ok = withUnsafeMutablePointer(to: &info) {
+                $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                    task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
+                }
+            }
+            return ok == KERN_SUCCESS ? Double(info.resident_size) / 1e9 : 0
+        }
+
+        let s = 15_731
+        let shapes = [("qkv", 5376, 21_504), ("fc1", 5376, 28_672), ("attn out", 7168, 5376)]
+        let before = residentGB()
+        for (label, k, n) in shapes {
+            let x = MLX.contiguous((MLXRandom.normal([s, k]) * 0.5).asType(.bfloat16))
+            let w = MLX.contiguous((MLXRandom.normal([n, k]) * 0.02).asType(.bfloat16))
+            MLX.eval(x, w)
+            // One call builds the programs, the slot pool and the weight
+            // surfaces for this shape — everything the route keeps resident.
+            MLX.eval(ANELinearBackend.project(x: x, weight: w, label: label))
+        }
+        let after = residentGB()
+        print(String(format: "\n  resident before %.1f GB, after %.1f GB — engine surfaces and"
+                     + " weights for three projections: %.1f GB\n",
+                     before, after, after - before))
+    }
+
     static func forms(k: Int, n: Int, s: Int) -> [Form] {
         [Form(name: "matmul", raw: H3ANEFormMatmul, wRows: k, wWidth: n, yRows: s, yWidth: n),
          Form(name: "conv", raw: H3ANEFormConv, wRows: n, wWidth: k, yRows: n, yWidth: s)]
