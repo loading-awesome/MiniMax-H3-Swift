@@ -956,6 +956,37 @@ public enum ANELinearBackend {
                        rows: s, perDie: plan.perDie, x: x, weight: weight)
     }
 
+    /// The fp32 accumulate, the unscale and the cast back — as **one** kernel.
+    ///
+    /// Written as ordinary MLX these are `2*splits` elementwise operations, and
+    /// MLX materialises each one: at the production shard and a share of 0.45
+    /// every fp32 intermediate is 306 MB, and the chain moves about 5 GB a die
+    /// per projection against the 0.77 GB the arithmetic actually requires.
+    /// Across both dies and three projections that is 30 GB a block, which at
+    /// this machine's bandwidth is most of what splitting the contraction won.
+    ///
+    /// Compiled, the whole chain fuses into a single pass: read `splits` fp16
+    /// partials, write one bf16 result. The accumulation stays fp32 inside the
+    /// kernel, so the accuracy the split buys is kept — it is the intermediates
+    /// that go, not the precision.
+    ///
+    /// One compiled reducer per `splits`, cached: compiling is not free and the
+    /// split count is fixed for a render.
+    nonisolated(unsafe) private static var reducers: [Int: @Sendable ([MLXArray]) -> [MLXArray]] = [:]
+
+    fileprivate static func reducer(splits: Int) -> @Sendable ([MLXArray]) -> [MLXArray] {
+        lock.lock(); defer { lock.unlock() }
+        if let cached = reducers[splits] { return cached }
+        let inverse = 1 / operandScale
+        let made = MLX.compile { (parts: [MLXArray]) -> [MLXArray] in
+            var acc = parts[0].asType(.float32)
+            for i in 1 ..< parts.count { acc = acc + parts[i].asType(.float32) }
+            return [(acc * inverse).asType(.bfloat16)]
+        }
+        reducers[splits] = made
+        return made
+    }
+
     /// Adopts the engine's two output surfaces and joins them to the GPU shard.
     fileprivate static func join(gpu: MLXArray, slot: Slot, session: Session,
                                  rows s: Int, perDie: Int) -> MLXArray {
@@ -1000,11 +1031,10 @@ public enum ANELinearBackend {
         // pieces. Splitting the contraction makes this path faster *and* more
         // accurate, which is the rare direction.
         func partial(_ die: Int) -> MLXArray {
-            var acc = adopt(die == 0 ? slot.ys[0].0 : slot.ys[0].1).asType(.float32)
-            for c in 1 ..< session.splits {
-                acc = acc + adopt(die == 0 ? slot.ys[c].0 : slot.ys[c].1).asType(.float32)
+            let parts = (0 ..< session.splits).map {
+                adopt(die == 0 ? slot.ys[$0].0 : slot.ys[$0].1)
             }
-            return (acc * (1 / operandScale)).asType(.bfloat16)
+            return reducer(splits: session.splits)(parts)[0]
         }
 
         // The `eval` is what copies the engine's output out of the shared

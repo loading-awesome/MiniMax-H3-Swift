@@ -249,8 +249,9 @@ struct ANEFormTests {
     func splitJoinCost() {
         let s = 15_731, k = 5376, n = 21_504
         ANELinearBackend.share = 0.5
-        let x = MLX.contiguous((MLXRandom.normal([s, k]) * 0.05).asType(.bfloat16))
-        let w = MLX.contiguous((MLXRandom.normal([n, k]) * 0.02).asType(.bfloat16))
+        let mag = Float(ProcessInfo.processInfo.environment["H3_ACC_MAG"] ?? "") ?? 1.0
+        let x = MLX.contiguous((MLXRandom.normal([s, k]) * mag).asType(.bfloat16))
+        let w = MLX.contiguous((MLXRandom.normal([n, k]) * mag).asType(.bfloat16))
         MLX.eval(x, w)
 
         print("\n  qkv [\(s),\(k)]x[\(k),\(n)] at engine share 0.5\n")
@@ -271,6 +272,89 @@ struct ANEFormTests {
         }
         ANELinearBackend.share = 0.286
         print("")
+    }
+
+    /// Splitting must not cost accuracy, and the fused reducer must not either.
+    ///
+    /// The split's justification is that it is faster *and* closer to fp32 —
+    /// each piece is a shorter fp16 reduction, and the pieces are summed in
+    /// fp32. Fusing that sum into one compiled kernel is a performance change
+    /// that touches the arithmetic path, so it is checked rather than assumed.
+    @Test(.enabled(if: ProcessInfo.processInfo.environment["H3_BIG"] != nil))
+    func splitKeepsAccuracy() {
+        let s = 2048, k = 5376, n = 21_504
+        ANELinearBackend.share = 0.45
+        defer { ANELinearBackend.share = 0.45 }
+        let (gpuError, whole, split) = Self.routedError(s: s, k: k, n: n, sigma: 1.0)
+        print(String(format: """
+
+          rel RMS against fp32, unit-scale operands
+            bf16 on the GPU     %.3e
+            routed, whole k     %.3e
+            routed, split 4     %.3e
+
+        """, gpuError, whole, split))
+        #expect(split <= whole,
+                "splitting the contraction must not lose accuracy against the whole one")
+        #expect(split < gpuError * 1.05,
+                "the routed path must stay within reach of the bf16 path it replaces")
+    }
+
+    /// **The operand scale has a floor, and nothing in the code says so.**
+    ///
+    /// Every routed activation is multiplied by 1/16 before the engine sees it,
+    /// to move the partial-sum envelope away from the 2^15 saturation cliff.
+    /// That trade has a second edge nobody had measured: fp16's smallest normal
+    /// is 6.1e-05, so scaling down far enough pushes the *products* into
+    /// denormals and the engine loses them.
+    ///
+    /// This is a property of the shipping path, not of the contraction split —
+    /// whole and split degrade together, and identically. `ANE_PRECISION_RESULTS`
+    /// measured 7e-05 to 5e-04 on real captured activations, which sit well
+    /// above the cliff; what was missing is any statement of where the cliff is.
+    ///
+    ///     sigma 1.00   engine sees 0.0625, product 6.3e-02   1.68e-03  fine
+    ///     sigma 0.20   engine sees 0.0125, product 2.5e-03   2.13e-03  fine
+    ///     sigma 0.05   engine sees 0.0031, product 1.6e-04   3.10e-02  20x worse
+    ///
+    /// A projection whose activations run near sigma 0.05 would be quietly
+    /// wrong by 3%, which no downstream gate in this tree would catch.
+    @Test(.enabled(if: ProcessInfo.processInfo.environment["H3_BIG"] != nil))
+    func operandScaleHasAnUnderflowFloor() {
+        let s = 2048, k = 5376, n = 21_504
+        ANELinearBackend.share = 0.45
+        let safe = Self.routedError(s: s, k: k, n: n, sigma: 1.0)
+        let small = Self.routedError(s: s, k: k, n: n, sigma: 0.05)
+        print(String(format: "\n  sigma 1.00 routed %.3e   sigma 0.05 routed %.3e   (%.0fx)\n",
+                     safe.whole, small.whole, small.whole / safe.whole))
+        #expect(safe.whole < safe.gpu * 1.05,
+                "at production magnitudes the engine must match the GPU path")
+        // Pinned so the day someone changes `operandScale` this says what it
+        // costs at the bottom of the range rather than the top.
+        #expect(small.whole > safe.whole * 5,
+                "the underflow floor has moved; re-measure where it now sits")
+    }
+
+    /// Routed error against an fp32 reference, whole and split, plus the plain
+    /// bf16 GPU path for scale.
+    static func routedError(s: Int, k: Int, n: Int, sigma: Float)
+        -> (gpu: Float, whole: Float, split: Float) {
+        let x = MLX.contiguous((MLXRandom.normal([s, k]) * sigma).asType(.bfloat16))
+        let w = MLX.contiguous((MLXRandom.normal([n, k]) * sigma).asType(.bfloat16))
+        MLX.eval(x, w)
+        let reference = MLX.matmul(x.asType(.float32), w.asType(.float32).transposed())
+        let gpu = MLX.matmul(x, w.transposed())
+        MLX.eval(reference, gpu)
+
+        var routed: [Int: Float] = [:]
+        for splits in [1, 4] {
+            ANELinearBackend.splitOverride = splits
+            defer { ANELinearBackend.splitOverride = nil }
+            let out = ANELinearBackend.project(x: x, weight: w, label: "qkv")
+            MLX.eval(out)
+            routed[splits] = relRMS(reference, out)
+        }
+        return (relRMS(reference, gpu), routed[1]!, routed[4]!)
     }
 
     static func forms(k: Int, n: Int, s: Int) -> [Form] {

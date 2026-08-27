@@ -11,9 +11,11 @@ research.
 
 ## The position in three lines
 
-**A production block runs 1162.7 ms unrouted and 1047.5 ms routed: 1.110x**,
-against a 1.15x gate. Every hardware objection is discharged. `fc2` stays off
-the engine (saturation).
+**The 1.15x gate is cleared: 1.172x.** A production block runs 1136.1 ms
+unrouted, 1041.0 ms on the previous routed path, and **969.4 ms** with the
+contraction split and the partial join fused. `fc2` stays off the engine
+(saturation), and the two overlap schedules stay closed — the win is entirely in
+how the engine is fed.
 
 **Overlapping the two CFG branches was the last idea with a multiple in it, and
 it is measured and closed.** It works — the schedule is bit-identical and
@@ -398,14 +400,54 @@ collect between engine jobs, and the dependency chain inside a block gives it
 nowhere else to be. A faster engine made the schedules cheaper to feed and did
 not make them pay.
 
-### Where this leaves the gate
+### Fusing the join, and the gate
 
-`1.093x -> ~1.12x`, reproducible, bit-identical at a fixed share, and more
-accurate than the path it replaces. **It does not clear the 1.15x gate**, which
-needs about 986 ms in this harness against the 1010 measured. The remaining 25
-ms is not in any schedule that has been tried; it is in the per-projection seam
-— upload, partial summation, join — which is roughly 24 ms per projection at
-share 0.5 and is what an accumulating merge kernel exists to attack.
+Splitting leaves `splits` partials per die to sum. Written as ordinary MLX that
+is `2*splits` elementwise operations and MLX materialises every one: at a share
+of 0.45 each fp32 intermediate is 306 MB, and the chain moves about 5 GB a die
+per projection against the 0.77 GB the arithmetic requires. Across both dies and
+three projections, 30 GB a block — most of what splitting had won.
+
+Compiled, the accumulate, the unscale and the cast fuse into one pass: read
+`splits` fp16 partials, write one bf16 result, accumulate in fp32 inside the
+kernel so the precision the split buys is kept. `qkv` at share 0.5 went from
+122.4 ms to **108.0 ms**, and the block from ~1010 to **969.4 ms**.
+
+Two passes of the three-way comparison, one configuration per process:
+
+| | pass 1 | pass 2 | |
+|---|---:|---:|---:|
+| GPU only | 1133.1 ms | 1139.1 ms | — |
+| whole contraction, share 0.286 | 1038.5 ms | 1043.5 ms | 1.091x |
+| **split-k + fused join, share 0.45** | **972.2 ms** | **966.5 ms** | **1.172x** |
+
+The gate wants 987.9 ms against this harness's 1136.1 ms baseline. 969.4 clears
+it with 19 ms in hand. The share plateau moved with the cheaper join and now
+runs 0.45 to 0.52 — 968.5 and 960.7 — falling off at 0.60 (1012.1) and 0.68
+(1043.0), so 0.45 keeps the margin from the cliff.
+
+### The operand scale has an underflow floor
+
+Chasing the split's accuracy claim turned up something older. Every routed
+activation is multiplied by 1/16 before the engine sees it, to move the
+partial-sum envelope off the 2^15 cliff. fp16's smallest normal is 6.1e-05, so
+scaling down far enough pushes the **products** into denormals and the engine
+loses them:
+
+| operand sigma | engine sees | typical product | bf16 GPU | routed |
+|---:|---:|---:|---:|---:|
+| 1.00 | 0.0625 | 6.3e-02 | 1.66e-03 | 1.68e-03 |
+| 0.20 | 0.0125 | 2.5e-03 | 1.66e-03 | 2.13e-03 |
+| 0.05 | 0.0031 | 1.6e-04 | 1.66e-03 | **3.10e-02** |
+
+This is the **shipping path**, not the split: whole and split degrade together
+and identically, and at production magnitudes the split is very slightly the
+better of the two. `ANE_PRECISION_RESULTS` measured 7e-05 to 5e-04 on real
+captured activations, which sit far above the floor — what was missing is any
+statement of where the floor is, or any test holding it there. A projection
+whose activations ran near sigma 0.05 would be quietly wrong by 3%, and nothing
+downstream in this tree would catch it.
+`operandScaleHasAnUnderflowFloor` pins it.
 
 ### What would move it
 
