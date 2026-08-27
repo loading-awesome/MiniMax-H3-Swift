@@ -1184,6 +1184,53 @@ it with 19 ms in hand. The share plateau moved with the cheaper join and now
 runs 0.45 to 0.52 — 968.5 and 960.7 — falling off at 0.60 (1012.1) and 0.68
 (1043.0), so 0.45 keeps the margin from the cliff.
 
+### Routing `fc2`: per-block bounds, and the machinery for a per-block scale
+
+`fc2` was refused on a single global bound — 4,761,873 at block 45, 9.1x over
+the cliff — and that refusal was right for a single global scale. It is the
+wrong instrument for routing, because the bound is not remotely uniform across
+blocks.
+
+The probe now records a per-block entry alongside the global worst, from the
+same GEMM (`SaturationProbe.record`, `alsoLabel:`). A partial run — 3 of 20
+faithful steps, preserved at `docs/bench/fc2-bound-partial.json` — already shows
+an **813x spread** across blocks, and the required scales fall out as:
+
+| required operand scale | blocks |
+|---|---:|
+| 1 (none needed) | 15 |
+| 1/2 to 1/8 | 17 |
+| 1/16 — the shipping scale | 9 |
+| 1/32 to 1/128 | 9 |
+
+**41 of 50 blocks need 1/16 or milder**, which is no more aggressive than what
+`qkv`, `attn out` and `fc1` already ship with. That is the case for routing
+`fc2` per block rather than refusing it wholesale: scaling everything by what
+the worst block needs would push the quiet blocks into the fp16 denormals the
+next section pins, and scaling everything by 1/16 leaves the loud blocks
+breaching the cliff as silent zeros. Per block, both ends are safe.
+
+**These numbers are a lower bound, not a calibration.** They come from 3 steps
+of 20, and the completed run in *`fc2` is refused* reached 4,761,873 where this
+partial one is at 2,069,736. A shipping table needs the full render. The
+refusal rule matters more than the table: any block whose required scale is more
+aggressive than the underflow floor allows stays on the GPU, and a partial bound
+can only understate what that is.
+
+The plumbing is in and unmeasured:
+
+- `ANELinearBackend.start(scale:)` threads a per-call operand scale through the
+  upload, the join, and the reducer cache — which is now keyed on the scale, so
+  a reducer compiled for one block cannot silently apply the wrong magnitude to
+  another.
+- The native merge path is gated on the default scale. It has no unscale and the
+  native pack has no scale, so the pair is self-consistent only there; a
+  per-block scale taking that path would have its upload scale dropped and
+  breach the very bound it was chosen to clear, silently.
+
+What is still missing: the table generator, the routing entry point with its
+refusal rule, a conformance test per routed block, and any measurement at all.
+
 ### The operand scale has an underflow floor
 
 Chasing the split's accuracy claim turned up something older. Every routed

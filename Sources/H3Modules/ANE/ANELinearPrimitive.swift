@@ -739,7 +739,7 @@ public enum ANELinearBackend {
             /// avoid.
             case routed(gpu: MLXArray, job: Engine.Job,
                         session: Session, slot: Slot, rows: Int, perDie: Int,
-                        x: MLXArray, weight: MLXArray)
+                        x: MLXArray, weight: MLXArray, scale: Float)
         }
         fileprivate let body: Body
         private var collected: MLXArray?
@@ -757,7 +757,7 @@ public enum ANELinearBackend {
             case .plain(let v):
                 result = v
             case .routed(let gpu, let job, let session, let slot, let rows, let perDie,
-                         let x, let weight):
+                         let x, let weight, let scale):
                 guard job.wait() else {
                     // The engine failed after the GPU shard was queued. `gpu`
                     // holds only the columns the GPU was given, so the whole
@@ -771,7 +771,7 @@ public enum ANELinearBackend {
                     return result
                 }
                 result = ANELinearBackend.join(gpu: gpu, slot: slot, session: session,
-                                               rows: rows, perDie: perDie)
+                                               rows: rows, perDie: perDie, scale: scale)
                 session.give(slot)
             }
             collected = result
@@ -796,7 +796,7 @@ public enum ANELinearBackend {
                 let parts = v.split(parts: 2, axis: -1)
                 result = silu(parts[0]) * parts[1]
             case .routed(let gpu, let job, let session, let slot, let rows, let perDie,
-                         let x, let weight):
+                         let x, let weight, let scale):
                 guard job.wait() else {
                     session.quarantine(slot)
                     ANELinearBackend.note("engine failed mid-flight", routed: false)
@@ -806,14 +806,15 @@ public enum ANELinearBackend {
                     swigluCollected = result
                     return result
                 }
-                if let fused = ANELinearBackend.joinSwiGLU(
+                if scale == ANELinearBackend.operandScale,
+                   let fused = ANELinearBackend.joinSwiGLU(
                     gpu: gpu, slot: slot, session: session,
                     rows: rows, perDie: perDie
                 ) {
                     result = fused
                 } else {
                     let full = ANELinearBackend.join(gpu: gpu, slot: slot, session: session,
-                                                     rows: rows, perDie: perDie)
+                                                     rows: rows, perDie: perDie, scale: scale)
                     let parts = full.split(parts: 2, axis: -1)
                     result = silu(parts[0]) * parts[1]
                 }
@@ -825,7 +826,7 @@ public enum ANELinearBackend {
 
         deinit {
             guard collected == nil, swigluCollected == nil,
-                  case .routed(_, let job, let session, let slot, _, _, _, _) = body
+                  case .routed(_, let job, let session, let slot, _, _, _, _, _) = body
             else { return }
             if job.wait() { session.give(slot) }
             else { session.quarantine(slot) }
@@ -885,8 +886,15 @@ public enum ANELinearBackend {
         return Pending(body).value()
     }
 
+    /// - Parameter scale: operand scale for this call. Defaults to the shipping
+    ///   1/16. `fc2` overrides it per block: its bound is 145x over the cliff at
+    ///   the worst block and varies by orders of magnitude between blocks, so a
+    ///   single scale would either fail to clear the peak or push the quiet
+    ///   blocks into the fp16 denormals that `operandScaleHasAnUnderflowFloor`
+    ///   pins.
     fileprivate static func start(x: MLXArray, weight: MLXArray,
-                                  share: Double? = nil) -> Pending.Body? {
+                                  share: Double? = nil,
+                                  scale: Float = operandScale) -> Pending.Body? {
         guard h3_ane_is_available(), x.ndim == 2, weight.ndim == 2 else { return nil }
 
         let s = x.shape[0], k = x.shape[1], n = weight.shape[0]
@@ -945,7 +953,7 @@ public enum ANELinearBackend {
             }
         } else {
             let scaled = Stream.withNewDefaultStream(device: .gpu) { () -> MLXArray in
-                let v = MLX.contiguous((x * operandScale).transposed().asType(.float16))
+                let v = MLX.contiguous((x * scale).transposed().asType(.float16))
                 v.eval()
                 return v
             }
@@ -999,7 +1007,7 @@ public enum ANELinearBackend {
 
         if splits > 1 { markSplitContraction(splits) }
         return .routed(gpu: gpuOut, job: job, session: session, slot: slot,
-                       rows: s, perDie: plan.perDie, x: x, weight: weight)
+                       rows: s, perDie: plan.perDie, x: x, weight: weight, scale: scale)
     }
 
     /// The fp32 accumulate, the unscale and the cast back — as **one** kernel.
@@ -1018,28 +1026,41 @@ public enum ANELinearBackend {
     ///
     /// One compiled reducer per `splits`, cached: compiling is not free and the
     /// split count is fixed for a render.
-    nonisolated(unsafe) private static var reducers: [Int: @Sendable ([MLXArray]) -> [MLXArray]] = [:]
+    private struct ReducerKey: Hashable { let splits: Int; let scale: Float }
+    nonisolated(unsafe) private static var reducers: [ReducerKey: @Sendable ([MLXArray]) -> [MLXArray]] = [:]
 
-    fileprivate static func reducer(splits: Int) -> @Sendable ([MLXArray]) -> [MLXArray] {
+    /// - Parameter scale: the operand scale this projection was uploaded with,
+    ///   which the reducer has to undo. It is part of the cache key because
+    ///   `fc2` needs a different scale per block and a reducer compiled for one
+    ///   scale silently produces the wrong magnitude for another.
+    fileprivate static func reducer(splits: Int, scale: Float) -> @Sendable ([MLXArray]) -> [MLXArray] {
         lock.lock(); defer { lock.unlock() }
-        if let cached = reducers[splits] { return cached }
-        let inverse = 1 / operandScale
+        let key = ReducerKey(splits: splits, scale: scale)
+        if let cached = reducers[key] { return cached }
+        let inverse = 1 / scale
         let made = MLX.compile { (parts: [MLXArray]) -> [MLXArray] in
             var acc = parts[0].asType(.float32)
             for i in 1 ..< parts.count { acc = acc + parts[i].asType(.float32) }
             return [(acc * inverse).asType(.bfloat16)]
         }
-        reducers[splits] = made
+        reducers[key] = made
         return made
     }
 
     /// Adopts the engine's two output surfaces and joins them to the GPU shard.
     fileprivate static func join(gpu: MLXArray, slot: Slot, session: Session,
-                                 rows s: Int, perDie: Int) -> MLXArray {
+                                 rows s: Int, perDie: Int,
+                                 scale: Float = operandScale) -> MLXArray {
         // The native merge reads exactly one output pair. A split projection
         // has `splits` of them to sum first, so it takes the MLX path below
         // until the kernel learns to accumulate.
-        if nativeIOEnabled, session.splits == 1, let device = metalDevice {
+        // The native merge has no unscale, and the native pack has no scale —
+        // the pair is only self-consistent at scale 1. A per-block `fc2` scale
+        // must not silently take this path: the upload would drop the scale and
+        // the bound it was chosen to clear would be breached, which fails as
+        // silent zeros rather than an error.
+        if nativeIOEnabled, session.splits == 1, scale == operandScale,
+           let device = metalDevice {
             let gpu = MLX.contiguous(gpu)
             let total = gpu.dim(-1) + 2 * perDie
             let output = MLXArray.zeros([s, total], dtype: .bfloat16)
@@ -1080,7 +1101,7 @@ public enum ANELinearBackend {
             let parts = (0 ..< session.splits).map {
                 adopt(die == 0 ? slot.ys[$0].0 : slot.ys[$0].1)
             }
-            return reducer(splits: session.splits)(parts)[0]
+            return reducer(splits: session.splits, scale: scale)(parts)[0]
         }
 
         // The `eval` is what copies the engine's output out of the shared

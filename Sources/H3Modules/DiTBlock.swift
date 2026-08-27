@@ -584,12 +584,23 @@ package final class SaturationProbe: @unchecked Sendable {
     package var splits = 8
 
     /// `x` is `[s, k]`, `weight` is `[n, k]` — the projection's own operands.
+    /// Records the worst bound for the projection **and** the worst for this
+    /// block on its own.
+    ///
+    /// A single global worst is enough to refuse a projection, which is what
+    /// this was built for. It is not enough to *route* one: a per-block operand
+    /// scale needs a per-block bound, and scaling every block by what block 45
+    /// needs would push the quiet blocks into fp16 denormals — the underflow
+    /// floor `operandScaleHasAnUnderflowFloor` pins. Both entries come from one
+    /// GEMM; only the bookkeeping is duplicated.
     package func record(_ label: String, x: MLXArray, weight: MLXArray) {
         guard enabled, !mlpIslandOnly, block >= 0 else { return }
-        measure(label, x: x, weight: weight, pieces: 1)
+        measure(label, x: x, weight: weight, pieces: 1,
+                alsoLabel: String(format: "%@ b%02d", label, block))
         let k = x.dim(1)
         if splits > 1, k % splits == 0 {
-            measure(label + " split\(splits)", x: x, weight: weight, pieces: splits)
+            measure(label + " split\(splits)", x: x, weight: weight, pieces: splits,
+                    alsoLabel: String(format: "%@ b%02d split%d", label, block, splits))
         }
     }
 
@@ -651,7 +662,8 @@ package final class SaturationProbe: @unchecked Sendable {
 
     private func measure(_ label: String, x: MLXArray, weight: MLXArray, pieces: Int,
                          contraction: Range<Int>? = nil,
-                         operandScale: Double = 0.0625) {
+                         operandScale: Double = 0.0625,
+                         alsoLabel: String? = nil) {
         // fp32 throughout: this is a safety bound, and bf16's three digits are
         // not enough to argue a factor-of-two margin with.
         let span = contraction ?? (0 ..< x.dim(1))
@@ -676,9 +688,10 @@ package final class SaturationProbe: @unchecked Sendable {
         }
         let peak = Double(MLX.stacked(pieceMax).max().item(Float.self))
         lock.lock()
-        if peak > (worst[label]?.bound ?? 0) {
-            worst[label] = (peak, block, progress, operandScale,
-                            span.lowerBound, span.upperBound)
+        for key in alsoLabel.map({ [label, $0] }) ?? [label]
+        where peak > (worst[key]?.bound ?? 0) {
+            worst[key] = (peak, block, progress, operandScale,
+                          span.lowerBound, span.upperBound)
         }
         lock.unlock()
         write()
