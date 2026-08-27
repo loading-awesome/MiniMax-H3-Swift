@@ -75,13 +75,21 @@ public struct RenderReceipt: Codable, Sendable {
         /// to prevent, and the arithmetic fields are part of what identifies
         /// the output.
         public let aneCFGOverlap: Bool?
+        /// A native Metal pack or IOSurface merge actually ran.
+        public let aneNativeIO: Bool?
+        /// Number of query tiles used by the block scheduler. Zero means the
+        /// observed render stayed on the ordinary whole-attention route.
+        public let aneQueryTiles: Int?
 
         public init(ditDType: String, aneRoutedProjections: [String],
-                    aneDeclinedProjections: [String], aneCFGOverlap: Bool? = nil) {
+                    aneDeclinedProjections: [String], aneCFGOverlap: Bool? = nil,
+                    aneNativeIO: Bool? = nil, aneQueryTiles: Int? = nil) {
             self.ditDType = ditDType
             self.aneRoutedProjections = aneRoutedProjections
             self.aneDeclinedProjections = aneDeclinedProjections
             self.aneCFGOverlap = aneCFGOverlap
+            self.aneNativeIO = aneNativeIO
+            self.aneQueryTiles = aneQueryTiles
         }
     }
 
@@ -132,7 +140,9 @@ public struct RenderReceipt: Codable, Sendable {
         // 5 adds `compute.aneCFGOverlap`. Optional, so a v4 file still reads,
         // but a v4 file cannot say whether the CFG branches were overlapped and
         // a v5 file can.
-        schemaVersion = 5
+        // 6 adds native-I/O and query-tile observations. They are optional so
+        // older receipts remain readable; nil means unrecorded, not disabled.
+        schemaVersion = 6
         self.jobID = jobID
         status = .running
         startedAt = .now

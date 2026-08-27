@@ -427,7 +427,7 @@ package struct H3MLP {
     }
 
     package func finish(_ pending: ANELinearBackend.Pending) -> MLXArray {
-        gateAndProject(pending.value())
+        matmul(pending.swiGLUValue(), fc2.T)
     }
 
     private func gateAndProject(_ h: MLXArray) -> MLXArray {
@@ -445,10 +445,10 @@ package struct H3MLP {
         // (34,649) and the failure is silent zeros, so it waits on a measured
         // per-block bound rather than on an operand scale that is merely
         // probably enough.
-        let h = ANELinearBackend.isEnabled
-            ? ANELinearBackend.project(x: x, weight: fc1, label: "fc1")
-            : matmul(x, fc1.T)
-        return gateAndProject(h)
+        if ANELinearBackend.isEnabled {
+            return finish(begin(x))
+        }
+        return gateAndProject(matmul(x, fc1.T))
     }
 }
 

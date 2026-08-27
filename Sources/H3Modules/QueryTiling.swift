@@ -43,7 +43,14 @@ package enum QueryTiling {
     }()
 
     package static var isEnabled: Bool {
-        ANELinearBackend.isEnabled && tiles > 1
+        // The tiled schedule is numerically conformant but the current Swift
+        // implementation measured slower than the ordinary routed block. Keep
+        // it as an explicit research arm until the native pack/merge path
+        // clears the production block gate; `H3_ANE=experimental` by itself
+        // must continue to select the measured 0.286 channel split.
+        ANELinearBackend.isEnabled
+            && ProcessInfo.processInfo.environment["H3_ANE_QUERY_TILING"] == "1"
+            && tiles > 1
     }
 
     /// Row spans of `count` rows split into `tiles` tiles.
@@ -78,6 +85,7 @@ package enum QueryTiling {
             return block.postAttention(prep, merged: block.attend(prep, context: context),
                                        index: index)
         }
+        ANELinearBackend.markQueryTiling(spans.count)
 
         // `q`, `k` and `v` are queued, not waited for. They must be *submitted*
         // before the tiles so the engine's `qkv` shard lands before the window

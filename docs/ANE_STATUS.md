@@ -213,10 +213,64 @@ millisecond the GPU attends while one MLX thread also runs sixteen uploads and
 every gather and norm in the block. Measured duty is about half that, which is
 the 1136 ms above. There is no version of this that clears the gate with room.
 
+### Native pack and merge, measured and closed
+
+The tiling result above left one hypothesis alive: that the engine sat at about
+half duty because of the per-tile MLX seam — a bf16→fp16 convert, a transpose, a
+CPU-visible `asData`, a memcpy in, and a three-way MLX join out, all multiplied
+by T. Removing that seam is the only version of query tiling with a path to the
+gate, so it was built: a Metal kernel packing straight into the engine's
+activation IOSurface, and merge kernels reading both output surfaces. Both are
+bit-identical to the seam they replace.
+
+**The seam was not the cost.** Paired in one process, alternating the two paths
+sample by sample because the effect is smaller than cross-process drift:
+
+| route | CPU seam | native | |
+|---|---:|---:|---:|
+| untiled, 0.286 (shipping) | 1035.1 ms | 1046.0 ms | 0.990x |
+| tiled T=4, 0.286 | 1094.5 ms | 1092.1 ms | 1.002x |
+
+Native I/O is very slightly *slower* on the route that ships and does nothing on
+the tiled one. Against the gate, with the shipping control measured before and
+after the candidate and agreeing to better than 2%:
+
+| candidate | control | candidate | gate |
+|---|---:|---:|---|
+| tiled T=4, post 0.40, native | 1053 ms | 1138.2 ms | misses |
+| tiled T=8, post 0.45, native | 1054 ms | 1184.6 ms | misses |
+
+The `tilingTax` measurement already said why: at T=8 the whole per-call overhead
+is 5% of the projection — 290.3 ms whole against 305.0 for eight calls. A native
+seam can attack that 5%. The missing duty is not there. It is the dependency
+chain: attention tile `i` must land before `out i` can be packed, and `out i`
+must land before `fc1 i` can be packed, and no amount of faster packing removes
+a serial edge.
+
+**Even giving up exactness does not clear it.** The fused SwiGLU merge is the
+only kernel that removes real work rather than seam — it emits `[tileS, ffn]`
+directly instead of materialising the 28,672-column `fc1` result — and it is
+the one kernel that does not reproduce MLX bit-for-bit, so it cannot ship. Run
+anyway as a ceiling probe, with the control drifting 0.2–0.4%:
+
+| candidate | control | candidate | gate |
+|---|---:|---:|---|
+| tiled T=4, post 0.40, fused | 1054.0 ms | 1130.9 ms | misses |
+| tiled T=8, post 0.45, fused | 1068.0 ms | 1190.4 ms | misses |
+
+Seven milliseconds, and still 120 above the gate. That is the ceiling of the
+direction, measured with the numerical constraint removed.
+
+The native pack and the linear merge stay behind `H3_ANE_NATIVE_IO=1` because
+they are exact and correct; the fused merge stays behind
+`H3_ANE_NATIVE_FUSED_SWIGLU=1` and must not be enabled until it has an oracle.
+Neither is on a production path.
+
 ### What would move it
 
-Nothing on this path — the CFG overlap and the query tiling were the two
-schedules the arithmetic allowed, and both are measured and closed. The engine would have to reach ~9.3 TFLOP/s — 18% above
+Nothing on this path. The CFG overlap and the query tiling were the two
+schedules the arithmetic allowed; both are measured and closed, and so is the
+native seam that was the last hypothesis for why tiling underdelivered. The engine would have to reach ~9.3 TFLOP/s — 18% above
 anything measured here — before overlapping beats not overlapping, and 1.5x on
 a guided step needs the pair under 1560 ms, which is below the GPU-only floor of
 1288.6 ms plus any engine share at all. The levers that remain all change the

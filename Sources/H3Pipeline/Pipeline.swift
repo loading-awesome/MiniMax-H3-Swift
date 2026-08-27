@@ -82,6 +82,8 @@ package enum PipelineRuntime {
         package let aneDeclinedProjections: [String]
         /// GPU attention on one CFG branch ran beside engine linears on the other.
         package let aneCFGOverlap: Bool
+        package let aneNativeIO: Bool
+        package let aneQueryTiles: Int
 
         package static func observed() -> ArithmeticProfile {
             let dtype: String
@@ -94,7 +96,9 @@ package enum PipelineRuntime {
                 ditDType: dtype,
                 aneRoutedProjections: ANELinearBackend.routedProjections,
                 aneDeclinedProjections: ANELinearBackend.declinedProjections,
-                aneCFGOverlap: ANELinearBackend.overlappedCFG)
+                aneCFGOverlap: ANELinearBackend.overlappedCFG,
+                aneNativeIO: ANELinearBackend.usedNativeIO,
+                aneQueryTiles: ANELinearBackend.queryTilesUsed)
         }
     }
 

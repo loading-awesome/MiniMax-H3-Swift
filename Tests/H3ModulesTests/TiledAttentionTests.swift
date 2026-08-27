@@ -152,6 +152,106 @@ struct TiledAttentionTests {
                      shippingMs / tiledMs))
     }
 
+    /// **The gate, with the control measured twice.**
+    ///
+    /// The shipping route is untiled at 0.286. The candidate is the tiled,
+    /// native-I/O route at whatever T and post share are configured. Changing
+    /// the share re-plans the shards and re-uploads both weight surfaces, so
+    /// these cannot be interleaved sample by sample; instead the control runs
+    /// before *and* after the candidate, and if the two controls disagree the
+    /// run is drifting and the comparison is void.
+    @Test(.enabled(if: ProcessInfo.processInfo.environment["H3_BIG"] != nil))
+    func tileGate() {
+        let f = CompiledBlockTests.productionBlock()
+        let tiles = QueryTiling.tiles
+        let post = ANELinearBackend.postShare
+
+        func median(_ body: () -> [MLXArray]) -> Double {
+            MLX.eval(body())
+            var v: [Double] = []
+            for _ in 0 ..< 5 {
+                let t = Date(); MLX.eval(body()); v.append(Date().timeIntervalSince(t))
+            }
+            return v.sorted()[2] * 1000
+        }
+        func control() -> Double {
+            ANELinearBackend.nativeIOEnabled = false
+            ANELinearBackend.postShare = 0.286
+            return median { [f.block(f.x, tEmb: f.tEmb, index: f.index, ropeTable: f.rope)] }
+        }
+
+        let before = control()
+        ANELinearBackend.nativeIOEnabled = true
+        ANELinearBackend.postShare = post
+        let candidate = median {
+            [QueryTiling.block(f.block, f.x, tEmb: f.tEmb, index: f.index,
+                               ropeTable: f.rope, tiles: tiles)]
+        }
+        let after = control()
+
+        let drift = abs(before - after) / min(before, after)
+        print(String(format: """
+
+          shipping control   %8.1f ms   (re-measured %8.1f ms, drift %.1f%%)
+          tiled T=%d post=%.3f native   %8.1f ms
+          against the gate   %8.1f ms   %@
+
+        """, before, after, 100 * drift, tiles, post, candidate, 1011.0,
+             candidate < 1011 ? "CLEARS" : "MISSES" as NSString))
+        #expect(drift < 0.03, "the control moved \(100 * drift)%; this comparison is void")
+    }
+
+    /// Does the native Metal pack and IOSurface merge actually buy anything?
+    ///
+    /// It replaces a bf16->fp16 convert, a transpose, a CPU-visible `asData`
+    /// and a memcpy with one kernel writing straight into the engine's
+    /// activation surface, and replaces the three-way MLX join with a kernel
+    /// reading both output surfaces. Both seams are per routed projection, so
+    /// tiling multiplies them by T — which is exactly the argument for building
+    /// them, and exactly why it has to be measured on the untiled route too.
+    ///
+    /// Interleaved in one process, because the effect is smaller than the
+    /// cross-process drift.
+    @Test(.enabled(if: ProcessInfo.processInfo.environment["H3_BIG"] != nil))
+    func nativeSeam() {
+        let f = CompiledBlockTests.productionBlock()
+        let tiles = QueryTiling.tiles
+        let post = ANELinearBackend.postShare
+        print("\n  ANE \(ANELinearBackend.isEnabled ? "ON" : "off")   T=\(tiles)"
+              + "   qkv \(ANELinearBackend.share)   post \(post)")
+
+        func untiled() -> [MLXArray] {
+            [f.block(f.x, tEmb: f.tEmb, index: f.index, ropeTable: f.rope)]
+        }
+        func tiled() -> [MLXArray] {
+            [QueryTiling.block(f.block, f.x, tEmb: f.tEmb, index: f.index,
+                               ropeTable: f.rope, tiles: tiles)]
+        }
+        func with(_ native: Bool, _ body: () -> [MLXArray]) -> [MLXArray] {
+            ANELinearBackend.nativeIOEnabled = native
+            defer { ANELinearBackend.nativeIOEnabled = false }
+            let out = body()
+            MLX.eval(out)
+            return out
+        }
+
+        // The seam must not move the numbers. It changes where bytes are
+        // converted, not what is computed.
+        let cpu = with(false, untiled), native = with(true, untiled)
+        #expect(MLX.abs(cpu[0] - native[0]).max().item(Float.self) == 0,
+                "the native pack/merge seam changed the block's arithmetic")
+
+        for (name, body) in [("untiled", untiled), ("tiled T=\(tiles)", tiled)] {
+            let m = BenchmarkSupport.interleavedArrays(
+                rounds: 5,
+                first: { with(false, body) }, second: { with(true, body) })
+            let cpuMs = m.first * 1000, nativeMs = m.second * 1000
+            print(String(format: "  %-14@ CPU seam %8.1f ms   native %8.1f ms   %6.3fx",
+                         name as NSString, cpuMs, nativeMs, cpuMs / nativeMs))
+        }
+        print("")
+    }
+
     @Test(.enabled(if: ProcessInfo.processInfo.environment["H3_BIG"] != nil))
     func tiledAttention() {
         MLXRandom.seed(11)

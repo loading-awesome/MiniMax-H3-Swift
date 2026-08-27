@@ -151,7 +151,9 @@ private enum RenderOperation {
         return .init(ditDType: profile.ditDType,
                      aneRoutedProjections: profile.aneRoutedProjections,
                      aneDeclinedProjections: profile.aneDeclinedProjections,
-                     aneCFGOverlap: profile.aneCFGOverlap)
+                     aneCFGOverlap: profile.aneCFGOverlap,
+                     aneNativeIO: profile.aneNativeIO,
+                     aneQueryTiles: profile.aneQueryTiles)
     }
 
     static func execute(jobID: UUID, request: RenderRequest, models: ModelSet,

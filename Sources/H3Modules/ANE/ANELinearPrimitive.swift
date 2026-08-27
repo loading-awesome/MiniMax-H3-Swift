@@ -2,8 +2,10 @@
 // Copyright 2026 Sean Kammerich
 
 import Foundation
+import Metal
 import MLX
 import MLXFast
+import MLXNN
 import H3ANEBridge
 
 /// Runs part of a linear projection on the Neural Engine while MLX runs the
@@ -45,9 +47,34 @@ public enum ANELinearBackend {
         return h3_ane_is_available()
     }()
 
+    /// The native IOSurface pack/merge path is a separately gated research
+    /// arm. It changes the synchronization seam, not the model decomposition,
+    /// and remains opt-in until its production block clears the 1.15x gate.
+    ///
+    /// A `var` so a benchmark can interleave it against the CPU seam in one
+    /// process. Cross-process comparison drifts about 4% here — more than the
+    /// effect being measured — and a control that moves more than the treatment
+    /// cannot decide anything. The two paths are bit-identical, so alternating
+    /// them changes only which seam is timed.
+    nonisolated(unsafe) static var nativeIOEnabled =
+        ProcessInfo.processInfo.environment["H3_ANE_NATIVE_IO"] == "1"
+
+    /// The fused nonlinear merge is kept behind a narrower research switch.
+    /// Its kernel is useful for measuring the ceiling, but random production
+    /// values have not yet matched MLX's fused bf16 SiLU bit-for-bit. Native
+    /// pack and linear merge remain exact without enabling this switch.
+    static var nativeFusedSwiGLUEnabled: Bool {
+        nativeIOEnabled
+            && ProcessInfo.processInfo.environment["H3_ANE_NATIVE_FUSED_SWIGLU"] == "1"
+    }
+
+    private static let metalDevice = MTLCreateSystemDefaultDevice()
+
     /// True after a guided step overlapped GPU attention on one branch with
     /// engine linears on the other. Observed for the receipt, like routing.
     nonisolated(unsafe) package static var overlappedCFG = false
+    nonisolated(unsafe) package static var usedNativeIO = false
+    nonisolated(unsafe) package static var queryTilesUsed = 0
 
     /// Whether a guided step overlaps the two CFG branches.
     ///
@@ -75,6 +102,16 @@ public enum ANELinearBackend {
     package static func markCFGOverlap() {
         lock.lock(); defer { lock.unlock() }
         overlappedCFG = true
+    }
+
+    package static func markNativeIO() {
+        lock.lock(); defer { lock.unlock() }
+        usedNativeIO = true
+    }
+
+    package static func markQueryTiling(_ count: Int) {
+        lock.lock(); defer { lock.unlock() }
+        queryTilesUsed = max(queryTilesUsed, count)
     }
 
     /// Operand scale. Exact in fp16 because it is a power of two, so it moves
@@ -279,6 +316,12 @@ public enum ANELinearBackend {
         private let lock = NSLock()
         private var idle: [Slot]
         private let available: DispatchSemaphore
+        private var poisoned = false
+
+        var isUsable: Bool {
+            lock.lock(); defer { lock.unlock() }
+            return !poisoned
+        }
 
         init?(s requested: Int, k: Int, perDie: Int) {
             let s = ANELinearBackend.paddedSequence(requested)
@@ -301,15 +344,30 @@ public enum ANELinearBackend {
 
         /// Blocks when every slot is in flight, which is the backpressure that
         /// keeps the queue from growing without bound.
-        func take() -> Slot {
+        func take() -> Slot? {
+            guard isUsable else { return nil }
             available.wait()
             lock.lock(); defer { lock.unlock() }
+            guard !poisoned else {
+                available.signal()
+                return nil
+            }
             return idle.removeLast()
         }
 
         func give(_ slot: Slot) {
             lock.lock(); idle.append(slot); lock.unlock()
             available.signal()
+        }
+
+        /// `evaluateWithQoS:` has no cancellation operation. After a failed
+        /// pair the private runtime may still own these mutable surfaces, so
+        /// retire the whole session and deliberately keep this slot out of its
+        /// free list rather than racing a fallback request against stale ANE
+        /// writes.
+        func quarantine(_ slot: Slot) {
+            lock.lock(); poisoned = true; lock.unlock()
+            _ = slot
         }
 
         deinit {
@@ -349,7 +407,11 @@ public enum ANELinearBackend {
     private static func session(s: Int, k: Int, perDie: Int) -> Session? {
         let key = "\(paddedSequence(s))x\(k)x\(perDie)"
         lock.lock(); defer { lock.unlock() }
-        if let cached = sessions[key] { return cached }
+        if let cached = sessions[key] {
+            if cached.isUsable { return cached }
+            refused.insert(key)
+            return nil
+        }
         if refused.contains(key) { return nil }
         guard let made = Session(s: s, k: k, perDie: perDie) else {
             refused.insert(key)
@@ -492,6 +554,7 @@ public enum ANELinearBackend {
         }
         fileprivate let body: Body
         private var collected: MLXArray?
+        private var swigluCollected: MLXArray?
         fileprivate init(_ body: Body) { self.body = body }
 
         /// Waits for the engine, adopts its output, and joins the two halves.
@@ -512,7 +575,7 @@ public enum ANELinearBackend {
                     // projection is recomputed rather than returned in part.
                     // Slower than the plain path and correct, which is the only
                     // acceptable direction for this to fail in.
-                    session.give(slot)
+                    session.quarantine(slot)
                     ANELinearBackend.note("engine failed mid-flight", routed: false)
                     result = MLX.matmul(x, weight.transposed())
                     collected = result
@@ -526,12 +589,57 @@ public enum ANELinearBackend {
             return result
         }
 
+        /// Collects an `fc1` projection directly as `SiLU(gate) * up` when the
+        /// native merge path is active. This avoids materialising and joining
+        /// the full 28,672-column tensor only to split it again immediately.
+        package func swiGLUValue() -> MLXArray {
+            if let swigluCollected { return swigluCollected }
+            if let collected {
+                let parts = collected.split(parts: 2, axis: -1)
+                let result = silu(parts[0]) * parts[1]
+                swigluCollected = result
+                return result
+            }
+
+            let result: MLXArray
+            switch body {
+            case .plain(let v):
+                let parts = v.split(parts: 2, axis: -1)
+                result = silu(parts[0]) * parts[1]
+            case .routed(let gpu, let job, let session, let slot, let rows, let perDie,
+                         let x, let weight):
+                guard job.wait() else {
+                    session.quarantine(slot)
+                    ANELinearBackend.note("engine failed mid-flight", routed: false)
+                    let full = MLX.matmul(x, weight.transposed())
+                    let parts = full.split(parts: 2, axis: -1)
+                    result = silu(parts[0]) * parts[1]
+                    swigluCollected = result
+                    return result
+                }
+                if let fused = ANELinearBackend.joinSwiGLU(
+                    gpu: gpu, slot: slot, session: session,
+                    rows: rows, perDie: perDie
+                ) {
+                    result = fused
+                } else {
+                    let full = ANELinearBackend.join(gpu: gpu, slot: slot, session: session,
+                                                     rows: rows, perDie: perDie)
+                    let parts = full.split(parts: 2, axis: -1)
+                    result = silu(parts[0]) * parts[1]
+                }
+                session.give(slot)
+            }
+            swigluCollected = result
+            return result
+        }
+
         deinit {
-            guard collected == nil,
+            guard collected == nil, swigluCollected == nil,
                   case .routed(_, let job, let session, let slot, _, _, _, _) = body
             else { return }
-            _ = job.wait()
-            session.give(slot)
+            if job.wait() { session.give(slot) }
+            else { session.quarantine(slot) }
         }
     }
 
@@ -590,7 +698,7 @@ public enum ANELinearBackend {
 
         // A slot owns one mutable activation and two mutable outputs from here
         // until `Pending.value` has copied the results into MLX.
-        let slot = session.take()
+        guard let slot = session.take() else { return nil }
 
         // Order matters more than anything else in this function.
         //
@@ -618,16 +726,32 @@ public enum ANELinearBackend {
         //
         // On a separate stream this waits only for `x` itself, through the
         // cross-stream dependency MLX inserts, and the attention keeps running.
-        let scaled = Stream.withNewDefaultStream(device: .gpu) { () -> MLXArray in
-            let v = MLX.contiguous((x * operandScale).transposed().asType(.float16))
-            v.eval()
-            return v
-        }
-        let uploaded = scaled.asData(access: .noCopyIfContiguous).data.withUnsafeBytes { raw -> Bool in
-            guard let base = raw.baseAddress else { return false }
-            return h3_ane_tensor_write_prefix(slot.x, base, Int32(k), Int32(s))
+        let uploaded: Bool
+        if nativeIOEnabled, let device = metalDevice {
+            let source = Stream.withNewDefaultStream(device: .gpu) { () -> MLXArray in
+                let v = MLX.contiguous(x)
+                v.eval()
+                return v
+            }
+            if let buffer = source.asMTLBuffer(device: device, noCopy: true) {
+                uploaded = h3_ane_pack_bf16_to_fp16_transpose(
+                    buffer.contents(), slot.x, Int32(s), Int32(k), nil)
+            } else {
+                uploaded = false
+            }
+        } else {
+            let scaled = Stream.withNewDefaultStream(device: .gpu) { () -> MLXArray in
+                let v = MLX.contiguous((x * operandScale).transposed().asType(.float16))
+                v.eval()
+                return v
+            }
+            uploaded = scaled.asData(access: .noCopyIfContiguous).data.withUnsafeBytes { raw -> Bool in
+                guard let base = raw.baseAddress else { return false }
+                return h3_ane_tensor_write_prefix(slot.x, base, Int32(k), Int32(s))
+            }
         }
         guard uploaded else { session.give(slot); return nil }
+        if nativeIOEnabled { markNativeIO() }
 
         // The engine goes to its own thread and this one returns immediately.
         // Nothing below here blocks, so the caller keeps the GPU busy while the
@@ -656,6 +780,20 @@ public enum ANELinearBackend {
     /// Adopts the engine's two output surfaces and joins them to the GPU shard.
     fileprivate static func join(gpu: MLXArray, slot: Slot, session: Session,
                                  rows s: Int, perDie: Int) -> MLXArray {
+        if nativeIOEnabled, let device = metalDevice {
+            let gpu = MLX.contiguous(gpu)
+            let total = gpu.dim(-1) + 2 * perDie
+            let output = MLXArray.zeros([s, total], dtype: .bfloat16)
+            if let gpuBuffer = gpu.asMTLBuffer(device: device, noCopy: true),
+               let outputBuffer = output.asMTLBuffer(device: device, noCopy: true),
+               h3_ane_merge_attn_out(
+                   gpuBuffer.contents(), slot.y0, slot.y1, outputBuffer.contents(),
+                   Int32(s), Int32(gpu.dim(-1)), Int32(perDie), Int32(perDie), nil
+               ) {
+                return output
+            }
+        }
+
         // Read the results by aliasing the output surfaces rather than copying
         // them home: `MLXArray(rawPointer:)` transfers a managed external
         // allocation into MLX without copying, per mlx-swift's initializer
@@ -680,5 +818,23 @@ public enum ANELinearBackend {
         MLX.eval(ane0, ane1)
 
         return MLX.concatenated([gpu, ane0, ane1], axis: -1)
+    }
+
+    /// Native `fc1` merge that emits the gated FFN activation directly.
+    fileprivate static func joinSwiGLU(gpu: MLXArray, slot: Slot, session: Session,
+                                       rows s: Int, perDie: Int) -> MLXArray? {
+        guard nativeFusedSwiGLUEnabled, let device = metalDevice else { return nil }
+        let gpu = MLX.contiguous(gpu)
+        let total = gpu.dim(-1) + 2 * perDie
+        guard total.isMultiple(of: 2) else { return nil }
+        let output = MLXArray.zeros([s, total / 2], dtype: .bfloat16)
+        guard let gpuBuffer = gpu.asMTLBuffer(device: device, noCopy: true),
+              let outputBuffer = output.asMTLBuffer(device: device, noCopy: true),
+              h3_ane_merge_fc1_swiglu(
+                  gpuBuffer.contents(), slot.y0, slot.y1, outputBuffer.contents(),
+                  Int32(s), Int32(gpu.dim(-1)), Int32(perDie), Int32(perDie), nil
+              )
+        else { return nil }
+        return output
     }
 }

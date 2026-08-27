@@ -303,6 +303,14 @@ package struct H3Transformer {
                      tapsOut: inout Taps,
                      stepCache: H3StepCache?,
                      stepIndex: Int?, stepCount: Int?) {
+        let evalBlock: (DiTBlock, MLXArray, AttentionContext?) -> MLXArray = { b, xIn, ctx in
+            if QueryTiling.isEnabled {
+                return QueryTiling.block(b, xIn, tEmb: tEmb, index: index, ropeTable: table, context: ctx)
+            } else {
+                return b(xIn, tEmb: tEmb, index: index, ropeTable: table, context: ctx)
+            }
+        }
+
         // Cross-step residual reuse. Block 0 always runs and doubles as the
         // probe; if its residual barely moved since the previous step, the
         // other 49 blocks are skipped and last step's total residual is
@@ -318,13 +326,7 @@ package struct H3Transformer {
             // and the probe signal the cache thresholds on is 0.077: the
             // approximation is 1.7x the quantity being measured. Sparsify here
             // and the cache stops thresholding on how much the step moved and
-            // starts thresholding on backend noise — reusing when it should not
-            // and refusing when it should, with every shape still correct.
-            //
-            // The cost is 1/50th of the stack. Passing nil, rather than asking
-            // the backend to exclude block 0 itself, keeps the rule where its
-            // reason lives instead of in each backend's policy.
-            h = blocks[0](h, tEmb: tEmb, index: index, ropeTable: table, context: nil)
+            h = evalBlock(blocks[0], h, nil)
             if Self.tappedBlocks.contains(0) { tapsOut.blocks[0] = h }
 
             switch cache.decide(probe: h - hIn, audioRange: layout.audioRange,
@@ -335,18 +337,16 @@ package struct H3Transformer {
                 h = hIn + residual
             case .runFull:
                 for i in 1 ..< blocks.count {
-                    h = blocks[i](h, tEmb: tEmb, index: index, ropeTable: table,
-                                  context: attentionContext(block: i, stepIndex: stepIndex,
-                                                            stepCount: stepCount, layout: layout))
+                    h = evalBlock(blocks[i], h, attentionContext(block: i, stepIndex: stepIndex,
+                                                                 stepCount: stepCount, layout: layout))
                     if Self.tappedBlocks.contains(i) { tapsOut.blocks[i] = h }
                 }
                 cache.record(totalResidual: h - hIn)
             }
         } else {
             for (i, block) in blocks.enumerated() {
-                h = block(h, tEmb: tEmb, index: index, ropeTable: table,
-                          context: attentionContext(block: i, stepIndex: stepIndex,
-                                                    stepCount: stepCount, layout: layout))
+                h = evalBlock(block, h, attentionContext(block: i, stepIndex: stepIndex,
+                                                         stepCount: stepCount, layout: layout))
                 if Self.tappedBlocks.contains(i) { tapsOut.blocks[i] = h }
             }
         }

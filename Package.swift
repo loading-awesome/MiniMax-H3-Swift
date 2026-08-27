@@ -53,6 +53,7 @@ let package = Package(
             linkerSettings: [
                 .linkedFramework("Foundation"),
                 .linkedFramework("IOSurface"),
+                .linkedFramework("Metal"),
             ]
         ),
         .target(

@@ -4,6 +4,7 @@
 import Testing
 import Foundation
 import MLX
+import MLXNN
 import H3Foundation
 import H3ANEBridge
 @testable import H3Modules
@@ -244,6 +245,49 @@ struct ANERealPrimitiveTests {
         let up   = Self.relRMS(reference[0..., n / 2 ..< n], actual[0..., n / 2 ..< n])
         #expect(gate < Self.tolerance, "SwiGLU gate half: relRMS \(gate)")
         #expect(up < Self.tolerance, "SwiGLU up half: relRMS \(up)")
+    }
+
+    /// The native route does not materialise fc1's complete gate/up tensor: it
+    /// merges the three column shards and applies `SiLU(gate) * up` in one Metal
+    /// pass. Pin that optimization against the ordinary MLX expression with
+    /// different gate and up weights so reversing the halves cannot pass.
+    @Test
+    func fusedFC1MatchesMLX() {
+        let s = 64, hidden = 128, ffn = 512
+        let x = MLXRandom.normal([s, hidden]).asType(.bfloat16)
+        let gate = (MLXRandom.normal([ffn, hidden]) + 0.75).asType(.bfloat16)
+        let up = (MLXRandom.normal([ffn, hidden]) - 0.25).asType(.bfloat16)
+        let fc1 = concatenated([gate, up], axis: 0)
+        let fc2 = MLXRandom.normal([hidden, ffn]).asType(.bfloat16)
+        MLX.eval(x, fc1, fc2)
+
+        let mlp = H3MLP(fc1: fc1, fc2: fc2)
+        let fusedActivation = mlp.begin(x).swiGLUValue()
+        guard let joined = ANELinearBackend.route(x: x, qkvWeight: fc1) else {
+            Issue.record("route declined the fused fc1 oracle"); return
+        }
+        let joinedHalves = joined.split(parts: 2, axis: -1)
+        let joinedActivation = silu(joinedHalves[0]) * joinedHalves[1]
+        MLX.eval(fusedActivation, joinedActivation)
+        let fusedDiff = MLX.abs(fusedActivation - joinedActivation).max().item(Float.self)
+        let fusedRel = Self.relRMS(joinedActivation, fusedActivation)
+        let fusedHead = fusedActivation[0, 0 ..< 8].asType(.float32).asArray(Float.self)
+        let joinedHead = joinedActivation[0, 0 ..< 8].asType(.float32).asArray(Float.self)
+        // These are two independent ANE evaluations. The private reduction can
+        // differ by a bf16 ULP on the small fixture, so use the engine's pinned
+        // numerical tolerance here; the production tiled-block test separately
+        // requires bit identity between schedules at one fixed route.
+        #expect(fusedRel < Self.tolerance,
+                "native fc1 collection changed SwiGLU; relRMS \(fusedRel), max \(fusedDiff), fused \(fusedHead), joined \(joinedHead)")
+
+        let actual = MLX.matmul(fusedActivation, fc2.transposed())
+        let projected = MLX.matmul(x, fc1.transposed())
+        let halves = projected.split(parts: 2, axis: -1)
+        let reference = MLX.matmul(silu(halves[0]) * halves[1], fc2.transposed())
+        MLX.eval(actual, reference)
+
+        let rel = Self.relRMS(reference, actual)
+        #expect(rel < 4e-3, "native fused fc1/SwiGLU changed the MLP: relRMS \(rel)")
     }
 
     /// The shard plan keeps heads and 64-byte rows intact, and leaves the

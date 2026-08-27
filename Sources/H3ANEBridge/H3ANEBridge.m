@@ -212,6 +212,7 @@ bool h3_ane_is_available(void) {
 struct H3ANEProgram {
     int s, k, n;
     H3ANEForm form;
+    _Atomic bool poisoned;
     id _Nullable model;             // _ANEInMemoryModel
     NSString * _Nullable scratchDir;
 };
@@ -398,7 +399,7 @@ int h3_ane_program_n(H3ANEProgram *p) { return p ? p->n : 0; }
 
 bool h3_ane_run(H3ANEProgram *p, H3ANETensor *x, H3ANETensor *w, H3ANETensor *y,
                 int instance_hint) {
-    if (!p || !p->model || !x || !w || !y) return false;
+    if (!p || !p->model || !x || !w || !y || atomic_load(&p->poisoned)) return false;
     // The engine reads whatever the surfaces hold; if they were allocated for
     // a different shape than the program was compiled for it produces numbers
     // rather than an error, so check here.
@@ -436,15 +437,352 @@ bool h3_ane_run(H3ANEProgram *p, H3ANETensor *x, H3ANETensor *w, H3ANETensor *y,
 
 bool h3_ane_run_pair(H3ANEProgram *p0, H3ANETensor *x0, H3ANETensor *w0, H3ANETensor *y0,
                      H3ANEProgram *p1, H3ANETensor *x1, H3ANETensor *w1, H3ANETensor *y1) {
-    __block bool ok0 = false, ok1 = false;
-    dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
-    dispatch_group_t group = dispatch_group_create();
+    H3ANEJob *job = h3_ane_job_submit_pair(p0, x0, w0, y0, p1, x1, w1, y1);
+    if (!job) return false;
+    // Bound a wedged private driver without mistaking first-use JIT for a
+    // failure. The steady-state path is far below this limit.
+    bool ok = h3_ane_job_wait(job, 30000000000ULL);
+    h3_ane_job_retire(job);
+    return ok;
+}
 
-    dispatch_group_async(group, q, ^{ ok0 = h3_ane_run(p0, x0, w0, y0, 1); });
-    // The second shard runs here rather than on another queue slot so one of
-    // the two always makes progress even under a saturated global queue.
-    ok1 = h3_ane_run(p1, x1, w1, y1, 2);
-    dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
+#pragma mark - Asynchronous Bounded Job API (Phase 2)
 
-    return ok0 && ok1;
+struct H3ANEJob {
+    _Atomic H3ANEJobState state;
+    _Atomic uint32_t references;
+    uint64_t submitTime;
+    uint64_t completeTime;
+    dispatch_group_t _Nullable group;
+    H3ANEProgram *p0;
+    H3ANEProgram *p1;
+    bool ok0;
+    bool ok1;
+};
+
+static void H3ANEJobRelease(H3ANEJob *job) {
+    if (atomic_fetch_sub(&job->references, 1) == 1) free(job);
+}
+
+H3ANEJob* h3_ane_job_submit_pair(H3ANEProgram *p0, H3ANETensor *x0, H3ANETensor *w0, H3ANETensor *y0,
+                                 H3ANEProgram *p1, H3ANETensor *x1, H3ANETensor *w1, H3ANETensor *y1) {
+    if (!p0 || !p1 || !x0 || !x1 || !w0 || !w1 || !y0 || !y1) return NULL;
+
+    H3ANEJob *job = (H3ANEJob *)calloc(1, sizeof(H3ANEJob));
+    if (!job) return NULL;
+
+    job->state = H3ANEJobStateRunning;
+    // The caller and both blocks own the job. A timeout may retire the caller
+    // while evaluateWithQoS is still blocked; the worker references prevent a
+    // use-after-free until the private calls really return.
+    job->references = 3;
+    job->submitTime = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+    job->group = dispatch_group_create();
+    job->p0 = p0;
+    job->p1 = p1;
+
+    dispatch_queue_t q0 = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
+    dispatch_queue_t q1 = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
+
+    dispatch_group_async(job->group, q0, ^{
+        job->ok0 = h3_ane_run(p0, x0, w0, y0, 1);
+        H3ANEJobRelease(job);
+    });
+    dispatch_group_async(job->group, q1, ^{
+        job->ok1 = h3_ane_run(p1, x1, w1, y1, 2);
+        H3ANEJobRelease(job);
+    });
+
+    return job;
+}
+
+bool h3_ane_job_wait(H3ANEJob *job, uint64_t timeout_ns) {
+    if (!job) return false;
+    if (job->state == H3ANEJobStateComplete) return (job->ok0 && job->ok1);
+    if (job->state == H3ANEJobStateError) return false;
+
+    dispatch_time_t t = (timeout_ns == 0) ? DISPATCH_TIME_FOREVER : dispatch_time(DISPATCH_TIME_NOW, timeout_ns);
+    long res = dispatch_group_wait(job->group, t);
+
+    if (res == 0) {
+        job->completeTime = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+        bool ok = (job->ok0 && job->ok1);
+        job->state = ok ? H3ANEJobStateComplete : H3ANEJobStateError;
+        return ok;
+    } else {
+        // There is no cancellation selector. Refuse future submissions to the
+        // two programs; the caller must quarantine the mutable surfaces that
+        // these evaluations may still be reading and writing.
+        NSLog(@"[H3ANEBridge] Job evaluation timed out after %llu ns", timeout_ns);
+        atomic_store(&job->p0->poisoned, true);
+        atomic_store(&job->p1->poisoned, true);
+        job->state = H3ANEJobStateError;
+        return false;
+    }
+}
+
+H3ANEJobState h3_ane_job_status(H3ANEJob *job) {
+    return job ? job->state : H3ANEJobStateError;
+}
+
+void h3_ane_job_retire(H3ANEJob *job) {
+    if (!job) return;
+    H3ANEJobRelease(job);
+}
+
+#pragma mark - Native Metal Pack & Merge Operations (Phases 3 & 4)
+
+#import <Metal/Metal.h>
+
+static id<MTLDevice> gMetalDevice = nil;
+static id<MTLCommandQueue> gCommandQueue = nil;
+static id<MTLComputePipelineState> gPackPipelineState = nil;
+static id<MTLComputePipelineState> gMergeAttnPipelineState = nil;
+static id<MTLComputePipelineState> gMergeFC1PipelineState = nil;
+static dispatch_once_t gMetalOnceToken;
+
+static bool InitMetalKernels(void) {
+    dispatch_once(&gMetalOnceToken, ^{
+        gMetalDevice = MTLCreateSystemDefaultDevice();
+        if (!gMetalDevice) return;
+        gCommandQueue = [gMetalDevice newCommandQueue];
+
+        NSError *error = nil;
+        NSString *metalSource = @""
+            "#include <metal_stdlib>\n"
+            "using namespace metal;\n"
+            "inline ushort h3_bf16_rne(float v) {\n"
+            "    uint b = as_type<uint>(v);\n"
+            "    return (ushort)((b + 0x7fffu + ((b >> 16) & 1u)) >> 16);\n"
+            "}\n"
+            "inline float h3_bf16_value(float v) {\n"
+            "    return as_type<float>(((uint)h3_bf16_rne(v)) << 16);\n"
+            "}\n"
+            "inline float h3_read_shard(device const ushort* gpu, device const half* a0,\n"
+            "    device const half* a1, uint row, uint col, uint ng, uint n0, uint n1) {\n"
+            "    if (col < ng) return as_type<float>(((uint)gpu[row * ng + col]) << 16);\n"
+            "    if (col < ng + n0) return h3_bf16_value(((float)a0[row * n0 + col - ng]) * 16.0f);\n"
+            "    return h3_bf16_value(((float)a1[row * n1 + col - ng - n0]) * 16.0f);\n"
+            "}\n"
+            "kernel void h3_pack_bf16_to_fp16_transpose(\n"
+            "    device const ushort* src_bf16 [[buffer(0)]],\n"
+            "    device half* dst_fp16         [[buffer(1)]],\n"
+            "    constant uint& s              [[buffer(2)]],\n"
+            "    constant uint& k              [[buffer(3)]],\n"
+            "    constant uint& padded_s       [[buffer(4)]],\n"
+            "    uint2 gid                     [[thread_position_in_grid]]\n"
+            ") {\n"
+            "    uint row = gid.y; uint col = gid.x;\n"
+            "    if (row >= s || col >= k) return;\n"
+            "    ushort u = src_bf16[row * k + col];\n"
+            "    float val = as_type<float>(((uint)u) << 16);\n"
+            "    half scaled = (half)(val * 0.0625f);\n"
+            "    dst_fp16[col * padded_s + row] = scaled;\n"
+            "}\n"
+            "kernel void h3_merge_attn_out(\n"
+            "    device const ushort* gpu_suffix_bf16 [[buffer(0)]],\n"
+            "    device const half* ane0_fp16         [[buffer(1)]],\n"
+            "    device const half* ane1_fp16         [[buffer(2)]],\n"
+            "    device ushort* dst_bf16              [[buffer(3)]],\n"
+            "    constant uint& s                     [[buffer(4)]],\n"
+            "    constant uint& n_gpu                 [[buffer(5)]],\n"
+            "    constant uint& n_ane0                [[buffer(6)]],\n"
+            "    constant uint& n_ane1                [[buffer(7)]],\n"
+            "    uint2 gid                            [[thread_position_in_grid]]\n"
+            ") {\n"
+            "    uint row = gid.y; uint col = gid.x;\n"
+            "    uint n_total = n_gpu + n_ane0 + n_ane1;\n"
+            "    if (row >= s || col >= n_total) return;\n"
+            "    float val = 0.0f;\n"
+            "    if (col < n_gpu) {\n"
+            "        ushort u = gpu_suffix_bf16[row * n_gpu + col];\n"
+            "        val = as_type<float>(((uint)u) << 16);\n"
+            "    } else if (col < n_gpu + n_ane0) {\n"
+            "        uint c = col - n_gpu;\n"
+            "        val = ((float)ane0_fp16[row * n_ane0 + c]) * 16.0f;\n"
+            "    } else {\n"
+            "        uint c = col - (n_gpu + n_ane0);\n"
+            "        val = ((float)ane1_fp16[row * n_ane1 + c]) * 16.0f;\n"
+            "    }\n"
+            "    dst_bf16[row * n_total + col] = h3_bf16_rne(val);\n"
+            "}\n"
+            "kernel void h3_merge_fc1_swiglu(\n"
+            "    device const ushort* gpu_suffix_bf16 [[buffer(0)]],\n"
+            "    device const half* ane0_fp16         [[buffer(1)]],\n"
+            "    device const half* ane1_fp16         [[buffer(2)]],\n"
+            "    device ushort* dst_bf16              [[buffer(3)]],\n"
+            "    constant uint& s                     [[buffer(4)]],\n"
+            "    constant uint& n_gpu                 [[buffer(5)]],\n"
+            "    constant uint& n_ane0                [[buffer(6)]],\n"
+            "    constant uint& n_ane1                [[buffer(7)]],\n"
+            "    uint2 gid                            [[thread_position_in_grid]]\n"
+            ") {\n"
+            "    uint row = gid.y; uint col = gid.x;\n"
+            "    uint ffn_dim = (n_gpu + n_ane0 + n_ane1) / 2;\n"
+            "    if (row >= s || col >= ffn_dim) return;\n"
+            "    uint gate_col = col; uint up_col = col + ffn_dim;\n"
+            "    float g = h3_read_shard(gpu_suffix_bf16, ane0_fp16, ane1_fp16,\n"
+            "                            row, gate_col, n_gpu, n_ane0, n_ane1);\n"
+            "    float u = h3_read_shard(gpu_suffix_bf16, ane0_fp16, ane1_fp16,\n"
+            "                            row, up_col, n_gpu, n_ane0, n_ane1);\n"
+            "    float tail = 1.0f / (1.0f + exp(abs(g)));\n"
+            "    float sigmoid_g = h3_bf16_value(g < 0.0f ? tail : 1.0f - tail);\n"
+            "    float silu_g = h3_bf16_value(g * sigmoid_g);\n"
+            "    dst_bf16[row * ffn_dim + col] = h3_bf16_rne(silu_g * u);\n"
+            "}\n";
+
+        id<MTLLibrary> lib = [gMetalDevice newLibraryWithSource:metalSource options:nil error:&error];
+        if (!lib) { NSLog(@"[H3ANEBridge] Metal lib init failed: %@", error); return; }
+
+        id<MTLFunction> fnPack = [lib newFunctionWithName:@"h3_pack_bf16_to_fp16_transpose"];
+        id<MTLFunction> fnAttn = [lib newFunctionWithName:@"h3_merge_attn_out"];
+        id<MTLFunction> fnFC1  = [lib newFunctionWithName:@"h3_merge_fc1_swiglu"];
+
+        if (fnPack) gPackPipelineState = [gMetalDevice newComputePipelineStateWithFunction:fnPack error:nil];
+        if (fnAttn) gMergeAttnPipelineState = [gMetalDevice newComputePipelineStateWithFunction:fnAttn error:nil];
+        if (fnFC1)  gMergeFC1PipelineState  = [gMetalDevice newComputePipelineStateWithFunction:fnFC1 error:nil];
+    });
+
+    return (gMetalDevice && gCommandQueue && gPackPipelineState && gMergeAttnPipelineState && gMergeFC1PipelineState);
+}
+
+bool h3_ane_pack_bf16_to_fp16_transpose(const void *srcBF16, H3ANETensor *dstTensor, int s, int k, void *commandQueue) {
+    if (!srcBF16 || !dstTensor) return false;
+    if (!InitMetalKernels()) return false;
+
+    id<MTLCommandQueue> queue = commandQueue ? (__bridge id<MTLCommandQueue>)commandQueue : gCommandQueue;
+    void *dstPtr = h3_ane_tensor_ptr(dstTensor);
+    if (!dstPtr) return false;
+
+    uint uS = (uint)s;
+    uint uK = (uint)k;
+    uint uPaddedS = (uint)dstTensor->width;
+
+    size_t srcBytes = s * k * 2;
+    size_t dstBytes = dstTensor->rows * dstTensor->rowBytes;
+
+    id<MTLBuffer> srcBuf = [gMetalDevice newBufferWithBytesNoCopy:(void*)srcBF16 length:srcBytes options:MTLResourceStorageModeShared deallocator:nil];
+    id<MTLBuffer> dstBuf = [gMetalDevice newBufferWithBytesNoCopy:dstPtr length:dstBytes options:MTLResourceStorageModeShared deallocator:nil];
+
+    if (!srcBuf || !dstBuf) return false;
+
+    id<MTLCommandBuffer> cmd = [queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+
+    [enc setComputePipelineState:gPackPipelineState];
+    [enc setBuffer:srcBuf offset:0 atIndex:0];
+    [enc setBuffer:dstBuf offset:0 atIndex:1];
+    [enc setBytes:&uS length:sizeof(uint) atIndex:2];
+    [enc setBytes:&uK length:sizeof(uint) atIndex:3];
+    [enc setBytes:&uPaddedS length:sizeof(uint) atIndex:4];
+
+    MTLSize threadgroupSize = MTLSizeMake(16, 16, 1);
+    MTLSize gridSize = MTLSizeMake((k + 15) / 16 * 16, (s + 15) / 16 * 16, 1);
+    [enc dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
+    [enc endEncoding];
+
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    return (cmd.status == MTLCommandBufferStatusCompleted);
+}
+
+bool h3_ane_merge_attn_out(const void *gpuSuffixBF16, H3ANETensor *ane0Tensor, H3ANETensor *ane1Tensor, void *dstBF16, int s, int nGpu, int nAne0, int nAne1, void *commandQueue) {
+    if (!gpuSuffixBF16 || !ane0Tensor || !ane1Tensor || !dstBF16) return false;
+    if (!InitMetalKernels()) return false;
+
+    id<MTLCommandQueue> queue = commandQueue ? (__bridge id<MTLCommandQueue>)commandQueue : gCommandQueue;
+    void *ane0Ptr = h3_ane_tensor_ptr(ane0Tensor);
+    void *ane1Ptr = h3_ane_tensor_ptr(ane1Tensor);
+    if (!ane0Ptr || !ane1Ptr) return false;
+
+    uint uS = (uint)s;
+    uint uNGpu = (uint)nGpu;
+    uint uNAne0 = (uint)nAne0;
+    uint uNAne1 = (uint)nAne1;
+    uint nTotal = uNGpu + uNAne0 + uNAne1;
+
+    size_t gpuBytes = s * nGpu * 2;
+    size_t ane0Bytes = ane0Tensor->rows * ane0Tensor->rowBytes;
+    size_t ane1Bytes = ane1Tensor->rows * ane1Tensor->rowBytes;
+    size_t dstBytes = s * nTotal * 2;
+
+    id<MTLBuffer> gpuBuf = [gMetalDevice newBufferWithBytesNoCopy:(void*)gpuSuffixBF16 length:gpuBytes options:MTLResourceStorageModeShared deallocator:nil];
+    id<MTLBuffer> ane0Buf = [gMetalDevice newBufferWithBytesNoCopy:ane0Ptr length:ane0Bytes options:MTLResourceStorageModeShared deallocator:nil];
+    id<MTLBuffer> ane1Buf = [gMetalDevice newBufferWithBytesNoCopy:ane1Ptr length:ane1Bytes options:MTLResourceStorageModeShared deallocator:nil];
+    id<MTLBuffer> dstBuf = [gMetalDevice newBufferWithBytesNoCopy:dstBF16 length:dstBytes options:MTLResourceStorageModeShared deallocator:nil];
+
+    if (!gpuBuf || !ane0Buf || !ane1Buf || !dstBuf) return false;
+
+    id<MTLCommandBuffer> cmd = [queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+
+    [enc setComputePipelineState:gMergeAttnPipelineState];
+    [enc setBuffer:gpuBuf offset:0 atIndex:0];
+    [enc setBuffer:ane0Buf offset:0 atIndex:1];
+    [enc setBuffer:ane1Buf offset:0 atIndex:2];
+    [enc setBuffer:dstBuf offset:0 atIndex:3];
+    [enc setBytes:&uS length:sizeof(uint) atIndex:4];
+    [enc setBytes:&uNGpu length:sizeof(uint) atIndex:5];
+    [enc setBytes:&uNAne0 length:sizeof(uint) atIndex:6];
+    [enc setBytes:&uNAne1 length:sizeof(uint) atIndex:7];
+
+    MTLSize threadgroupSize = MTLSizeMake(16, 16, 1);
+    MTLSize gridSize = MTLSizeMake((nTotal + 15) / 16 * 16, (s + 15) / 16 * 16, 1);
+    [enc dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
+    [enc endEncoding];
+
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    return (cmd.status == MTLCommandBufferStatusCompleted);
+}
+
+bool h3_ane_merge_fc1_swiglu(const void *gpuSuffixBF16, H3ANETensor *ane0Tensor, H3ANETensor *ane1Tensor, void *dstBF16, int s, int nGpu, int nAne0, int nAne1, void *commandQueue) {
+    if (!gpuSuffixBF16 || !ane0Tensor || !ane1Tensor || !dstBF16) return false;
+    if (!InitMetalKernels()) return false;
+
+    id<MTLCommandQueue> queue = commandQueue ? (__bridge id<MTLCommandQueue>)commandQueue : gCommandQueue;
+    void *ane0Ptr = h3_ane_tensor_ptr(ane0Tensor);
+    void *ane1Ptr = h3_ane_tensor_ptr(ane1Tensor);
+    if (!ane0Ptr || !ane1Ptr) return false;
+
+    uint uS = (uint)s;
+    uint uNGpu = (uint)nGpu;
+    uint uNAne0 = (uint)nAne0;
+    uint uNAne1 = (uint)nAne1;
+    uint nTotal = uNGpu + uNAne0 + uNAne1;
+    uint ffnDim = nTotal / 2;
+
+    size_t gpuBytes = s * nGpu * 2;
+    size_t ane0Bytes = ane0Tensor->rows * ane0Tensor->rowBytes;
+    size_t ane1Bytes = ane1Tensor->rows * ane1Tensor->rowBytes;
+    size_t dstBytes = s * ffnDim * 2;
+
+    id<MTLBuffer> gpuBuf = [gMetalDevice newBufferWithBytesNoCopy:(void*)gpuSuffixBF16 length:gpuBytes options:MTLResourceStorageModeShared deallocator:nil];
+    id<MTLBuffer> ane0Buf = [gMetalDevice newBufferWithBytesNoCopy:ane0Ptr length:ane0Bytes options:MTLResourceStorageModeShared deallocator:nil];
+    id<MTLBuffer> ane1Buf = [gMetalDevice newBufferWithBytesNoCopy:ane1Ptr length:ane1Bytes options:MTLResourceStorageModeShared deallocator:nil];
+    id<MTLBuffer> dstBuf = [gMetalDevice newBufferWithBytesNoCopy:dstBF16 length:dstBytes options:MTLResourceStorageModeShared deallocator:nil];
+
+    if (!gpuBuf || !ane0Buf || !ane1Buf || !dstBuf) return false;
+
+    id<MTLCommandBuffer> cmd = [queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+
+    [enc setComputePipelineState:gMergeFC1PipelineState];
+    [enc setBuffer:gpuBuf offset:0 atIndex:0];
+    [enc setBuffer:ane0Buf offset:0 atIndex:1];
+    [enc setBuffer:ane1Buf offset:0 atIndex:2];
+    [enc setBuffer:dstBuf offset:0 atIndex:3];
+    [enc setBytes:&uS length:sizeof(uint) atIndex:4];
+    [enc setBytes:&uNGpu length:sizeof(uint) atIndex:5];
+    [enc setBytes:&uNAne0 length:sizeof(uint) atIndex:6];
+    [enc setBytes:&uNAne1 length:sizeof(uint) atIndex:7];
+
+    MTLSize threadgroupSize = MTLSizeMake(16, 16, 1);
+    MTLSize gridSize = MTLSizeMake((ffnDim + 15) / 16 * 16, (s + 15) / 16 * 16, 1);
+    [enc dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
+    [enc endEncoding];
+
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    return (cmd.status == MTLCommandBufferStatusCompleted);
 }
