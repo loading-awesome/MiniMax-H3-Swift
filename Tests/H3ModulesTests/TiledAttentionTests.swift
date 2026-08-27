@@ -152,6 +152,67 @@ struct TiledAttentionTests {
                      shippingMs / tiledMs))
     }
 
+    /// One production block at whatever share and split the environment says.
+    ///
+    /// Single arm on purpose. Two configurations in one process means two sets
+    /// of engine programs and weight surfaces resident at once, and that
+    /// measurably distorts them — a whole-contraction block that costs 1037 ms
+    /// alone measured 1227 ms sharing a process with its split counterpart.
+    /// Sweeping the share therefore means one process per point.
+    @Test(.enabled(if: ProcessInfo.processInfo.environment["H3_BIG"] != nil))
+    func blockCost() {
+        let f = CompiledBlockTests.productionBlock()
+        let body = { [f.block(f.x, tEmb: f.tEmb, index: f.index, ropeTable: f.rope)] }
+        MLX.eval(body())
+        var v: [Double] = []
+        for _ in 0 ..< 7 {
+            let t = Date(); MLX.eval(body()); v.append(Date().timeIntervalSince(t))
+        }
+        let sorted = v.sorted()
+        print(String(format: "\n  share %.3f   split %@   block %8.1f ms   (min %.1f max %.1f)\n",
+                     ANELinearBackend.share,
+                     (ANELinearBackend.splitOverride.map { "\($0)" } ?? "auto") as NSString,
+                     sorted[3] * 1000, sorted.first! * 1000, sorted.last! * 1000))
+    }
+
+    /// Cutting the contraction, against not cutting it, on a production block.
+    ///
+    /// Interleaved in one process. The two configurations build different
+    /// engine programs and different weight surfaces, so both sets live at once
+    /// and the comparison costs memory rather than accuracy — which is the
+    /// right trade for a measurement that has drifted 4% across processes.
+    ///
+    /// The split is not bit-identical to the whole contraction and is not meant
+    /// to be: it is a different, shorter accumulation. It should be *closer* to
+    /// fp32, and `splitContraction` measures that directly. What is checked
+    /// here is that the block still agrees with the unrouted GPU path inside
+    /// the equivalence class the tree already accepts.
+    @Test(.enabled(if: ProcessInfo.processInfo.environment["H3_BIG"] != nil))
+    func splitBlock() {
+        let f = CompiledBlockTests.productionBlock()
+        func block(_ splits: Int?) -> [MLXArray] {
+            ANELinearBackend.splitOverride = splits
+            defer { ANELinearBackend.splitOverride = nil }
+            return [f.block(f.x, tEmb: f.tEmb, index: f.index, ropeTable: f.rope)]
+        }
+        print("\n  ANE \(ANELinearBackend.isEnabled ? "ON" : "off")   share \(ANELinearBackend.share)")
+
+        let whole = block(1), split = block(nil)
+        MLX.eval(whole, split)
+        let diff = MLX.abs(whole[0].asType(.float32) - split[0].asType(.float32))
+            .max().item(Float.self)
+        let scale = MLX.abs(whole[0].asType(.float32)).max().item(Float.self)
+        print(String(format: "  whole vs split: max |diff| %.3e against max |y| %.1f (%.2e relative)",
+                     diff, scale, diff / scale))
+
+        let m = BenchmarkSupport.interleavedArrays(
+            rounds: 5, first: { block(1) }, second: { block(nil) })
+        let wholeMs = m.first * 1000, splitMs = m.second * 1000
+        print(String(format: "  whole contraction  %8.1f ms", wholeMs))
+        print(String(format: "  split contraction  %8.1f ms", splitMs))
+        print(String(format: "  gain               %8.3fx\n", wholeMs / splitMs))
+    }
+
     /// **The gate, with the control measured twice.**
     ///
     /// The shipping route is untiled at 0.286. The candidate is the tiled,

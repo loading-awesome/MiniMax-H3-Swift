@@ -325,16 +325,79 @@ before anything is built:
     in this checkout, and the coverage objection that kept `fc2` out survives
     the better margin anyway. See *Splitting the contraction does not settle
     `fc2` either*.
-  * **The native merge kernels are useful after all.** They were measured
-    worthless against a single shard pair. Split-k produces `c` partials per
-    projection that must be summed, and a merge kernel that accumulates all of
-    them in one pass is the difference between one pass over the output and
-    `c-1` of them.
+  * **The native merge kernels may still be useful.** Split-k produces `c`
+    partials per projection to sum, which is what an accumulating merge kernel
+    is for. Measured, the summation is not currently the binding cost — a split
+    `qkv` projection is 122.4 ms against an engine time of 50.3 — so this is an
+    optimisation and not the gate.
 
 None of this is implemented in the routed path. What is measured is the engine's
 rate and its arithmetic; the block ceiling above is arithmetic, not a
 measurement, and the two schedules already closed on this page are a standing
 reminder of the distance between those.
+
+### Split-k, implemented and measured
+
+The three routed projections now cut their contraction. `qkv` and `fc1` run four
+pieces of 1344, `attn out` eight of 896, chosen by `splitFactor` and overridable
+with `H3_ANE_SPLIT_K`. Both operands are already `k`-major, so a piece is a
+contiguous byte range of the packed activation and of the uploaded weight shard:
+the split costs an offset per piece, not a gather, and the activation surfaces
+total exactly what one contraction needed. The partials are summed in fp32
+before the operand scale comes off.
+
+**The share had to move with it, and that is the whole result.** 0.286 was the
+point where the GPU shard and the engine finish together *for an engine at 0.40
+of the GPU's rate*. Split, the engine is at parity, so the balance moves to
+`r/(1+r)` ≈ 0.52. One production block, one configuration per process:
+
+| configuration | block |
+|---|---:|
+| GPU only | 1131.4 ms |
+| whole contraction, share 0.286 — **what ships** | ~1037 ms (1.091x) |
+| whole contraction, share 0.45 | 1287.5 ms |
+| split-k, share 0.286 | 1068.8 ms |
+| split-k, share 0.40 | 1007.4 ms |
+| **split-k, share 0.50** | **1005.7 ms (1.125x)** |
+| split-k, share 0.60 | 1051.4 ms |
+
+The third row is the control that matters: **raising the share without splitting
+costs 250 ms**, so the gain is the split and not the retune. Neither is any use
+without the other, which is why 0.286 looked like a wall for as long as it did.
+
+Splitting six ways instead of four (1010.6 ms) buys nothing — 896-wide pieces
+are faster in isolation but the projection is no longer engine-bound at share
+0.5, so the extra rate has nowhere to go.
+
+At the projection level the win is much larger than at the block: `qkv` at share
+0.5 costs 122.4 ms split against 245.7 whole, and 196 on the GPU alone — 1.60x.
+The block only sees 1.125x because **the engine can overlap nothing but its own
+GPU shard.** Attention, `fc2` and the elementwise are 643 ms of the block that
+the engine cannot touch, and the dependency chain keeps it from working on them.
+That is the same wall query tiling and the CFG overlap were built to breach, and
+both were closed on the grounds that the engine was too slow to fit in the
+window. It is not too slow any more: at post share 1.0 the engine's `out`+`fc1`
+work is 308 ms against a 434 ms attention window, so all of it fits.
+
+Memory is the cost. Every piece keeps its own `[s, perDie]` partial until they
+are summed, so a slot's output surfaces are `splits` times what one contraction
+needed.
+
+**Paying for that by shrinking the slot pool deadlocked the renderer**, and the
+way it was found is the point. `QueryTiling` begins tile `i`'s `fc1` before it
+collects tile `i-2`'s, so three jobs of one projection are live across that
+call; a pool of two meant `take` waited for a slot that could not be returned
+until the caller it was blocking returned. It hung, silently, and was found by
+a person watching a benchmark not finish.
+
+Two things changed. The pool is now sized to the deepest consumer that is
+actually enabled, and that coupling is written down where the number is. And
+`take` is **bounded**: it gives up after ten seconds, `start` returns nil, and
+the projection is computed whole on the GPU — slower, correct, and recorded as
+a decline. A pipeline deeper than its pool is now a measurable slowdown rather
+than a stopped machine. `pipelineDepthOutlivesTheSlotPool` asserts the
+invariant and fails in 38 ms; reinstating the old pool size was checked to make
+it fail, because a regression test that cannot fail is decoration.
 
 ### What would move it
 

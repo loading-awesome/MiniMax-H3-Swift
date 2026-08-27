@@ -29,6 +29,42 @@ struct QueryTilingTests {
         }
     }
 
+    /// **The pipeline must not be deeper than the pool it draws from.**
+    ///
+    /// `QueryTiling` begins tile `i`'s `fc1` before collecting tile `i-2`'s, so
+    /// three jobs of one projection are live across that call. A slot pool of
+    /// two deadlocks there: `take` waits for a slot that cannot be returned
+    /// until the caller it is blocking returns. That shipped, briefly, and was
+    /// found by a person watching a benchmark fail to finish.
+    ///
+    /// This asserts the invariant directly rather than hoping a benchmark
+    /// notices, and the time limit means a regression fails in seconds instead
+    /// of hanging a run.
+    @Test("the slot pool is deeper than the tiling pipeline",
+          .timeLimit(.minutes(1)))
+    func pipelineDepthOutlivesTheSlotPool() {
+        // What the schedule holds at once, read off the loop in `QueryTiling`:
+        // out for tile i+1 and i, and fc1 for tiles i, i-1 and i-2.
+        let deepestConsumer = 3
+        #expect(ANELinearBackend.Session.slotCount(splits: 1) >= deepestConsumer
+                || !QueryTiling.isEnabled,
+                "query tiling needs \(deepestConsumer) slots of one projection")
+        #expect(ANELinearBackend.Session.slotCount(splits: 4) >= deepestConsumer
+                || !QueryTiling.isEnabled,
+                "splitting the contraction must not shrink the pool below the pipeline")
+
+        // And drive it, so the invariant is checked against the real schedule
+        // rather than against a number someone wrote down.
+        let (block, x, tEmb, index, rope) = CFGOverlapTests.block()
+        ANELinearBackend.splitOverride = 4
+        defer { ANELinearBackend.splitOverride = nil }
+        let tiled = QueryTiling.block(block, x, tEmb: tEmb, index: index,
+                                      ropeTable: rope, tiles: 4)
+        let dense = block(x, tEmb: tEmb, index: index, ropeTable: rope)
+        MLX.eval(tiled, dense)
+        #expect(MLX.abs(tiled - dense).max().item(Float.self) == 0)
+    }
+
     @Test("the tiled block matches the untiled one, bit for bit")
     func tiledMatchesDense() {
         let (block, x, tEmb, index, rope) = CFGOverlapTests.block()

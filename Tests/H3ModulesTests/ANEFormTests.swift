@@ -236,6 +236,43 @@ struct ANEFormTests {
             / MLX.sqrt(MLX.mean(r * r)).item(Float.self)
     }
 
+    /// What does the whole routed projection cost, engine plus join?
+    ///
+    /// `splitContraction` timed the engine alone. The split also adds work the
+    /// engine never sees: `splits` partials per die must be summed in fp32
+    /// before the operand scale comes off, which is `splits - 1` extra passes
+    /// over a `[s, perDie]` array. If that summation is eating the engine's
+    /// gain, the accumulate belongs in one merge kernel rather than a chain of
+    /// MLX adds — and this is the measurement that says whether it is worth
+    /// writing.
+    @Test(.enabled(if: ProcessInfo.processInfo.environment["H3_BIG"] != nil))
+    func splitJoinCost() {
+        let s = 15_731, k = 5376, n = 21_504
+        ANELinearBackend.share = 0.5
+        let x = MLX.contiguous((MLXRandom.normal([s, k]) * 0.05).asType(.bfloat16))
+        let w = MLX.contiguous((MLXRandom.normal([n, k]) * 0.02).asType(.bfloat16))
+        MLX.eval(x, w)
+
+        print("\n  qkv [\(s),\(k)]x[\(k),\(n)] at engine share 0.5\n")
+        print("  split   project ms   engine ms   join + overhead")
+        for (splits, engineMs) in [(1, 133.8), (4, 50.3)] {
+            ANELinearBackend.splitOverride = splits
+            defer { ANELinearBackend.splitOverride = nil }
+            _ = ANELinearBackend.project(x: x, weight: w, label: "qkv")
+            var v: [Double] = []
+            for _ in 0 ..< 5 {
+                let t = Date()
+                MLX.eval(ANELinearBackend.project(x: x, weight: w, label: "qkv"))
+                v.append(Date().timeIntervalSince(t))
+            }
+            let ms = v.sorted()[2] * 1000
+            print(String(format: "  %5d   %10.1f   %9.1f   %10.1f",
+                         splits, ms, engineMs, ms - engineMs))
+        }
+        ANELinearBackend.share = 0.286
+        print("")
+    }
+
     static func forms(k: Int, n: Int, s: Int) -> [Form] {
         [Form(name: "matmul", raw: H3ANEFormMatmul, wRows: k, wWidth: n, yRows: s, yWidth: n),
          Form(name: "conv", raw: H3ANEFormConv, wRows: n, wWidth: k, yRows: n, yWidth: s)]

@@ -75,6 +75,15 @@ public enum ANELinearBackend {
     nonisolated(unsafe) package static var overlappedCFG = false
     nonisolated(unsafe) package static var usedNativeIO = false
     nonisolated(unsafe) package static var queryTilesUsed = 0
+    /// Pieces the contraction was actually cut into. Observed, like routing,
+    /// and on the receipt for the same reason: splitting changes the
+    /// accumulation, so it changes the sample.
+    nonisolated(unsafe) package static var splitContractions = 0
+
+    package static func markSplitContraction(_ splits: Int) {
+        lock.lock(); defer { lock.unlock() }
+        splitContractions = max(splitContractions, splits)
+    }
 
     /// Whether a guided step overlaps the two CFG branches.
     ///
@@ -195,6 +204,35 @@ public enum ANELinearBackend {
         var perDie: Int { ane0.count }
     }
 
+    /// How many pieces the **contraction** is cut into before the engine runs.
+    ///
+    /// The engine's rate is a strong function of `k`: measured on both dies at
+    /// the production shard, 7.72 TFLOP/s at k=5376 against 20.69 at k=1344 and
+    /// 24.89 at k=896. The rate roughly halves each time `k` doubles past about
+    /// 2688, which is an accumulator spilling and re-streaming rather than a
+    /// unit that is compute-bound. Cutting `k` and summing the partials
+    /// afterwards is 2.7x to 5.1x faster on the same arithmetic — and *more*
+    /// accurate, because summing partials in fp32 beats one long fp16 chain.
+    ///
+    /// Powers of two only, down to a floor of 896 — the smallest piece measured
+    /// at full rate — and never so small that the pieces stop dividing `k`
+    /// exactly. `H3_ANE_SPLIT_K` overrides it; 1 restores the single
+    /// contraction this path used to run.
+    /// Set to pin the split in-process, so a benchmark can interleave a cut
+    /// contraction against a whole one instead of comparing across runs.
+    nonisolated(unsafe) static var splitOverride: Int? = {
+        guard let raw = ProcessInfo.processInfo.environment["H3_ANE_SPLIT_K"],
+              let forced = Int(raw), forced >= 1 else { return nil }
+        return forced
+    }()
+
+    static func splitFactor(k: Int) -> Int {
+        if let forced = splitOverride, forced >= 1, k % forced == 0 { return forced }
+        var best = 1
+        for c in [2, 4, 8] where k % c == 0 && k / c >= 896 { best = c }
+        return best
+    }
+
     static func plan(n: Int, headDim: Int = 128, share: Double? = nil) -> ShardPlan? {
         guard n >= 8 * headDim, n % headDim == 0 else { return nil }
         let columns = share ?? Self.share
@@ -265,29 +303,50 @@ public enum ANELinearBackend {
     /// with work queued ahead of the GPU there must be one set per job in
     /// flight, or the schedule that makes this fast also makes it wrong.
     final class Slot: @unchecked Sendable {
-        let x: OpaquePointer
-        let y0: OpaquePointer, y1: OpaquePointer
+        /// One activation surface per contraction piece, `[k/splits, s]` each.
+        /// Their total size is exactly the unsplit activation's: cutting `k`
+        /// moves bytes between surfaces, it does not add any.
+        let xs: [OpaquePointer]
+        /// One output pair per piece. **This is the cost of splitting.** Every
+        /// piece produces a full `[s, perDie]` partial that has to survive until
+        /// they are summed, so the output surfaces are `splits` times what a
+        /// single contraction needs.
+        let ys: [(OpaquePointer, OpaquePointer)]
 
-        init?(s: Int, k: Int, perDie: Int) {
-            // The engine reads the activation with sequence as the minor axis,
-            // so this surface is [k, s], not [s, k].
-            guard let xt = h3_ane_tensor_create(Int32(k), Int32(s)) else { return nil }
-            guard let y0t = h3_ane_tensor_create(Int32(s), Int32(perDie)) else {
-                h3_ane_tensor_free(xt); return nil
+        var x: OpaquePointer { xs[0] }
+        var y0: OpaquePointer { ys[0].0 }
+        var y1: OpaquePointer { ys[0].1 }
+
+        init?(s: Int, k: Int, perDie: Int, splits: Int) {
+            var xs: [OpaquePointer] = []
+            var ys: [(OpaquePointer, OpaquePointer)] = []
+            func unwind() {
+                for t in xs { h3_ane_tensor_free(t) }
+                for pair in ys { h3_ane_tensor_free(pair.0); h3_ane_tensor_free(pair.1) }
             }
-            guard let y1t = h3_ane_tensor_create(Int32(s), Int32(perDie)) else {
-                h3_ane_tensor_free(xt); h3_ane_tensor_free(y0t); return nil
+            let kc = k / splits
+            for _ in 0 ..< splits {
+                // The engine reads the activation with sequence as the minor
+                // axis, so this surface is [kc, s], not [s, kc].
+                guard let xt = h3_ane_tensor_create(Int32(kc), Int32(s)) else {
+                    unwind(); return nil
+                }
+                xs.append(xt)
+                guard let y0t = h3_ane_tensor_create(Int32(s), Int32(perDie)),
+                      let y1t = h3_ane_tensor_create(Int32(s), Int32(perDie))
+                else { unwind(); return nil }
+                ys.append((y0t, y1t))
+                // Outputs are aliased into MLX, so padding is not representable.
+                guard h3_ane_tensor_is_dense(y0t), h3_ane_tensor_is_dense(y1t) else {
+                    unwind(); return nil
+                }
             }
-            // Outputs are aliased into MLX, so padding is not representable.
-            guard h3_ane_tensor_is_dense(y0t), h3_ane_tensor_is_dense(y1t) else {
-                h3_ane_tensor_free(xt); h3_ane_tensor_free(y0t); h3_ane_tensor_free(y1t)
-                return nil
-            }
-            self.x = xt; self.y0 = y0t; self.y1 = y1t
+            self.xs = xs; self.ys = ys
         }
 
         deinit {
-            h3_ane_tensor_free(x); h3_ane_tensor_free(y0); h3_ane_tensor_free(y1)
+            for t in xs { h3_ane_tensor_free(t) }
+            for pair in ys { h3_ane_tensor_free(pair.0); h3_ane_tensor_free(pair.1) }
         }
     }
 
@@ -304,7 +363,14 @@ public enum ANELinearBackend {
     final class Session {
         /// The compiled length, which is `paddedSequence(requested)`.
         let s: Int, k: Int, perDie: Int
-        let program0: OpaquePointer, program1: OpaquePointer
+        /// Pieces the contraction is cut into. 1 is the single contraction this
+        /// path ran before, and every shape below reduces to it.
+        let splits: Int
+        var kc: Int { k / splits }
+        /// One compiled pair per piece, each at `(s, k/splits, perDie)`.
+        let programs: [(OpaquePointer, OpaquePointer)]
+        var program0: OpaquePointer { programs[0].0 }
+        var program1: OpaquePointer { programs[0].1 }
 
         /// Three. Two covers the CFG schedule, which has at most two branches
         /// of one projection outstanding; query tiling wants one more, because
@@ -312,7 +378,23 @@ public enum ANELinearBackend {
         /// collects the tile behind that. At tile size the surfaces are small —
         /// a `fc1` slot at T=8 is 46 MB against 427 at full length — so the
         /// third is nearly free where it is actually used.
-        static let slotCount = 3
+        /// **Sized to the deepest consumer that is actually enabled, and that
+        /// coupling is load-bearing.**
+        ///
+        /// The plain routed path holds at most two of one projection at once,
+        /// and so does the CFG pipeline. `QueryTiling` holds *three*: it begins
+        /// tile `i`'s `fc1` before it collects tile `i-2`'s, so three are live
+        /// across that one call.
+        ///
+        /// Sizing this to two while tiling was on deadlocked the whole render
+        /// inside `take`, waiting on a slot that could not arrive because the
+        /// consumer holding it was waiting for this call to return. It was
+        /// found by a person watching a benchmark not finish, which is the
+        /// worst available detector — hence the bounded wait below and
+        /// `pipelineDepthOutlivesTheSlotPool`.
+        static func slotCount(splits: Int) -> Int {
+            QueryTiling.isEnabled ? 3 : 2
+        }
         private let lock = NSLock()
         private var idle: [Slot]
         private let available: DispatchSemaphore
@@ -323,30 +405,54 @@ public enum ANELinearBackend {
             return !poisoned
         }
 
-        init?(s requested: Int, k: Int, perDie: Int) {
+        init?(s requested: Int, k: Int, perDie: Int, splits: Int) {
             let s = ANELinearBackend.paddedSequence(requested)
-            guard let p0 = h3_ane_program_create(Int32(s), Int32(k), Int32(perDie)) else { return nil }
-            guard let p1 = h3_ane_program_create(Int32(s), Int32(k), Int32(perDie)) else {
-                h3_ane_program_free(p0); return nil
+            guard splits >= 1, k % splits == 0 else { return nil }
+            let kc = k / splits
+            var programs: [(OpaquePointer, OpaquePointer)] = []
+            func unwind() {
+                for pair in programs {
+                    h3_ane_program_free(pair.0); h3_ane_program_free(pair.1)
+                }
+            }
+            for _ in 0 ..< splits {
+                guard let p0 = h3_ane_program_create(Int32(s), Int32(kc), Int32(perDie))
+                else { unwind(); return nil }
+                guard let p1 = h3_ane_program_create(Int32(s), Int32(kc), Int32(perDie))
+                else { h3_ane_program_free(p0); unwind(); return nil }
+                programs.append((p0, p1))
             }
             var slots: [Slot] = []
-            for _ in 0 ..< Self.slotCount {
-                guard let slot = Slot(s: s, k: k, perDie: perDie) else {
-                    h3_ane_program_free(p0); h3_ane_program_free(p1); return nil
+            for _ in 0 ..< Self.slotCount(splits: splits) {
+                guard let slot = Slot(s: s, k: k, perDie: perDie, splits: splits) else {
+                    unwind(); return nil
                 }
                 slots.append(slot)
             }
-            self.s = s; self.k = k; self.perDie = perDie
-            self.program0 = p0; self.program1 = p1
+            self.s = s; self.k = k; self.perDie = perDie; self.splits = splits
+            self.programs = programs
             self.idle = slots
             self.available = DispatchSemaphore(value: slots.count)
         }
 
-        /// Blocks when every slot is in flight, which is the backpressure that
-        /// keeps the queue from growing without bound.
-        func take() -> Slot? {
+        /// Waits for a free slot, and **gives up rather than waiting forever.**
+        ///
+        /// The wait is real backpressure — it is what keeps the engine queue
+        /// from growing without bound — but an unbounded one turns any consumer
+        /// whose pipeline is deeper than this pool into a hang, and a hang in a
+        /// render is indistinguishable from a machine that has stopped. Timing
+        /// out returns nil, `start` returns nil, and `begin` computes the whole
+        /// projection on the GPU: slower, correct, and visible on the receipt.
+        ///
+        /// The bound is generous on purpose. A legitimately busy slot is held
+        /// for one engine evaluation — 135 ms unsplit at the production shard —
+        /// so seconds of waiting is not congestion, it is a bug.
+        func take(timeout: DispatchTimeInterval = .seconds(10)) -> Slot? {
             guard isUsable else { return nil }
-            available.wait()
+            guard available.wait(timeout: .now() + timeout) == .success else {
+                ANELinearBackend.note("slot pool exhausted", routed: false)
+                return nil
+            }
             lock.lock(); defer { lock.unlock() }
             guard !poisoned else {
                 available.signal()
@@ -371,7 +477,9 @@ public enum ANELinearBackend {
         }
 
         deinit {
-            h3_ane_program_free(program0); h3_ane_program_free(program1)
+            for pair in programs {
+                h3_ane_program_free(pair.0); h3_ane_program_free(pair.1)
+            }
         }
     }
 
@@ -381,7 +489,11 @@ public enum ANELinearBackend {
     /// converted and copied both shards on every call — 66 GB of memcpy per
     /// render for bytes that were already there.
     private final class WeightSet {
-        let w0: OpaquePointer, w1: OpaquePointer
+        /// One `[k/splits, perDie]` pair per contraction piece. Same bytes as
+        /// the unsplit pair, cut along `k`.
+        let pairs: [(OpaquePointer, OpaquePointer)]
+        var w0: OpaquePointer { pairs[0].0 }
+        var w1: OpaquePointer { pairs[0].1 }
         weak var source: MLXArray?
         let shape: [Int]
         /// **Which columns these two surfaces hold.** The shards are a slice of
@@ -391,10 +503,15 @@ public enum ANELinearBackend {
         /// silently reuses the previous split's columns and reports numbers for
         /// a projection nobody ran.
         var perDie: Int = 0
-        init(w0: OpaquePointer, w1: OpaquePointer, source: MLXArray) {
-            self.w0 = w0; self.w1 = w1; self.source = source; self.shape = source.shape
+        /// Keyed alongside `perDie` for the same reason: a set uploaded whole
+        /// is the wrong data for a program that contracts a piece at a time.
+        var splits: Int = 1
+        init(pairs: [(OpaquePointer, OpaquePointer)], source: MLXArray) {
+            self.pairs = pairs; self.source = source; self.shape = source.shape
         }
-        deinit { h3_ane_tensor_free(w0); h3_ane_tensor_free(w1) }
+        deinit {
+            for pair in pairs { h3_ane_tensor_free(pair.0); h3_ane_tensor_free(pair.1) }
+        }
     }
 
     private static let lock = NSLock()
@@ -404,8 +521,8 @@ public enum ANELinearBackend {
     /// lookup rather than a failed compile per call.
     nonisolated(unsafe) private static var refused: Set<String> = []
 
-    private static func session(s: Int, k: Int, perDie: Int) -> Session? {
-        let key = "\(paddedSequence(s))x\(k)x\(perDie)"
+    private static func session(s: Int, k: Int, perDie: Int, splits: Int) -> Session? {
+        let key = "\(paddedSequence(s))x\(k)x\(perDie)x\(splits)"
         lock.lock(); defer { lock.unlock() }
         if let cached = sessions[key] {
             if cached.isUsable { return cached }
@@ -413,7 +530,7 @@ public enum ANELinearBackend {
             return nil
         }
         if refused.contains(key) { return nil }
-        guard let made = Session(s: s, k: k, perDie: perDie) else {
+        guard let made = Session(s: s, k: k, perDie: perDie, splits: splits) else {
             refused.insert(key)
             return nil
         }
@@ -426,14 +543,15 @@ public enum ANELinearBackend {
     /// the life of the process, so this is stable across steps and distinct
     /// across blocks.
     private static func weightSet(for qkvWeight: MLXArray, plan: ShardPlan,
-                                  k: Int) -> WeightSet? {
+                                  k: Int, splits: Int) -> WeightSet? {
         let key = ObjectIdentifier(qkvWeight)
         lock.lock()
         // Drop entries whose model has gone away, both to bound retained ANE
         // surfaces and to prevent ObjectIdentifier reuse selecting old weights.
         weights = weights.filter { $0.value.source != nil }
         if let cached = weights[key], cached.source === qkvWeight,
-           cached.shape == qkvWeight.shape, cached.perDie == plan.perDie {
+           cached.shape == qkvWeight.shape, cached.perDie == plan.perDie,
+           cached.splits == splits {
             lock.unlock(); return cached
         }
         weights.removeValue(forKey: key)
@@ -444,28 +562,46 @@ public enum ANELinearBackend {
         // checkpoint holds `[n, k]`. The transpose happens here, once, which
         // is the entire reason weights have their own lifetime: per call it
         // would cost more than the projection.
-        guard let w0 = h3_ane_tensor_create(Int32(k), Int32(plan.perDie)),
-              let w1 = h3_ane_tensor_create(Int32(k), Int32(plan.perDie))
-        else { return nil }
+        let kc = k / splits
+        var pairs: [(OpaquePointer, OpaquePointer)] = []
+        func unwind() {
+            for pair in pairs { h3_ane_tensor_free(pair.0); h3_ane_tensor_free(pair.1) }
+        }
+        for _ in 0 ..< splits {
+            guard let a = h3_ane_tensor_create(Int32(kc), Int32(plan.perDie)),
+                  let b = h3_ane_tensor_create(Int32(kc), Int32(plan.perDie))
+            else { unwind(); return nil }
+            pairs.append((a, b))
+        }
 
-        func upload(_ rows: Range<Int>, into tensor: OpaquePointer) -> Bool {
+        /// Builds the shard once as `[k, perDie]` and hands each program its own
+        /// row range. Piece `c` is rows `[c*kc, (c+1)*kc)` of a row-major
+        /// buffer, so it is a contiguous byte range — the split costs an offset,
+        /// not a gather.
+        func upload(_ rows: Range<Int>, die: Int) -> Bool {
             // Contiguous for the same reason as the activation: this is a
             // transposed view, and handing one to `asData` costs a gather.
             let shard = MLX.contiguous(qkvWeight[rows].transposed().asType(.float16))
             shard.eval()
             return shard.asData(access: .noCopyIfContiguous).data.withUnsafeBytes { raw in
                 guard let base = raw.baseAddress else { return false }
-                return h3_ane_tensor_write(tensor, base, Int32(k), Int32(plan.perDie))
+                for c in 0 ..< splits {
+                    let piece = base + c * kc * plan.perDie * MemoryLayout<Float16>.size
+                    let tensor = die == 0 ? pairs[c].0 : pairs[c].1
+                    guard h3_ane_tensor_write(tensor, piece, Int32(kc), Int32(plan.perDie))
+                    else { return false }
+                }
+                return true
             }
         }
 
-        guard upload(plan.ane0, into: w0), upload(plan.ane1, into: w1) else {
-            h3_ane_tensor_free(w0); h3_ane_tensor_free(w1)
-            return nil
+        guard upload(plan.ane0, die: 0), upload(plan.ane1, die: 1) else {
+            unwind(); return nil
         }
 
-        let set = WeightSet(w0: w0, w1: w1, source: qkvWeight)
+        let set = WeightSet(pairs: pairs, source: qkvWeight)
         set.perDie = plan.perDie
+        set.splits = splits
         lock.lock(); weights[key] = set; lock.unlock()
         return set
     }
@@ -692,8 +828,9 @@ public enum ANELinearBackend {
 
         let s = x.shape[0], k = x.shape[1], n = weight.shape[0]
         guard weight.shape[1] == k, let plan = plan(n: n, share: share) else { return nil }
-        guard let session = session(s: s, k: k, perDie: plan.perDie),
-              let weights = weightSet(for: weight, plan: plan, k: k)
+        let splits = splitFactor(k: k)
+        guard let session = session(s: s, k: k, perDie: plan.perDie, splits: splits),
+              let weights = weightSet(for: weight, plan: plan, k: k, splits: splits)
         else { return nil }
 
         // A slot owns one mutable activation and two mutable outputs from here
@@ -727,7 +864,11 @@ public enum ANELinearBackend {
         // On a separate stream this waits only for `x` itself, through the
         // cross-stream dependency MLX inserts, and the attention keeps running.
         let uploaded: Bool
-        if nativeIOEnabled, let device = metalDevice {
+        // The native pack writes one whole `[k, s]` surface and has no split
+        // form, so a cut contraction takes the CPU seam. That costs nothing
+        // worth recovering: the native pack measured 0.990x on the route that
+        // ships, and the split is worth 2.7x.
+        if nativeIOEnabled, splits == 1, let device = metalDevice {
             let source = Stream.withNewDefaultStream(device: .gpu) { () -> MLXArray in
                 let v = MLX.contiguous(x)
                 v.eval()
@@ -747,7 +888,17 @@ public enum ANELinearBackend {
             }
             uploaded = scaled.asData(access: .noCopyIfContiguous).data.withUnsafeBytes { raw -> Bool in
                 guard let base = raw.baseAddress else { return false }
-                return h3_ane_tensor_write_prefix(slot.x, base, Int32(k), Int32(s))
+                // `scaled` is `[k, s]` row-major, so piece `c` is rows
+                // `[c*kc, (c+1)*kc)` — a contiguous byte range. Splitting the
+                // contraction costs an offset per piece and nothing else; the
+                // bytes written are exactly those the unsplit path wrote.
+                let kc = k / splits
+                for c in 0 ..< splits {
+                    let piece = base + c * kc * s * MemoryLayout<Float16>.size
+                    guard h3_ane_tensor_write_prefix(slot.xs[c], piece, Int32(kc), Int32(s))
+                    else { return false }
+                }
+                return true
             }
         }
         guard uploaded else { session.give(slot); return nil }
@@ -756,12 +907,22 @@ public enum ANELinearBackend {
         // The engine goes to its own thread and this one returns immediately.
         // Nothing below here blocks, so the caller keeps the GPU busy while the
         // shards run.
-        let shards = ShardHandles(x: slot.x, y0: slot.y0, y1: slot.y1,
-                                  p0: session.program0, p1: session.program1,
-                                  w0: weights.w0, w1: weights.w1)
+        // One `run_pair` per contraction piece, in order, on the engine's own
+        // thread. Both dies stay busy within a piece — they hold different
+        // output columns — and the pieces are independent, so the queue never
+        // waits on anything but the engine.
+        let shards = (0 ..< splits).map { c in
+            ShardHandles(x: slot.xs[c], y0: slot.ys[c].0, y1: slot.ys[c].1,
+                         p0: session.programs[c].0, p1: session.programs[c].1,
+                         w0: weights.pairs[c].0, w1: weights.pairs[c].1)
+        }
         let job = Engine.shared.submit {
-            h3_ane_run_pair(shards.p0, shards.x, shards.w0, shards.y0,
-                            shards.p1, shards.x, shards.w1, shards.y1)
+            for piece in shards {
+                guard h3_ane_run_pair(piece.p0, piece.x, piece.w0, piece.y0,
+                                      piece.p1, piece.x, piece.w1, piece.y1)
+                else { return false }
+            }
+            return true
         }
 
         // `asyncEval` queues the Metal work and returns, so the GPU is busy with
@@ -773,6 +934,7 @@ public enum ANELinearBackend {
             return output
         }
 
+        if splits > 1 { markSplitContraction(splits) }
         return .routed(gpu: gpuOut, job: job, session: session, slot: slot,
                        rows: s, perDie: plan.perDie, x: x, weight: weight)
     }
@@ -780,7 +942,10 @@ public enum ANELinearBackend {
     /// Adopts the engine's two output surfaces and joins them to the GPU shard.
     fileprivate static func join(gpu: MLXArray, slot: Slot, session: Session,
                                  rows s: Int, perDie: Int) -> MLXArray {
-        if nativeIOEnabled, let device = metalDevice {
+        // The native merge reads exactly one output pair. A split projection
+        // has `splits` of them to sum first, so it takes the MLX path below
+        // until the kernel learns to accumulate.
+        if nativeIOEnabled, session.splits == 1, let device = metalDevice {
             let gpu = MLX.contiguous(gpu)
             let total = gpu.dim(-1) + 2 * perDie
             let output = MLXArray.zeros([s, total], dtype: .bfloat16)
@@ -809,12 +974,28 @@ public enum ANELinearBackend {
             return session.s == s ? full : full[0 ..< s]
         }
 
-        // Undo the operand scale and join. The `eval` is what copies the engine's
-        // output out of the shared surfaces, and it has to happen before the slot
-        // is reused — returning a lazy graph over live surfaces would read
-        // whichever block ran most recently.
-        let ane0 = (adopt(slot.y0) * (1 / operandScale)).asType(.bfloat16)
-        let ane1 = (adopt(slot.y1) * (1 / operandScale)).asType(.bfloat16)
+        // Sum the pieces, then undo the operand scale. **The accumulation is
+        // fp32 and that is not incidental.** Each piece is an independent fp16
+        // reduction over `k/splits` terms, and adding those in fp32 is a
+        // shorter, better-conditioned chain than one fp16 reduction over the
+        // whole `k`: measured against an fp32 reference at the production
+        // shard, relative RMS falls from 1.695e-04 unsplit to 8.743e-05 at four
+        // pieces. Splitting the contraction makes this path faster *and* more
+        // accurate, which is the rare direction.
+        func partial(_ die: Int) -> MLXArray {
+            var acc = adopt(die == 0 ? slot.ys[0].0 : slot.ys[0].1).asType(.float32)
+            for c in 1 ..< session.splits {
+                acc = acc + adopt(die == 0 ? slot.ys[c].0 : slot.ys[c].1).asType(.float32)
+            }
+            return (acc * (1 / operandScale)).asType(.bfloat16)
+        }
+
+        // The `eval` is what copies the engine's output out of the shared
+        // surfaces, and it has to happen before the slot is reused — returning a
+        // lazy graph over live surfaces would read whichever block ran most
+        // recently.
+        let ane0 = partial(0)
+        let ane1 = partial(1)
         MLX.eval(ane0, ane1)
 
         return MLX.concatenated([gpu, ane0, ane1], axis: -1)
