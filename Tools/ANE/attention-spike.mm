@@ -133,6 +133,24 @@ static BOOL FiniteAndNonconstant(IOSurfaceRef output, size_t count,
 
 struct ReferenceErrors { double keyAxis, queryAxis, swappedQK; };
 
+/// Writes a surface's fp16 contents so the reference can be computed outside.
+///
+/// `ReferenceError` above is a scalar O(H*S^2*D) loop and is capped at S=512 for
+/// that reason, which left precision at the production sequence unmeasured —
+/// the one number that decides whether the fused graph is usable. A chunked
+/// fp32 reference over the same tensors costs about a second in numpy, so the
+/// cap is a tooling limit rather than a real one.
+static bool DumpSurface(IOSurfaceRef surface, size_t bytes, NSString *path) {
+    IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL);
+    NSData *data = [NSData dataWithBytes:IOSurfaceGetBaseAddress(surface) length:bytes];
+    IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+    NSError *error = nil;
+    bool ok = [data writeToFile:path options:NSDataWritingAtomic error:&error];
+    if (!ok) fprintf(stderr, "dump failed for %s: %s\n",
+                     path.UTF8String, error.description.UTF8String);
+    return ok;
+}
+
 static ReferenceErrors ReferenceError(IOSurfaceRef qSurface, IOSurfaceRef kSurface,
                                       IOSurfaceRef vSurface, IOSurfaceRef output,
                                       int heads, int sequence, int dimension) {
@@ -340,6 +358,17 @@ int main(void) {
         printf("evaluate=%s warm_ms=%.3f output_range=[%.6g,%.6g]\n",
                sane ? "SANE" : "INVALID", warm, lo, hi);
         if (!sane) return 6;
+        // `H3_ATTN_DUMP=/path/prefix` writes q/k/v/y for an external reference.
+        if (const char *prefix = getenv("H3_ATTN_DUMP")) {
+            size_t bytes = (size_t)heads * sequence * dimension * sizeof(_Float16);
+            NSString *base = [NSString stringWithUTF8String:prefix];
+            bool ok = DumpSurface(q,  bytes, [base stringByAppendingString:@"q.bin"])
+                   && DumpSurface(k,  bytes, [base stringByAppendingString:@"k.bin"])
+                   && DumpSurface(v,  bytes, [base stringByAppendingString:@"v.bin"])
+                   && DumpSurface(y0, bytes, [base stringByAppendingString:@"y.bin"]);
+            printf("dump=%s bytes_each=%zu heads=%d sequence=%d dimension=%d\n",
+                   ok ? "ok" : "FAILED", bytes, heads, sequence, dimension);
+        }
         ReferenceErrors reference = ReferenceError(q, k, v, y0, heads, sequence, dimension);
         if (isfinite(reference.keyAxis)) {
             printf("cpu_reference_rel_rms key_axis=%.6g query_axis=%.6g swapped_qk=%.6g\n",

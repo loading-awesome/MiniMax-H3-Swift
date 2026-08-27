@@ -482,6 +482,66 @@ against a GPU sustaining ~18.6 TFLOP/s, and a new Metal driver moving that moves
 the balance point. **Nothing here should be quoted as a 27.0 result until it is
 re-measured.**
 
+### The fused attention graph is accepted, and numerically wrong (2026-08-27)
+
+The last open approach. Attention is 37% of the block and the one term the
+ceiling model cannot overlap — `forward = A/G + L/(G+R)` — so it is the only
+place left that could move the number that dominates. A fused
+`QK^T -> softmax -> AV` graph was the only shape worth testing, because its
+seams are one at each end rather than one between every stage.
+
+At production S the graph **compiles, loads and evaluates**:
+
+```
+compile_load=ACCEPTED   evaluate=SANE   single_ms=62.703   2.025 TFLOP/s
+explicit_io=15.375 MiB  hypothetical_exposed_scores=0.462 GiB
+```
+
+The seam economics are genuinely good, and they are what the island lacked:
+15.4 MiB crosses per head while the 0.462 GiB score plane never leaves the
+engine. Throughput is poor — 2.02 TFLOP/s a die against 5.56 on linears, and
+8.4x slower per head than the GPU — but balancing heads would still have moved
+~11 of 56 onto the dies, taking attention from 417 ms to ~337 ms and the render
+from 1.179x to roughly **1.30x**, using capacity that is otherwise idle.
+
+**It is wrong.** Against an fp32 reference over the same tensors:
+
+| | S=512 | S=15,744 |
+|---|---:|---:|
+| key_axis rel-RMS | 0.0217 | **0.974** |
+| query_axis rel-RMS | 0.0300 | **0.974** |
+
+Both orientations, so it is not a transposed lowering. The reference is
+validated: at S=512 it reproduces the spike's own scalar `ReferenceError` to six
+figures (`Tools/ANE/attention_reference.py`, chunked fp32, which also lifts the
+S<=512 cap that left this unmeasured).
+
+**The cause is not the engine's arithmetic.** ANE linears measure 7e-5 to 5e-4,
+better than the bf16 GPU path's 1.66e-3. Precision decay would sit near 1e-4 and
+grow gently with contraction depth; this jumps 45x for a 31x change in `S`, with
+the same graph and the same arithmetic, to a value that is uncorrelated rather
+than imprecise. That is a wrong **normalisation**. A 0.462 GiB score plane must
+be tiled, and a softmax normalised per tile instead of across the full row
+produces exactly this — while at S=512 the row fits one tile, normalisation is
+correct, and 2.2% is just fp16 `exp` with no 1/sqrt(d) scale.
+
+So attention is closed from both directions, and the two failures are
+complementary rather than coincidental:
+
+| design | seams | softmax |
+|---|---|---|
+| fused | cheap — the score plane never crosses | **broken** once the plane tiles |
+| three-stage, Metal softmax between | correct | **seam cost**, measured negative by proxy at 0.958x |
+
+Correct normalisation or cheap seams; not both. Nothing here is tunable into a
+win, and `A/G` stays on the GPU.
+
+One process note. `evaluate=SANE` passed while the output was 97% wrong: that
+check tests finite and non-constant, nothing more. This is the third time in
+this document that wrong answers have presented as healthy output — after the
+saturation cliff's silent zeros and an `expectedHidden` that made the island
+decline every block while six conformance tests stayed green.
+
 ### CoreAI is not a route
 
 macOS 27 ships `/System/Library/Frameworks/CoreAI.framework`, an umbrella
