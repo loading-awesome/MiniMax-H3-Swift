@@ -657,12 +657,41 @@ bool h3_ane_run(H3ANEProgram *p, H3ANETensor *x, H3ANETensor *w, H3ANETensor *y,
     // The class is private and undocumented, so whether it is safe to share is
     // unknowable by reading; wrapping the same IOSurface again is cheap and
     // removes the question. **This is untested against the hardware.**
-    id xObject = ((id(*)(Class, SEL, IOSurfaceRef, size_t))objc_msgSend)(
-        IOSurfaceObjectClass, @selector(objectWithIOSurface:startOffset:), x->surface, 0);
-    id wObject = ((id(*)(Class, SEL, IOSurfaceRef, size_t))objc_msgSend)(
-        IOSurfaceObjectClass, @selector(objectWithIOSurface:startOffset:), w->surface, 0);
-    id yObject = ((id(*)(Class, SEL, IOSurfaceRef, size_t))objc_msgSend)(
-        IOSurfaceObjectClass, @selector(objectWithIOSurface:startOffset:), y->surface, 0);
+    // **Measured, and it is not the fault.** The theory was that sharing one
+    // `_ANEIOSurfaceObject` between two concurrent requests on two dies — two
+    // DARTs — races whatever per-evaluation mapping state the private class
+    // holds, and programs one request with an IOVA invalid in its own DART.
+    // Tested head to head at production submission rates on 2026-08-27:
+    //
+    //   shared object      671,438 pairs in 180 s, 0 failures
+    //   per-request object 636,432 pairs in 180 s, 0 failures
+    //
+    // Both clean, so the shared object stays: it is the simpler code and the
+    // change was not earned. `H3_ANE_PER_REQUEST_SURFACE_OBJECT=1` keeps the
+    // alternative available for a future run that has reason to suspect it.
+    //
+    // What those runs did establish is where the fault is not. 1.3 million pair
+    // submissions across six minutes did nothing, while 36 submissions spread
+    // over 72 seconds panicked the machine. Failures track **power
+    // transitions**, not submission volume.
+    static dispatch_once_t shareOnce;
+    static bool perRequest = false;
+    dispatch_once(&shareOnce, ^{
+        perRequest = [NSProcessInfo.processInfo.environment[@"H3_ANE_PER_REQUEST_SURFACE_OBJECT"]
+                          isEqualToString:@"1"];
+    });
+
+    id xObject, wObject, yObject;
+    if (!perRequest) {
+        xObject = x->object; wObject = w->object; yObject = y->object;
+    } else {
+        xObject = ((id(*)(Class, SEL, IOSurfaceRef, size_t))objc_msgSend)(
+            IOSurfaceObjectClass, @selector(objectWithIOSurface:startOffset:), x->surface, 0);
+        wObject = ((id(*)(Class, SEL, IOSurfaceRef, size_t))objc_msgSend)(
+            IOSurfaceObjectClass, @selector(objectWithIOSurface:startOffset:), w->surface, 0);
+        yObject = ((id(*)(Class, SEL, IOSurfaceRef, size_t))objc_msgSend)(
+            IOSurfaceObjectClass, @selector(objectWithIOSurface:startOffset:), y->surface, 0);
+    }
     if (!xObject || !wObject || !yObject) return false;
 
     id request = ((id(*)(Class, SEL, id, id, id, id, id, id, id))objc_msgSend)(

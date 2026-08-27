@@ -667,6 +667,55 @@ distribution. Silent corruption of another client's compute is a plausible
 outcome of the same defect, and is what the machine's owner suspected before
 this was found.
 
+### Two hypotheses tested and eliminated, and where that leaves it
+
+`Tools/ANE/pair-stress.m` submits `h3_ane_run_pair` in a loop with the same
+input and weight surfaces bound to both dies — the worst case, and what
+`ane-hold` was doing when the machine panicked 72 s in. It takes a gap in
+milliseconds, so the submission rate is the variable.
+
+| configuration | pairs | outcome |
+|---|---|---|
+| shared surface object, no gap | 671,438 in 180 s | clean |
+| per-request surface object, no gap | 636,432 in 180 s | clean |
+| shared, 200 ms gap | 879 in 180 s | clean |
+| shared, 2000 ms gap | 120 in 240 s | clean |
+| `ane-hold`, ~2000 ms gap | ~36 in 72 s | **DART panic** |
+
+**The shared `_ANEIOSurfaceObject` is not the fault.** Head to head at 3,700
+pairs a second it is indistinguishable from wrapping per evaluation, so the
+default stays shared and the alternative is available under
+`H3_ANE_PER_REQUEST_SURFACE_OBJECT=1`.
+
+**Submission volume is not the fault either.** 1.3 million pair submissions
+across six minutes did nothing. Thirty-six submissions across seventy-two
+seconds killed the machine. Whatever this is, hammering the engine is safer than
+poking it.
+
+**And a 2 s gap alone does not reproduce it.** Four minutes at exactly the rate
+that panicked the machine, clean.
+
+So there is **no reliable reproduction**, which is the most important fact for
+anything that comes next. Four failures in roughly five hours of intermittent
+heavy use is a base rate against which a four-minute clean run is worth almost
+nothing — no mitigation can be validated by absence of failure at this
+timescale, including the two already committed.
+
+What survives, unproven: the failure needs something we are not controlling.
+The machine's owner framed it as a lock CoreML takes that we cannot — and the
+shape of the evidence fits. We register as a client (the driver tracks our
+`Programs Open` and `Wired-Memory`) but we cannot register *intent*:
+`beginRealTimeTask` is the "I am holding this die" declaration and it is
+entitlement-gated. Without it the driver is free to act on the die — power it
+down, tear down and restore DART mappings — on its own schedule, while our
+mappings are live, and with no way to tell us. Continuous submission does not
+take a lock; it denies the driver the opportunity. That would explain why
+sustained work is safe, intermittent work is dangerous, and neither is
+deterministic: it needs the driver, or another client, to act in the window.
+
+Testing that needs a soak with per-client driver logging and a failure to
+examine, not another four-minute run.
+
 ### The rule this leaves
 
 - **Nothing runs on the engine.** As of the DART panic there is no configuration
