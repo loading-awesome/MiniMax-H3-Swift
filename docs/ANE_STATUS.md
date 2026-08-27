@@ -338,66 +338,74 @@ reminder of the distance between those.
 
 ### Split-k, implemented and measured
 
-The three routed projections now cut their contraction. `qkv` and `fc1` run four
-pieces of 1344, `attn out` eight of 896, chosen by `splitFactor` and overridable
-with `H3_ANE_SPLIT_K`. Both operands are already `k`-major, so a piece is a
-contiguous byte range of the packed activation and of the uploaded weight shard:
-the split costs an offset per piece, not a gather, and the activation surfaces
-total exactly what one contraction needed. The partials are summed in fp32
-before the operand scale comes off.
+The three routed projections cut their contraction: `qkv` and `fc1` into four
+pieces of 1344, `attn out` into eight of 896. Both operands are already
+`k`-major, so a piece is a contiguous byte range of the packed activation and of
+the uploaded weight shard — an offset per piece, not a gather — and the
+activation surfaces total exactly what one contraction needed. Partials are
+summed in fp32 before the operand scale comes off, which is why the split is
+*more* accurate as well as faster.
 
-**The share had to move with it, and that is the whole result.** 0.286 was the
+**The share had to move with it, and neither half works alone.** 0.286 is the
 point where the GPU shard and the engine finish together *for an engine at 0.40
-of the GPU's rate*. Split, the engine is at parity, so the balance moves to
-`r/(1+r)` ≈ 0.52. One production block, one configuration per process:
+of the GPU's rate*. Split, the engine is at parity and the balance moves. One
+production block, one configuration per process:
 
-| configuration | block |
-|---|---:|
-| GPU only | 1131.4 ms |
-| whole contraction, share 0.286 — **what ships** | ~1037 ms (1.091x) |
-| whole contraction, share 0.45 | 1287.5 ms |
-| split-k, share 0.286 | 1068.8 ms |
-| split-k, share 0.40 | 1007.4 ms |
-| **split-k, share 0.50** | **1005.7 ms (1.125x)** |
-| split-k, share 0.60 | 1051.4 ms |
+| configuration | block | |
+|---|---:|---:|
+| GPU only | 1133.6 ms | — |
+| whole contraction, share 0.286 — the previous default | 1037.6 ms | 1.093x |
+| whole contraction, share 0.45 | 1287.5 ms | 0.88x |
+| split-k, share 0.286 | 1068.8 ms | 1.06x |
+| **split-k, share 0.45 — the new default** | **~1010 ms** | **~1.12x** |
+| split-k, share 0.52 | 1061.5 ms | 1.07x |
 
-The third row is the control that matters: **raising the share without splitting
-costs 250 ms**, so the gain is the split and not the retune. Neither is any use
-without the other, which is why 0.286 looked like a wall for as long as it did.
+Row three is the control that matters: **raising the share without splitting
+costs 250 ms.** The gain is the split, not the retune, and 0.286 looked like a
+wall for as long as it did because moving it required a faster engine that
+nobody had gone looking for.
 
-Splitting six ways instead of four (1010.6 ms) buys nothing — 896-wide pieces
-are faster in isolation but the projection is no longer engine-bound at share
-0.5, so the extra rate has nowhere to go.
+The plateau runs 0.40 to 0.50 — 1005.7, 1007.4, 1010.6, 1015.8 — with a cliff
+just past it. The default is 0.45, mid-plateau, and it **follows the split**:
+`H3_ANE_SPLIT_K=1` restores 0.286 along with the whole contraction, because a
+split contraction left at 0.286 is slower than the unsplit path it replaced.
 
-At the projection level the win is much larger than at the block: `qkv` at share
-0.5 costs 122.4 ms split against 245.7 whole, and 196 on the GPU alone — 1.60x.
-The block only sees 1.125x because **the engine can overlap nothing but its own
-GPU shard.** Attention, `fc2` and the elementwise are 643 ms of the block that
-the engine cannot touch, and the dependency chain keeps it from working on them.
-That is the same wall query tiling and the CFG overlap were built to breach, and
-both were closed on the grounds that the engine was too slow to fit in the
-window. It is not too slow any more: at post share 1.0 the engine's `out`+`fc1`
-work is 308 ms against a 434 ms attention window, so all of it fits.
+At the projection the win is far larger than at the block: `qkv` at share 0.5 is
+122.4 ms split against 245.7 whole and 196 on the GPU alone — 1.60x. The block
+sees only ~1.12x because **the engine can overlap nothing but its own GPU
+shard.** Attention, `fc2` and the elementwise are 643 ms of the block it cannot
+touch.
 
-Memory is the cost. Every piece keeps its own `[s, perDie]` partial until they
-are summed, so a slot's output surfaces are `splits` times what one contraction
-needed.
+### Both schedules stay closed, now for a better reason
 
-**Paying for that by shrinking the slot pool deadlocked the renderer**, and the
-way it was found is the point. `QueryTiling` begins tile `i`'s `fc1` before it
-collects tile `i-2`'s, so three jobs of one projection are live across that
-call; a pool of two meant `take` waited for a slot that could not be returned
-until the caller it was blocking returned. It hung, silently, and was found by
-a person watching a benchmark not finish.
+Query tiling and the CFG overlap were closed on the grounds that the engine was
+too slow to fit in the window it was offered. That excuse is gone — at post
+share 0.85 the engine's `out`+`fc1` work is 261 ms against a 434 ms attention
+window — so both were re-run against a split engine at parity:
 
-Two things changed. The pool is now sized to the deepest consumer that is
-actually enabled, and that coupling is written down where the number is. And
-`take` is **bounded**: it gives up after ten seconds, `start` returns nil, and
-the projection is computed whole on the GPU — slower, correct, and recorded as
-a decline. A pipeline deeper than its pool is now a measurable slowdown rather
-than a stopped machine. `pipelineDepthOutlivesTheSlotPool` asserts the
-invariant and fails in 38 ms; reinstating the old pool size was checked to make
-it fail, because a regression test that cannot fail is decoration.
+| schedule | best | against untiled split-k |
+|---|---:|---:|
+| query tiling, T=4, post 0.50 | 1042.0 ms | +3.6% |
+| query tiling, T=4, post 0.70 | 1047.9 ms | +4.2% |
+| query tiling, T=4, post 0.85 | 1109.1 ms | +10.3% |
+| CFG pipeline, share 0.50 | 2050.0 ms a pair | +2.0% |
+| CFG pipeline, share 0.65 | 2172.8 ms a pair | +8.1% |
+
+Both still lose, and the CFG pipeline's 1.111x at share 0.65 is again a gain
+over a serial arm that is itself worse. **So the limit was never the engine's
+rate.** It is that one MLX thread has to run every upload, gather, norm and
+collect between engine jobs, and the dependency chain inside a block gives it
+nowhere else to be. A faster engine made the schedules cheaper to feed and did
+not make them pay.
+
+### Where this leaves the gate
+
+`1.093x -> ~1.12x`, reproducible, bit-identical at a fixed share, and more
+accurate than the path it replaces. **It does not clear the 1.15x gate**, which
+needs about 986 ms in this harness against the 1010 measured. The remaining 25
+ms is not in any schedule that has been tried; it is in the per-projection seam
+— upload, partial summation, join — which is roughly 24 ms per projection at
+share 0.5 and is what an accumulating merge kernel exists to attack.
 
 ### What would move it
 

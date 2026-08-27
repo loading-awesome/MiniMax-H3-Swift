@@ -172,7 +172,24 @@ public enum ANELinearBackend {
     /// `H3_ANE_SHARE_QKV` and `H3_ANE_SHARE_POST` sweep them independently;
     /// `H3_ANE_SHARE` overrides both, for comparison against the single-share
     /// measurements this replaced.
+    /// 0.286 is the balance for an engine at 0.40 of the GPU's rate, which is
+    /// what an unsplit contraction gets. Split, the engine is at parity and the
+    /// balance moves — `r/(1+r)` puts it near 0.52, and measurement puts the
+    /// plateau at 0.40 to 0.50 with a cliff just past it:
+    ///
+    ///     0.286  1068.8 ms      0.44  1010.6      0.50  1005.7
+    ///     0.40   1007.4         0.48  1015.8      0.52  1061.5
+    ///
+    /// So 0.45: mid-plateau and a clear step away from the cliff. **The default
+    /// has to follow the split**, because a split contraction at 0.286 is 3%
+    /// slower than the unsplit path it replaced — turning the engine's own
+    /// speed-up into a regression by leaving one constant behind.
     private static let racingShare = 0.286
+    private static let splitShare = 0.45
+
+    private static var defaultShare: Double {
+        splitOverride == 1 ? racingShare : splitShare
+    }
 
     private static func envShare(_ name: String) -> Double? {
         guard let raw = ProcessInfo.processInfo.environment[name],
@@ -181,10 +198,10 @@ public enum ANELinearBackend {
     }
 
     nonisolated(unsafe) static var share: Double =
-        envShare("H3_ANE_SHARE") ?? racingShare
+        envShare("H3_ANE_SHARE") ?? envShare("H3_ANE_SHARE_QKV") ?? defaultShare
 
     nonisolated(unsafe) static var postShare: Double =
-        envShare("H3_ANE_SHARE") ?? envShare("H3_ANE_SHARE_POST") ?? 0.45
+        envShare("H3_ANE_SHARE") ?? envShare("H3_ANE_SHARE_POST") ?? defaultShare
 
     /// Which window this projection sits in. `qkv` gates attention; everything
     /// else in a block comes after it.

@@ -307,9 +307,22 @@ struct ANERealPrimitiveTests {
             #expect(range.lowerBound % 32 == 0, "a shard must start on a 64-byte row boundary")
         }
 
-        #expect(plan.perDie == 3072,
-                "engine share has drifted off the swept balance point: \(plan.perDie) per die")
-        #expect(plan.gpu.count == 15360)
+        // **Against the configured share, not against a literal.** These were
+        // `3072` and `15360`, which is the plan for a share of 0.286 — the
+        // balance point for an engine contracting 5,376 deep in one call. Split,
+        // the engine is at parity and the balance moves to 0.45, and three
+        // hardcoded plans failed for a tuning change that was the entire point
+        // of the work. What the plan owes is that it matches the share it was
+        // asked for, to within the head-boundary rounding.
+        func expectMatchesShare(_ p: ANELinearBackend.ShardPlan, n: Int,
+                                _ what: String, headDim: Int = 128) {
+            let asked = ANELinearBackend.share
+            let got = Double(2 * p.perDie) / Double(n)
+            #expect(abs(got - asked) <= Double(2 * headDim) / Double(n),
+                    "\(what) gives the engine \(got) of its columns against a share of \(asked)")
+            #expect(p.gpu.count == n - 2 * p.perDie, "\(what) shards must cover n exactly")
+        }
+        expectMatchesShare(plan, n: 21504, "qkv")
 
         // Shapes the engine has no useful split for must say so rather than
         // returning a degenerate plan.
@@ -317,8 +330,7 @@ struct ANERealPrimitiveTests {
         guard let fc1 = ANELinearBackend.plan(n: 28672) else {
             Issue.record("no plan for fc1"); return
         }
-        #expect(fc1.perDie == 4096, "fc1 engine shard: \(fc1.perDie) per die")
-        #expect(fc1.gpu.count == 20480)
+        expectMatchesShare(fc1, n: 28672, "fc1")
         #expect(fc1.ane1.upperBound == 28672, "fc1 shards cover every channel")
 
         // `attn out` is the third routed width, and the one whose contraction
@@ -327,8 +339,7 @@ struct ANERealPrimitiveTests {
         guard let out = ANELinearBackend.plan(n: 5376) else {
             Issue.record("no plan for attn out"); return
         }
-        #expect(out.perDie == 768, "attn out engine shard: \(out.perDie) per die")
-        #expect(out.gpu.count == 3840)
+        expectMatchesShare(out, n: 5376, "attn out")
 
         #expect(ANELinearBackend.plan(n: 128) == nil, "too small to split")
         #expect(ANELinearBackend.plan(n: 21503) == nil, "not a whole number of heads")

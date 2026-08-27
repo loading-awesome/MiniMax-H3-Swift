@@ -152,6 +152,44 @@ struct TiledAttentionTests {
                      shippingMs / tiledMs))
     }
 
+    /// One **tiled** production block at whatever T, shares and split the
+    /// environment says, checked against the untiled block at the same shares.
+    ///
+    /// Single arm, like `blockCost`, and for the same reason: every distinct
+    /// share and tile length is another set of compiled engine programs, and a
+    /// test that builds two sets measures the contention as much as the
+    /// schedule.
+    @Test(.enabled(if: ProcessInfo.processInfo.environment["H3_BIG"] != nil))
+    func tiledCost() {
+        let f = CompiledBlockTests.productionBlock()
+        let tiles = QueryTiling.tiles
+        let tiled = {
+            [QueryTiling.block(f.block, f.x, tEmb: f.tEmb, index: f.index,
+                               ropeTable: f.rope, tiles: tiles)]
+        }
+        // Tiling is exact at a fixed share, so this must hold before any clock
+        // is read. It costs one untiled program set, which is the price of not
+        // timing something that computes the wrong block.
+        let a = [f.block(f.x, tEmb: f.tEmb, index: f.index, ropeTable: f.rope)]
+        let b = tiled()
+        MLX.eval(a, b)
+        let diff = MLX.abs(a[0].asType(.float32) - b[0].asType(.float32))
+            .max().item(Float.self)
+        #expect(diff == 0, "tiling changed the block at a fixed share")
+
+        MLX.eval(tiled())
+        var v: [Double] = []
+        for _ in 0 ..< 7 {
+            let t = Date(); MLX.eval(tiled()); v.append(Date().timeIntervalSince(t))
+        }
+        let sorted = v.sorted()
+        print(String(format: "\n  TILED  T=%d  qkv %.3f  post %.3f  split %@   block %8.1f ms"
+                     + "   (min %.1f max %.1f)\n",
+                     tiles, ANELinearBackend.share, ANELinearBackend.postShare,
+                     (ANELinearBackend.splitOverride.map { "\($0)" } ?? "auto") as NSString,
+                     sorted[3] * 1000, sorted.first! * 1000, sorted.last! * 1000))
+    }
+
     /// One production block at whatever share and split the environment says.
     ///
     /// Single arm on purpose. Two configurations in one process means two sets
