@@ -350,6 +350,126 @@ accepts `QK^T -> softmax -> AV` as one program — because a fused graph has one
 seam at each end and nothing in the middle. A three-stage attention island has
 already been measured by proxy, and the proxy lost.
 
+## macOS 27.0 (26A5421a): the ABI survives, and the failure mode changed
+
+The machine was upgraded from 26.5.2 (25F84, xnu-12377) to **27.0 (26A5421a,
+xnu-13432)** — a major kernel bump — after a day in which the ANE path hard
+reset it four times. What the upgrade changed, checked rather than assumed:
+
+| check | result |
+|---|---|
+| package + tests build (Swift 6.3.3, Xcode 26.6) | clean |
+| `h3 doctor` — Metal, model, memory | no problems |
+| private ABI, 12 selectors (`Tools/ANE/abi-check.m`) | **all resolve** |
+| in-memory MIL accepted by the new compiler | yes, compiles and loads |
+| `kANEFAneInstanceHint` still selects a die | yes — 3,865 pairs/s against 3,536-3,806 on 25F84 |
+| `-[_ANEClient beginRealTimeTask]` | still entitlement-gated, unchanged |
+
+The version gate now carries a list of audited builds rather than one string.
+`26A5421a` is on it, and the comment says exactly what that asserts: selectors
+resolve. The trailing letter says GM seed, so the shipping 27.0 build will
+differ and has to be re-audited rather than assumed.
+
+### Intermittent submission now fails loudly instead of silently
+
+This is the change that matters. The sequence that panicked 25F84 twice —
+`pair-stress 240 2000`, one pair every two seconds — now behaves completely
+differently:
+
+| | 25F84 | 27.0 |
+|---|---|---|
+| 2000 ms gap, 120 pairs | **0 failures**, then a DART panic at +504 s / +583 s | **114 failures**, machine alive |
+| no gap, ~38k pairs | 0 failures | 1 failure |
+
+The failures are `ANEProgramProcessRequestDirect() Failed with status=0x12 :
+statusType=0x9: Request cancelled`. The watch ran to **+1236 s with zero
+ANE/DART events** — more than double both prior reproductions — and the machine
+has taken no resets since the upgrade. The driver now **cancels** a request that
+arrives during a power transition instead of letting it proceed into an
+inconsistent DART mapping. That is the fix the three panic logs were asking for,
+and it independently confirms the characterisation built from those logs: the
+cancellations track the idle gap exactly, which is what the sleep race predicted
+and what the deferred fault was a symptom of.
+
+**The reconstructed root cause.** The old driver's own log names it: a request
+arriving during a driver-initiated power transition was met with
+`enqueueActionBlock: Skip ... fSleepInProgress: 1`, which discarded the work item
+that completes the transition and establishes the address translations — and yet
+the request was **admitted**. It then proceeded against a DART whose mappings
+were not installed or were being torn down, which produced two symptoms with one
+root:
+
+- the gated power-on blocked forever waiting for a completion that had been
+  discarded, parking a workloop thread while holding the command gate every ANE
+  client needs — the three watchdog resets;
+- the device translated against a mapping that was not valid, and the driver
+  faulted when it next exercised that DART — the three panics, whose
+  *secondary* error is a fault raised while handling a fault, meaning the
+  recovery path found the state already inconsistent.
+
+That is: **work admitted onto a die whose translations were mid-teardown.** It
+explains the deferral, since the corruption is installed at submission but only
+observed when the DART is next exercised — a later power cycle, a page recycle,
+another client — which is why it fired while idle with nothing of ours running,
+and why no clean run could ever have proven safety. It also explains why
+continuous submission was safe on the old OS: with no idle gap the timer never
+expires and the window never opens.
+
+27.0 fails closed where 25F84 failed open. The old driver reported all 120
+submissions successful and then killed the machine; the new one refuses 114 of
+them, and the refusal rate tracks the idle gap exactly.
+
+**This is inference, not a changelog.** It is reconstruction from the old
+driver's log lines, the failure timing and the new error code — consistent, but
+Apple's source is not visible. A competing reading cannot be excluded: 27.0 may
+have more aggressive power gating as a side effect of unrelated work, making the
+defect *unreachable* rather than *fixed*. The outcome is the same here; the
+difference decides whether it is still reachable by another path, which is a
+reason to file it rather than not.
+
+Two consequences:
+
+- **The engine now requires sustained feeding.** It refuses ~95% of work at a
+  2 s cadence and 1 in 38,654 at full rate. Irrelevant to a render, which
+  submits densely; fatal to the keep-alive idea, which would now be almost pure
+  refusal. That idea is dead on its own terms and stays off.
+- **A graceful refusal is testable in a way a silent wedge was not.** The bridge
+  already falls back to the GPU on a failed submission, so correctness holds and
+  the only cost is speed — and the receipts can count it.
+
+### What the upgrade does not change
+
+`fc2`'s bound, the seam economics, the 1.478x hardware ceiling, and the fact
+that `ComputeUnitKind` in the new `CoreAI` framework is a single `.neuralEngine`
+with no die granularity — see *CoreAI is not a route*. Every performance number
+in this document is also from 25F84 and is now stale: the engine share was swept
+against a GPU sustaining ~18.6 TFLOP/s, and a new Metal driver moving that moves
+the balance point. **Nothing here should be quoted as a 27.0 result until it is
+re-measured.**
+
+### CoreAI is not a route
+
+macOS 27 ships `/System/Library/Frameworks/CoreAI.framework`, an umbrella
+re-exporting `CoreAIDelegates` over six subframeworks (`CoreAIRuntime`,
+`CoreAICompiler`, `CoreAIDelegates`, `CoreAICommon`, `CoreAICache`,
+`CoreAIAsset`). It is pure Swift — no ObjC classes, no exported C symbols — and
+its API is a real generation beyond CoreML: `AIModel` loading **named
+functions**, `SpecializationOptions`, `CompilationDelegates` with third-party
+`delegatePlugins`, a `Profiler`, an `IntermediateLogger`.
+
+It is not usable here, for two reasons:
+
+- **Not linkable.** Nothing in the SDK — no header, no `.tbd`, no
+  `.swiftinterface`, and none on the system either. Its Info.plist reads
+  `DTSDKName = macosx27.0.internal`.
+- **Wrong granularity.** `ComputeUnitKind` is `cpu | gpu | neuralEngine`. One
+  neural engine, not two dies. That is the same abstraction level CoreML gave
+  us and the one this work has to go beneath, since everything here depends on
+  `kANEFAneInstanceHint` running both dies concurrently alongside Metal.
+
+The delegate plugin architecture is worth watching. If Apple opens it, it is the
+sanctioned version of what this bridge does by reverse engineering.
+
 ## Machine safety: the driver sleep race, which is not concurrency
 
 **A hard lock is reachable from a single-threaded, one-head, S=512 evaluation.

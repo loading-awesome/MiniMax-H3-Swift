@@ -189,7 +189,20 @@ bool h3_ane_is_available(void) {
         NSDictionary *env = NSProcessInfo.processInfo.environment;
         bool override = [env[@"H3_ANE_ALLOW_UNVALIDATED"] isEqualToString:@"1"];
         if (!override) {
-            if (![SysctlString("kern.osversion") isEqualToString:@"25F84"] ||
+            // Builds whose private ABI has been audited selector by selector.
+            //
+            // `26A5421a` is macOS 27.0 — a major kernel bump, xnu-12377 to
+            // xnu-13432 — and every selector this bridge calls still resolves
+            // there (`Tools/ANE/abi-check.m`, 2026-08-27). That is the only
+            // thing being asserted. Numerics, the saturation cliff, whether
+            // `kANEFAneInstanceHint` still selects a die, and whether the
+            // deferred DART fault that panicked this machine three times on
+            // 25F84 still reproduces are all **unproven on this build**.
+            //
+            // The trailing letter says GM seed. The shipping 27.0 build string
+            // will differ and will have to be re-audited rather than assumed.
+            NSArray<NSString *> *validated = @[@"25F84", @"26A5421a"];
+            if (![validated containsObject:SysctlString("kern.osversion")] ||
                 ![SysctlString("hw.model") isEqualToString:@"Mac15,14"]) return;
         }
 
