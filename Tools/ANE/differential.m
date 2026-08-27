@@ -249,6 +249,10 @@ static bool SpikeKeepEngineAwake(void) {
     // Re-entrancy: the keep-alive builds its own model through `Build`, which
     // calls this. The nested call must not recurse or refuse.
     if (settingUp) return true;
+    // Opt-in as of 2026-08-27: this mechanism is a suspect, not a fix. It
+    // preceded a DART (IOMMU) panic on ane0 by 72 seconds with nothing else
+    // touching the engine. See docs/ANE_STATUS.md.
+    if (!getenv("H3_ANE_KEEPALIVE")) return true;
     settingUp = true;
 
     // Free when it fails, and correct the moment a signed build can take it.

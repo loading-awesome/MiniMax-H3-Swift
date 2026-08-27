@@ -67,8 +67,14 @@ int main(int argc, char **argv) {
         // renders create afterwards happens with the idle timer held off.
         H3ANEProgram *p = h3_ane_program_create(64, 64, 64);
         if (!p || !h3_ane_keepalive_is_running()) {
-            fprintf(stderr, "Could not establish the keep-alive; refusing to pretend "
-                            "the engine is held.\n");
+            fprintf(stderr,
+                "The keep-alive is not running, so this tool holds nothing.\n\n"
+                "As of 2026-08-27 it is off unless H3_ANE_KEEPALIVE=1, because it is a\n"
+                "suspect rather than a fix: 72 seconds of this tool, with nothing else\n"
+                "on the machine touching the engine, ended in a kernel panic —\n"
+                "  sptm_t8110dart_clear_err: dart-ane0: Unrecoverable secondary error\n"
+                "an IOMMU fault on ANE die 0. Do not set that variable to work around\n"
+                "this message. See docs/ANE_STATUS.md, 'Machine safety'.\n");
             if (p) h3_ane_program_free(p);
             return 2;
         }

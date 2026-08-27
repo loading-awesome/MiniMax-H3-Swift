@@ -347,6 +347,27 @@ static void H3ANEKeepAliveTearDown(void) {
 /// create programs either — an engine that cannot hold itself awake is one this
 /// bridge will not keep creating on.
 static bool H3ANEKeepAliveEnsure(void) {
+    // OFF BY DEFAULT AS OF 2026-08-27, because it is a suspect rather than a
+    // fix. Seventy-two seconds after `Tools/ANE/ane-hold.m` started — with
+    // nothing else on the machine touching the engine, no benchmark, no render,
+    // only this ticking every two seconds — the kernel panicked:
+    //
+    //   sptm_t8110dart_clear_err: dart (dart-ane0:46): DART instance 1:
+    //   Unrecoverable secondary error 0x80080008
+    //
+    // That is an IOMMU fault on ANE die 0's DART, not the gate wedge this was
+    // written for. Submitting work every two seconds and letting the engine
+    // power-cycle in between produces a rate of DART teardown and restore that
+    // Apple's own stack never generates, and that is the one thing this code
+    // does. Until that is understood it does not run unless asked for.
+    static dispatch_once_t enabledOnce;
+    static bool enabled = false;
+    dispatch_once(&enabledOnce, ^{
+        enabled = [NSProcessInfo.processInfo.environment[@"H3_ANE_KEEPALIVE"]
+                      isEqualToString:@"1"];
+    });
+    if (!enabled) return true;
+
     os_unfair_lock_lock(&gKeepAliveLock);
     if (gKeepAliveTimer) { os_unfair_lock_unlock(&gKeepAliveLock); return true; }
     if (gKeepAliveSettingUp) { os_unfair_lock_unlock(&gKeepAliveLock); return true; }

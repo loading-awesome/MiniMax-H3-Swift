@@ -577,11 +577,63 @@ driver reports `Programs Open:0 Wired-Memory:0` for it, with
 persistent compiled programs and weight surfaces by design; four open programs
 with weights wired is the intended steady state, and it is released on exit.
 
+### It is a DART fault, and the keep-alive is a suspect (2026-08-27)
+
+The fourth failure of the day produced a panic log, and it says something none
+of the previous three could:
+
+```
+panic(cpu 2 caller ...): sptm_t8110dart_clear_err:
+  dart 0xfffffdc018445bc8 (dart-ane0:46): DART instance 1:
+  Unrecoverable secondary error 0x80080008
+Kernel Extensions in backtrace:
+  com.apple.sptm
+  com.apple.driver.AppleT8110DART  (dependency: IODARTFamily)
+```
+
+**DART is the IOMMU, and `dart-ane0` is ANE die 0's.** This is a device address
+translation fault, caught by the Secure Page Table Monitor and declared
+unrecoverable. It is not the software gate wedge this section was written
+around. "Secondary error" means a second fault arrived while the first was being
+handled.
+
+What was running: **only `Tools/ANE/ane-hold.m`**. No benchmark, no render, no
+test. It started at 12:07:33 and the machine panicked at 12:08:45 — **72
+seconds** — with nothing on the machine touching the engine except a 64x64x64
+pair submitted every two seconds.
+
+That inverts the story this document told an hour earlier. The keep-alive was
+built to prevent a hang and is now the best-evidenced trigger of a panic. The
+plausible mechanism is the one thing it uniquely does: because it cannot pin the
+power plane, the engine still power-cycles under client-requested power-off
+between ticks — about once every three seconds, measured — so a keep-alive at
+2 s manufactures DART teardown and restore at a rate Apple's own stack never
+produces. Rapid power-cycling with DMA mappings live is a plausible way to reach
+a secondary translation fault, and it is not a pattern any normal client makes.
+
+It is therefore **off unless `H3_ANE_KEEPALIVE=1`**, in the bridge and in
+`Tools/ANE/differential.m`. Do not set that variable to make `ane-hold` work.
+
+This also revises the earlier reading of the three watchdog resets. A DART fault
+that wedges the fabric rather than reaching the panic path would hang the kernel
+exactly as observed — no panic, no log tail, watchdog reset. The 11:02 wedge
+inside `ANE_PowerOn_gated` may be a *symptom* of a device that stopped answering
+because its DART had faulted, rather than a pure software deadlock. The sleep
+race remains a real and documented hazard; it may not be the whole story, and it
+is no longer clear it is the main one.
+
+**Nothing about this is understood well enough to keep running the engine.**
+Four failures in one day on a machine with no prior history: three watchdog
+resets and one DART panic. Two mitigations have now been tried and one of them
+made things worse.
+
 ### The rule this leaves
 
-- **`Tools/ANE/ane-hold.m` runs for the whole session, started before any ANE
-  work and left running.** Per-process protection is not enough: the exposed
-  transition opens after a process exits.
+- **Nothing runs on the engine.** As of the DART panic there is no configuration
+  of this bridge known to be safe on this machine, and the two mitigations tried
+  so far are a partial fix and a suspect. `ane-hold` refuses to run.
+- The keep-alive, in the bridge and in the spikes, is off unless
+  `H3_ANE_KEEPALIVE=1`.
 - **No ANE work of any size runs outside the keep-alive.** The toy shapes are
   not the safe subset; there is no safe subset. `h3_ane_program_create` starts
   the keep-alive before it creates anything, and returns NULL if it cannot.
