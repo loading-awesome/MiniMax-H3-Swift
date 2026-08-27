@@ -1,29 +1,29 @@
-// pair-stress.m — does concurrent dual-die submission fault the ANE's DART?
+// pair-stress.m — the ANE regression test for an OS bump.
 //
-// Isolates one variable. It submits `h3_ane_run_pair` back to back with the
-// SAME input and weight surfaces bound to both dies — the worst case, and
-// exactly what Tools/ANE/ane-hold.m was doing when the machine panicked with
-//
-//   sptm_t8110dart_clear_err: dart-ane0: DART instance 1:
-//   Unrecoverable secondary error 0x80080008
-//
-// 72 seconds in. Because it submits continuously the engine never idles, so the
-// driver's sleep race is out of the picture and what remains is the mapping
-// question: whether one _ANEIOSurfaceObject shared across two concurrent
-// requests on two DARTs is legal.
-//
-// H3_ANE_SHARE_SURFACE_OBJECT=1 restores the old behaviour for a controlled
-// reproduction. Without it, h3_ane_run wraps each surface per evaluation.
+// Submits `h3_ane_run_pair` in a loop with a configurable gap, the same
+// surfaces bound to both dies. Run it after any OS update, before adding the
+// build to the version gate's audited list:
 //
 //   xcrun clang -fobjc-arc -framework Foundation -framework Metal \
 //     -framework IOSurface -ISources/H3ANEBridge/include \
 //     Tools/ANE/pair-stress.m Sources/H3ANEBridge/H3ANEBridge.m -o /tmp/h3-pair-stress
-//   /tmp/h3-pair-stress 180        # seconds, default 120
+//   /tmp/h3-pair-stress 240 2000     # seconds, gap in ms
 //
-// A clean run is evidence, not proof: production shared only the activation and
-// took hours to fail, while the keep-alive shared activation and weights and
-// took 72 seconds. Time-to-failure is the measurement, so run it longer than
-// the failure it is trying to rule out.
+// Then watch for twenty minutes. **Nothing may be called clear before +900 s.**
+// On 25F84 this exact invocation reported zero failures and panicked the
+// machine at +504 s and +583 s; a watch stopped at +553 s missed it by thirty
+// seconds. The fault is deferred and fires while idle, so a clean run is not
+// evidence until the window has fully elapsed.
+//
+// On 27.0 the same run returns "Request cancelled" for ~95% of submissions —
+// the driver refusing work that arrives during a power transition — and the
+// machine survives. A high refusal rate at a long gap is the *healthy* result;
+// zero failures followed by a reboot is the broken one.
+//
+// H3_ANE_PER_REQUEST_SURFACE_OBJECT=1 wraps each surface per evaluation rather
+// than sharing one object across both dies. Measured equivalent on 25F84
+// (671k vs 636k pairs, both clean); kept for a future run with reason to
+// suspect it.
 
 #import <Foundation/Foundation.h>
 #import <signal.h>

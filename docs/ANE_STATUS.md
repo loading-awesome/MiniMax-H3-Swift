@@ -9,11 +9,10 @@ and refuses unrecognised machines, so an OS update becomes a fallback rather
 than a crash mid-sample; `H3_ANE_ALLOW_UNVALIDATED=1` overrides that for
 research.
 
-> **Before running anything that touches the engine, read *Machine safety: the
-> driver sleep race*.** A one-head, S=512, single-threaded evaluation hard-locked
-> this machine on 2026-08-27. The hazard is a five-second driver sleep timer, not
-> the size of the work or the number of evaluations in flight, and the bridge
-> currently has no defence against it.
+> **Only builds on the gate's audited list route to the engine.** Earning a
+> place needs the selector audit (`Tools/ANE/abi-check.m`) and a clean
+> `Tools/ANE/pair-stress.m` watch — see *Machine safety*. macOS 26.5.2 and
+> earlier carry a driver defect that hard-locks the machine and are not on it.
 
 ## The position in three lines
 
@@ -431,8 +430,8 @@ Two consequences:
 
 - **The engine now requires sustained feeding.** It refuses ~95% of work at a
   2 s cadence and 1 in 38,654 at full rate. Irrelevant to a render, which
-  submits densely; fatal to the keep-alive idea, which would now be almost pure
-  refusal. That idea is dead on its own terms and stays off.
+  submits densely — but it rules out ever adding a low-rate heartbeat, which
+  would now be almost pure refusal.
 - **A graceful refusal is testable in a way a silent wedge was not.** The bridge
   already falls back to the GPU on a failed submission, so correctness holds and
   the only cost is speed — and the receipts can count it.
@@ -506,436 +505,52 @@ It is not usable here, for two reasons:
 The delegate plugin architecture is worth watching. If Apple opens it, it is the
 sanctioned version of what this bridge does by reverse engineering.
 
-## Machine safety: the driver sleep race, which is not concurrency
-
-**A hard lock is reachable from a single-threaded, one-head, S=512 evaluation.
-Size and concurrency are not what makes it dangerous.** On 2026-08-27 a default
-`Tools/ANE/attention-spike.mm` run — serial mode, one compiled model, the
-configuration its own header calls the safe default — wedged the machine into a
-hard shutdown. No panic report was produced, because nothing faulted.
-
-The unified log stops dead. Its final line, and the boot 48 seconds later:
-
-```
-11:01:26.262 [ERROR] ANE1: enqueueActionBlock: Skip enqueueActionBlock \
-                          fSleepInProgress: 1 fDriverInitiatedSleep: 1
-11:01:26.262         ANE1: isANEActive: fIsPowered: 0, fSleepInProgress: 1
-11:01:26.262         ANE1: ANE_PowerOn_gated: Powering on ANE. blocking: 1
-11:01:26.262         ANE1: ANE_PowerOn_gated: Wait until ANE gets powered up \
-                          for client <private> retries=1
-11:01:26.262         ANE1: setPowerState:
-11:02:14.017 === system boot ===
-```
-
-Immediately before those lines the driver is transferring buffer ownership to
-`(name:h3-ane-attention pid:15415)` — the spike creating its program on ANE1.
-
-The mechanism the log describes:
-
-1. The program create arrives while that die's driver-initiated sleep is in
-   progress.
-2. The driver **refuses to enqueue** the action block because sleep is underway
-   — the completion that would finish the transition is discarded.
-3. The client still needs the die, so the driver calls `ANE_PowerOn_gated` with
-   `blocking: 1`.
-4. That wait sits inside the IOKit command gate, waiting for a power-up
-   notification only the action block from step 2 could deliver.
-5. The gate is never released. Every other ANE client — `aned`,
-   `localspeechrecog`, `naturallanguaged`, `mediaanalysisd`, `replayd` — is a
-   system daemon, and they serialise behind the same gate. Nothing crashes; a
-   kernel workloop thread is parked forever holding a lock the system needs.
-
-### The window is five seconds, and other processes keep it open
-
-The driver-initiated sleep timer, measured from the log:
-
-```
-11:04:19.724  ANE0/ANE1: ANE_PowerOff_gated: Client requesting power off: mediaanalysisd
-11:04:24.725  ANE0/ANE1: DriverInitiatedSleepTimerTimeOut
-```
-
-**5.001 seconds of idle.** macOS runs the ANE constantly for its own features,
-so both dies cycle awake → 5 s idle → sleep transition all day, driven by
-processes that have nothing to do with this repo. Arriving during a transition
-is not a coincidence to be avoided by being careful; it is a dice roll that any
-process touching the ANE after a pause is taking.
-
-The same `enqueueActionBlock: Skip` error appears in runs that survived — at
-10:58:26 during an identical spike run three minutes earlier. It survived
-because the dies were hot from a benchmark, so the blocking power-on returned
-immediately. Whether the skipped action is fatal depends on whether anything
-actually has to wait for it.
-
-The idle **second** die is the one that gets hit. Serial workloads keep ANE0 fed
-and give ANE1 nothing — the driver's own statistics after a boot read
-`ANE0: WorkSubmitted: 34` against `ANE1: WorkSubmitted: 0` — so ANE1 sleeps on
-its timer while the process is still running, and the next two-die program
-create lands in its transition. That, not concurrency, is why the earlier
-dual-evaluation lock happened: dual mode is simply the first thing to touch a
-die that has been idle long enough to sleep. **The header note in
-`attention-spike.mm` attributing the lock to concurrency is wrong**, and it sent
-the mitigation in the wrong direction.
-
-### What the runtime offers that this bridge never used
-
-System clients bracket their usage explicitly — the log lines are
-`Client requesting power on` and `Client requesting power off`. The private
-runtime exposes that protocol:
-
-```
-_ANEClient:            beginRealTimeTask, endRealTimeTask,
-                       loadRealTimeModel:options:qos:error:,
-                       unloadRealTimeModel:options:qos:error:,
-                       evaluateRealTimeWithModel:options:request:error:
-_ANEDaemonConnection:  beginRealTimeTaskWithReply:, endRealTimeTaskWithReply:
-```
-
-`H3ANEBridge.m` uses none of it. It drives `_ANEModel` directly —
-`compileWithQoS:`, `loadWithQoS:`, `evaluateWithQoS:`, `unloadWithQoS:` — with
-no power bracket and no keep-alive anywhere. A model is loaded once and then
-evaluated at whatever interval the schedule happens to produce, and the driver
-is free to begin sleeping between any two submissions.
-
-`_ANEStrings` lists no real-time-specific entitlement — only
-`restrictedAccessEntitlement` (`com.apple.aned.private.allow`) for the private
-mach service, `aggressivePowerSavingEntitlement`, the compiler-service and
-memory-unwire ones. That the bracket is reachable over the ordinary
-`com.apple.appleneuralengine` service is therefore **plausible and unverified**:
-`_ANEClient` has `initWithRestrictedAccessAllowed:` and `_ANEDaemonConnection`
-has both `daemonConnection` and `daemonConnectionRestricted`, and which one
-carries the real-time selectors has not been established. Establishing it means
-calling it, which is the operation that costs a reboot when it is wrong.
-
-### The bracket is entitlement-gated, and the keep-alive is what is left
-
-`-[_ANEClient beginRealTimeTask]` is the supported way to say the engine is in
-use. Measured 2026-08-27, it is not available to this process:
-
-| connection | `allowRestrictedAccess` | `beginRealTimeTask` |
-|---|---|---|
-| `sharedConnection` | no | **false**, 0.2 ms, three attempts |
-| `sharedPrivateConnection` | yes | **false**, 1.0 ms, three attempts |
-
-Sub-millisecond refusals on a connection that had just been activated, with no
-message from `aned` at all, on both the ordinary and the restricted connection.
-This is an entitlement check, not a failed operation and not a cold-connection
-ordering problem. `_ANEStrings` lists no real-time entitlement, so which one it
-wants is unknown; `com.apple.aned.private.allow` is the candidate, and it is an
-Apple-private entitlement that an ad-hoc signature cannot carry without
-disabling AMFI — a boot-arg change to the machine, which is a worse trade than
-the problem.
-
-Requiring the bracket therefore means refusing all ANE work, which was the
-bridge's behaviour for about twenty minutes and is not the right answer.
-
-What is left is to keep the timer from ever firing. The transition, not the
-sleep, is what is dangerous:
-
-```
-11:00:59.796  ANE0: setPowerStateGatedPriv: ANE sleep initiated
-11:00:59.811  ANE0: power_off_hardware: Powering off... done      (15 ms)
-11:03:08.109  ANE0: setPowerStateGatedPriv: ANE sleep initiated
-11:03:08.117  ANE0: power_off_hardware: Powering off... done      ( 8 ms)
-```
-
-**8 to 15 ms.** A fully-asleep die powers on correctly — that happens at every
-boot — so the exposure per create is that window, not the whole idle period.
-
-`h3_ane_keepalive_is_running` submits a 64x64x64 pair to both dies every two
-seconds, starting on the first `h3_ane_program_create` and running for the
-lifetime of the process. Both dies, because an idle die sleeps on its own timer
-while the other works, and the idle second die is the one that got hit. The
-keep-alive's own create goes first, so the real creates that follow — one per
-new shape, dozens across a benchmark — all happen with the timer held off.
-
-This is a reduction in exposure, not a proof of safety. What remains is the
-keep-alive's own first create, plus any real create that races it from another
-thread before the timer is running. Without the entitlement there is no way to
-close that, because there is no way to ask the driver to wait.
-
-Measured over 31 s of holding with no other work in the process
-(`Tools/ANE/power-bracket-check.m`, one create then idle):
-
-| signature | occurrences |
-|---|---|
-| `DriverInitiatedSleepTimerTimeOut` | **0** |
-| `setPowerStateGatedPriv: ANE sleep initiated` | **0** |
-| `enqueueActionBlock: Skip` | **0** |
-| driver events, ANE0 / ANE1 | 177 / 177 |
-
-All three signatures that preceded the hard lock are absent, and the two dies
-are equally active — the idle second die, which is the one that got hit, is
-being fed.
-
-What this does **not** do is pin the engine powered. The log shows it still
-power-cycling about once a tick, but through `ANE_PowerOff_gated: Client
-requesting power off` rather than `fDriverInitiatedSleep: 1`. Power-on from
-fully-off is the normal path and is what happens at every boot; the wedge needed
-a driver-initiated sleep in progress. Suppressing that timer is what the
-keep-alive does, and it is all it does. Pinning the engine powered is what the
-bracket would do, and that needs the entitlement.
-
-### Three watchdog resets, and what the hang actually is
-
-By the end of 2026-08-27 this machine had hard reset three times: 08:02, 11:02,
-11:49. It had never done so before that day. All three fell during ANE testing.
-
-The reset is **not** a power fault, and the owner's account settles it: hard
-shutdown followed by **self-recovery**, with nobody touching the power button.
-
-| evidence | reading |
-|---|---|
-| self-recovery, no human | the reset was automatic |
-| no panic report, ever | nothing faulted — a stuck thread does not panic |
-| `panicmedic-telemetry` in NVRAM | the OS was unresponsive and was reset for it |
-| 35 s, 48 s, 61 s from last log line to boot | not a power drop, which reboots in seconds; this is lost log tail plus watchdog timeout plus early boot |
-| `wdog` in all three `ResetCounter` records | consistent, though identical strings across three same-class events prove little on their own |
-
-The mechanism is a kernel workloop thread parked forever holding a gate, which
-stops the kernel making forward progress, which the watchdog answers by
-resetting the machine. For the 11:02 reset it is caught in the act — the log
-stops mid-sequence inside `ANE_PowerOn_gated: Wait until ANE gets powered up`,
-with the skipped enqueue two lines above. The other two have no ANE line at the
-end, which is weaker evidence than it looks: the unified log writes
-asynchronously and a wedged kernel never flushes its tail.
-
-The 11:49 reset came **2.5 minutes after** the benchmark process exited, with
-the last ANE event being a clean, normal sleep. That is the important detail for
-what to do about it. Once a process using the engine exits, the dies idle, five
-seconds later a transition opens — and macOS touches the ANE constantly for its
-own features. The access that lands in the window does not have to be ours, and
-in that case there is nothing of ours in the log at all.
-
-### Holding the engine for a session, and what that does not buy
-
-`Tools/ANE/ane-hold.m` runs for a whole work session and suppresses the idle
-timer for its duration. It creates one 64x64x64 program through the shipping
-bridge — which starts the bridge's own keep-alive — so what it holds is exactly
-what a render holds rather than a second mechanism that could drift.
-
-The scope is the point. A per-process keep-alive dies with its process, which is
-precisely when the window opens. One holder across a session collapses many
-transitions into one.
-
-**It does not pin the power plane, and nothing available to this process can.**
-`-[_ANEClient beginRealTimeTask]` is entitlement-gated and refuses on both
-connections. The engine still power-cycles under client-requested power-off —
-about eleven times in a 31 s measurement — and whether *that* transition path
-can race has not been established. This narrows the window; it does not close
-it.
-
-### The wired memory was not a leak
-
-`swiftpm-testing-helper` was observed holding 702 MB wired with 4 programs open,
-which invites a leak diagnosis. It is not one. After the process exited the
-driver reports `Programs Open:0 Wired-Memory:0` for it, with
-`ANE_UserClientClose_gated_block_invoke` on both dies. The island holds
-persistent compiled programs and weight surfaces by design; four open programs
-with weights wired is the intended steady state, and it is released on exit.
-
-### It is a DART fault, and the keep-alive is a suspect (2026-08-27)
-
-The fourth failure of the day produced a panic log, and it says something none
-of the previous three could:
-
-```
-panic(cpu 2 caller ...): sptm_t8110dart_clear_err:
-  dart 0xfffffdc018445bc8 (dart-ane0:46): DART instance 1:
-  Unrecoverable secondary error 0x80080008
-Kernel Extensions in backtrace:
-  com.apple.sptm
-  com.apple.driver.AppleT8110DART  (dependency: IODARTFamily)
-```
-
-**DART is the IOMMU, and `dart-ane0` is ANE die 0's.** This is a device address
-translation fault, caught by the Secure Page Table Monitor and declared
-unrecoverable. It is not the software gate wedge this section was written
-around. "Secondary error" means a second fault arrived while the first was being
-handled.
-
-What was running: **only `Tools/ANE/ane-hold.m`**. No benchmark, no render, no
-test. It started at 12:07:33 and the machine panicked at 12:08:45 — **72
-seconds** — with nothing on the machine touching the engine except a 64x64x64
-pair submitted every two seconds.
-
-That inverts the story this document told an hour earlier. The keep-alive was
-built to prevent a hang and is now the best-evidenced trigger of a panic. The
-plausible mechanism is the one thing it uniquely does: because it cannot pin the
-power plane, the engine still power-cycles under client-requested power-off
-between ticks — about once every three seconds, measured — so a keep-alive at
-2 s manufactures DART teardown and restore at a rate Apple's own stack never
-produces. Rapid power-cycling with DMA mappings live is a plausible way to reach
-a secondary translation fault, and it is not a pattern any normal client makes.
-
-It is therefore **off unless `H3_ANE_KEEPALIVE=1`**, in the bridge and in
-`Tools/ANE/differential.m`. Do not set that variable to make `ane-hold` work.
-
-This also revises the earlier reading of the three watchdog resets. A DART fault
-that wedges the fabric rather than reaching the panic path would hang the kernel
-exactly as observed — no panic, no log tail, watchdog reset. The 11:02 wedge
-inside `ANE_PowerOn_gated` may be a *symptom* of a device that stopped answering
-because its DART had faulted, rather than a pure software deadlock. The sleep
-race remains a real and documented hazard; it may not be the whole story, and it
-is no longer clear it is the main one.
-
-**Nothing about this is understood well enough to keep running the engine.**
-Four failures in one day on a machine with no prior history: three watchdog
-resets and one DART panic. Two mitigations have now been tried and one of them
-made things worse.
-
-### One surface object, two dies, two DARTs — the leading hypothesis
-
-`h3_ane_job_submit_pair` dispatches its two evaluations **concurrently**, with
-instance hints 1 and 2 — two dies, each behind its own DART. Every caller passes
-the *same input tensor* to both: the island (`handles.xs[split]` to gate0 and
-gate1), the shard path, and the keep-alive. Inside `h3_ane_run` each thread then
-built its `_ANERequest` from `x->object` — one cached `_ANEIOSurfaceObject`
-shared between two in-flight requests against two different IOMMUs.
-
-If that private class keeps per-evaluation mapping state — which IOVA the
-surface is currently mapped to for the requesting device — two concurrent uses
-race on it, and one request is programmed with an address not valid in its own
-DART. That is the fault the machine panicked with.
-
-The class is undocumented, so whether sharing is legal cannot be settled by
-reading. Wrapping the same IOSurface once per evaluation is cheap and removes
-the question, and `h3_ane_run` now does that. **The fix is untested against the
-hardware**, because the rule below says nothing runs.
-
-Two things make this the leading candidate rather than one of many:
-
-- It is the only structure found that can hand the device an address belonging
-  to a different mapping. Allocation size (`rows x align64(width x 2)`, floored
-  at 16 KB), `write_prefix` bounds, and padded-sequence agreement between the
-  compiled program and the allocated surface were all audited and are
-  conservative.
-- It scales with exactly what changed. The sharing is longstanding, but today
-  was the first day of sustained high-rate pair submission — dual-die spikes all
-  morning, the island routing for the first time, then a keep-alive doing it
-  every two seconds indefinitely.
-
-**And the IOMMU is not the safety net it first appears.** DART maps at 16 KB
-page granularity, so a device access that overruns a surface but stays inside
-the same page is never faulted — it silently reads or writes whatever else is
-there, and within one DART the neighbouring mappings belong to other ANE
-clients, which are Apple's. The panic is the page-crossing tail of that
-distribution. Silent corruption of another client's compute is a plausible
-outcome of the same defect, and is what the machine's owner suspected before
-this was found.
-
-### Two hypotheses tested and eliminated, and where that leaves it
-
-`Tools/ANE/pair-stress.m` submits `h3_ane_run_pair` in a loop with the same
-input and weight surfaces bound to both dies — the worst case, and what
-`ane-hold` was doing when the machine panicked 72 s in. It takes a gap in
-milliseconds, so the submission rate is the variable.
-
-| configuration | pairs | outcome |
-|---|---|---|
-| shared surface object, no gap | 671,438 in 180 s | clean |
-| per-request surface object, no gap | 636,432 in 180 s | clean |
-| shared, 200 ms gap | 879 in 180 s | clean |
-| shared, 2000 ms gap | 120 in 240 s | clean |
-| `ane-hold`, ~2000 ms gap | ~36 in 72 s | **DART panic** |
-
-**The shared `_ANEIOSurfaceObject` is not the fault.** Head to head at 3,700
-pairs a second it is indistinguishable from wrapping per evaluation, so the
-default stays shared and the alternative is available under
-`H3_ANE_PER_REQUEST_SURFACE_OBJECT=1`.
-
-**Submission volume is not the fault either.** 1.3 million pair submissions
-across six minutes did nothing. Thirty-six submissions across seventy-two
-seconds killed the machine. Whatever this is, hammering the engine is safer than
-poking it.
-
-**And a 2 s gap alone does not reproduce it.** Four minutes at exactly the rate
-that panicked the machine, clean.
-
-So there is **no reliable reproduction**, which is the most important fact for
-anything that comes next. Four failures in roughly five hours of intermittent
-heavy use is a base rate against which a four-minute clean run is worth almost
-nothing — no mitigation can be validated by absence of failure at this
-timescale, including the two already committed.
-
-What survives, unproven: the failure needs something we are not controlling.
-The machine's owner framed it as a lock CoreML takes that we cannot — and the
-shape of the evidence fits. We register as a client (the driver tracks our
-`Programs Open` and `Wired-Memory`) but we cannot register *intent*:
-`beginRealTimeTask` is the "I am holding this die" declaration and it is
-entitlement-gated. Without it the driver is free to act on the die — power it
-down, tear down and restore DART mappings — on its own schedule, while our
-mappings are live, and with no way to tell us. Continuous submission does not
-take a lock; it denies the driver the opportunity. That would explain why
-sustained work is safe, intermittent work is dangerous, and neither is
-deterministic: it needs the driver, or another client, to act in the window.
-
-Testing that needs a soak with per-client driver logging and a failure to
-examine, not another four-minute run.
-
-### The panic reproduces, with the fault deferred ~8-10 minutes (2026-08-27)
-
-Three DART panics, all byte-identical:
-
-```
-sptm_t8110dart_clear_err: dart (dart-ane0:46): DART instance 1:
-  Unrecoverable secondary error 0x80080008
-backtrace: com.apple.sptm, com.apple.driver.AppleT8110DART
-```
-
-| # | boot | panic | preceding ANE work | delay |
-|---|---|---|---|---|
-| 1 | 11:48:53 | 12:08:45 | `ane-hold` started 12:07:33 | +72 s |
-| 2 | 12:09:10 | 12:48:37 | `pair-stress` ended 12:40:13 | **+504 s** |
-| 3 | 12:48:59 | 13:08:25 | `pair-stress` ended 12:58:42 | **+583 s** |
-
-**Panics 2 and 3 are the same experiment, run twice.** The second was a
-deliberate replication of the first: `pair-stress 240 2000`, then the `probe`,
-then idle. It reproduced. That makes this a deterministic mechanism with a
-variable delay, not the random hardware event it looked like.
-
-Identical error codes are the other half of that argument. Random corruption —
-a stray write, an electrical fault — gives varied failure addresses and varied
-codes. The same DART, the same instance, and `0x80080008` three times means the
-hardware takes the same fault path every time.
-
-**The fault is deferred and fires while the machine is idle.** At the moment of
-panics 2 and 3 there had been no ANE driver activity for minutes; the last
-flushed log lines are ordinary system chatter. Whatever the work leaves behind
-surfaces eight to ten minutes later, with nothing running.
-
-Two methodological lessons, both learned the expensive way:
-
-- **A clean run proves nothing.** Every clean result recorded above —
-  1.3 million pairs, the 200 ms sweep, the 2 s sweep — was measuring a window
-  that closes before the fault arrives. They are not safety evidence.
-- **The replication was nearly called a negative.** The watch was stopped at
-  +553 s because the first panic came at +504 s. The machine panicked 30 s
-  later. Anything watching for this needs to run well past 600 s before
-  concluding anything, and the variance is not yet bounded.
-
-The fused attention graph is **not** implicated: it never executed in any of the
-three, exiting 127 on a missing binary both times it was invoked. Its apparent
-correlation with panics 2 and 3 was coincidence — the deferred clock was already
-running from the preceding stress run.
+## Machine safety: fixed on 27.0, real on 25F84 and earlier
+
+**Scope: this hazard applies to macOS 26.5.2 (25F84) and earlier. It does not
+reproduce on 27.0.** The full forensic record — four hard resets, three kernel
+panics, the hypotheses tested and eliminated — is in the git history around
+2026-08-27 rather than here, because it describes a defect that current builds
+do not have and would misread as a live warning.
+
+**What it was.** A request submitted to a die during a driver-initiated power
+transition was *admitted* rather than rejected. The driver's own log names the
+moment: `enqueueActionBlock: Skip ... fSleepInProgress: 1` discarded the work
+item that completes the transition and establishes the address translations, and
+the request proceeded anyway against a DART whose mappings were absent or being
+torn down. One root, two symptoms — a gated power-on blocking forever on a
+discarded completion (kernel hang, watchdog reset), and a translation fault
+whose *secondary* error means the recovery path found the state already
+inconsistent (`sptm_t8110dart_clear_err: dart-ane0 ... 0x80080008`).
+
+The fault was **deferred eight to ten minutes** and fired while the machine was
+idle, because the corruption is installed at submission but only observed when
+the DART is next exercised. That is why no clean run could ever have proven
+safety, and why continuous submission was always safe: with no idle gap the
+five-second timer never expires and the window never opens.
+
+**What changed.** 27.0 fails closed where 25F84 failed open. The same sequence
+now returns `ANEProgramProcessRequestDirect() ... Request cancelled` for ~95% of
+submissions at a 2 s cadence, and 1 in 38,654 at full rate — the refusal rate
+tracks the idle gap exactly. See *Intermittent submission now fails loudly*.
+
+Whether that is a targeted repair or more aggressive power gating making the
+defect unreachable is not something the outside of the driver can distinguish.
+Either way it is incidental to us, which is the reason for the rule below.
 
 ### The rule this leaves
 
-- **Nothing runs on the engine.** As of the DART panic there is no configuration
-  of this bridge known to be safe on this machine, and the two mitigations tried
-  so far are a partial fix and a suspect. `ane-hold` refuses to run.
-- The keep-alive, in the bridge and in the spikes, is off unless
-  `H3_ANE_KEEPALIVE=1`.
-- **No ANE work of any size runs outside the keep-alive.** The toy shapes are
-  not the safe subset; there is no safe subset. `h3_ane_program_create` starts
-  the keep-alive before it creates anything, and returns NULL if it cannot.
-- It covers **both** dies, at two seconds against the driver's five.
-- Anything that talks to the private runtime without going through
-  `H3ANEBridge` needs the same guard. `Tools/ANE/differential.m` has it, and the
-  five spikes that include it inherit it; the two island spikes reach the engine
-  through the bridge and inherit it there.
-- The residual first-create exposure is real and unclosable without the
-  entitlement. It is one window of 8-15 ms per process, against roughly one
-  create — not one per shape, which is what it was when this machine went down.
+- **Re-run the regression test on every OS bump.** `Tools/ANE/pair-stress.m`
+  submits one pair every two seconds for four minutes; then watch for twenty.
+  Reproductions landed at +504 s and +583 s, so nothing may be called clear
+  before +900 s — a watch was stopped at +553 s once and the machine panicked
+  30 seconds later.
+- **Only audited builds route.** The version gate carries a list, and a build
+  earns its place by the selector audit *and* a clean pair-stress watch. A GM
+  seed's build string differs from the shipping one and has to be re-audited.
+- **Sustained submission is the safe pattern and the fast one.** Intermittent
+  poking was what broke 25F84 and is what 27.0 refuses. A render submits
+  densely; nothing should add a low-rate heartbeat.
 
 ## Discharged
 

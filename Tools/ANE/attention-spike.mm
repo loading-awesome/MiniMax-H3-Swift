@@ -12,20 +12,17 @@
 //     -framework Foundation -framework IOSurface \
 //     Tools/ANE/attention-spike.mm -o /tmp/h3-ane-attention-spike
 //
-// DO NOT RUN THIS. There is no safe configuration of it today.
+// Runnable on audited builds only — macOS 27.0 and later. On 26.5.2 (25F84)
+// and earlier this spike hard-locked the machine: a program create landing in
+// the driver's idle power transition was admitted rather than refused, and the
+// fault surfaced minutes later. 27.0 refuses such a request instead. See
+// "Machine safety" in docs/ANE_STATUS.md, and confirm the build with
+// Tools/ANE/pair-stress.m before running anything here.
 //
-// This header used to call one head at S=512 in serial mode the safe default,
-// on the theory that the hard lock seen after a dual-evaluation run was caused
-// by concurrency. That was wrong, and running the supposedly safe default on
-// 2026-08-27 hard-locked the machine: the trigger is a program create landing
-// inside the driver's five-second idle sleep transition, which drops the
-// enqueue that would complete a blocking, gated power-on. One head at S=512 is
-// exactly as exposed as sixteen. See "Machine safety: the driver sleep race" in
-// docs/ANE_STATUS.md for the log and the mechanism.
-//
-// This spike creates its program lazily, holds no power bracket, and has no
-// keep-alive, so it takes that race every time it starts. It becomes runnable
-// once the bridge's real-time bracket exists and this is ported onto it.
+// The first question is still whether the compiler accepts the complete
+// QK^T -> softmax -> AV graph. Only an accepted, fused graph earns integration:
+// a three-stage island with Metal seams between the pieces has already been
+// measured by proxy and lost.
 //
 //   H3_ATTN_S=15744 H3_ATTN_H=1 /tmp/h3-ane-attention-spike
 //   H3_ATTN_MODE=dual-isolated /tmp/h3-ane-attention-spike

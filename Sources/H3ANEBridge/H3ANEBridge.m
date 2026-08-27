@@ -9,7 +9,6 @@
 #import <math.h>
 #import <stdatomic.h>
 #import <sys/sysctl.h>
-#import <os/lock.h>
 
 // The private surface holds only what this bridge actually calls. Everything
 // is reached through `objc_msgSend` with an explicit prototype cast, because
@@ -19,7 +18,6 @@ static Class DescriptorClass = nil;
 static Class ModelClass = nil;
 static Class RequestClass = nil;
 static Class IOSurfaceObjectClass = nil;
-static Class ClientClass = nil;
 
 static NSString *SysctlString(const char *name) {
     size_t length = 0;
@@ -189,19 +187,20 @@ bool h3_ane_is_available(void) {
         NSDictionary *env = NSProcessInfo.processInfo.environment;
         bool override = [env[@"H3_ANE_ALLOW_UNVALIDATED"] isEqualToString:@"1"];
         if (!override) {
-            // Builds whose private ABI has been audited selector by selector.
+            // Builds that have passed both gates: the selector audit
+            // (`Tools/ANE/abi-check.m`) and a clean `Tools/ANE/pair-stress.m`
+            // watch past +900 s.
             //
-            // `26A5421a` is macOS 27.0 — a major kernel bump, xnu-12377 to
-            // xnu-13432 — and every selector this bridge calls still resolves
-            // there (`Tools/ANE/abi-check.m`, 2026-08-27). That is the only
-            // thing being asserted. Numerics, the saturation cliff, whether
-            // `kANEFAneInstanceHint` still selects a die, and whether the
-            // deferred DART fault that panicked this machine three times on
-            // 25F84 still reproduces are all **unproven on this build**.
+            // **25F84 and earlier are deliberately absent.** They carry a
+            // driver defect that admits a request arriving during a power
+            // transition and hard-locks the machine minutes later, with no
+            // symptom at submission time. See "Machine safety" in
+            // docs/ANE_STATUS.md. There is no configuration of this bridge that
+            // is safe there, so it does not route.
             //
-            // The trailing letter says GM seed. The shipping 27.0 build string
-            // will differ and will have to be re-audited rather than assumed.
-            NSArray<NSString *> *validated = @[@"25F84", @"26A5421a"];
+            // The trailing letter on 26A5421a says GM seed; the shipping 27.0
+            // build string will differ and has to be re-audited, not assumed.
+            NSArray<NSString *> *validated = @[@"26A5421a"];
             if (![validated containsObject:SysctlString("kern.osversion")] ||
                 ![SysctlString("hw.model") isEqualToString:@"Mac15,14"]) return;
         }
@@ -213,7 +212,6 @@ bool h3_ane_is_available(void) {
         ModelClass           = NSClassFromString(@"_ANEInMemoryModel");
         RequestClass         = NSClassFromString(@"_ANERequest");
         IOSurfaceObjectClass = NSClassFromString(@"_ANEIOSurfaceObject");
-        ClientClass          = NSClassFromString(@"_ANEClient");
         available =
             ClassHasClassSelector(DescriptorClass, @selector(modelWithMILText:weights:optionsPlist:)) &&
             ClassHasClassSelector(ModelClass, @selector(inMemoryModelWithDescriptor:)) &&
@@ -227,219 +225,6 @@ bool h3_ane_is_available(void) {
             ClassHasInstanceSelector(ModelClass, @selector(evaluateWithQoS:options:request:error:));
     });
     return available;
-}
-
-#pragma mark - Power bracket
-
-/// `+[_ANEClient sharedConnection]`. Not retained: it is the framework's own
-/// singleton and outlives this process's interest in it, which matches how the
-/// rest of this file holds runtime objects.
-static id gPowerClient = nil;
-static bool gPowerHeld = false;
-static os_unfair_lock gPowerLock = OS_UNFAIR_LOCK_INIT;
-
-bool h3_ane_power_is_held(void) {
-    os_unfair_lock_lock(&gPowerLock);
-    bool held = gPowerHeld;
-    os_unfair_lock_unlock(&gPowerLock);
-    return held;
-}
-
-static void H3ANEPowerReleaseAtExit(void) { h3_ane_power_release(); }
-
-bool h3_ane_power_acquire(void) {
-    if (!h3_ane_is_available()) return false;
-    if (!ClassHasClassSelector(ClientClass, @selector(sharedConnection)) ||
-        !ClassHasInstanceSelector(ClientClass, @selector(beginRealTimeTask))) return false;
-
-    os_unfair_lock_lock(&gPowerLock);
-    if (gPowerHeld) { os_unfair_lock_unlock(&gPowerLock); return true; }
-
-    bool ok = false;
-    @try {
-        if (!gPowerClient) {
-            gPowerClient = ((id(*)(Class, SEL))objc_msgSend)(
-                ClientClass, @selector(sharedConnection));
-        }
-        if (gPowerClient) {
-            ok = ((BOOL(*)(id, SEL))objc_msgSend)(
-                gPowerClient, @selector(beginRealTimeTask));
-        }
-    } @catch (NSException *exception) {
-        NSLog(@"[H3ANEBridge] private runtime exception while taking the power "
-              @"bracket: %@", exception);
-        ok = false;
-    }
-
-    if (ok) {
-        gPowerHeld = true;
-        static dispatch_once_t once;
-        dispatch_once(&once, ^{ atexit(H3ANEPowerReleaseAtExit); });
-    } else {
-        // Measured 2026-08-27: refused on both `sharedConnection` and
-        // `sharedPrivateConnection`, in under a millisecond, on retries. The
-        // bracket is entitlement-gated and this process does not have it, so
-        // the keep-alive below is the defence instead.
-        static dispatch_once_t once;
-        dispatch_once(&once, ^{
-            NSLog(@"[H3ANEBridge] ANE power bracket refused (no entitlement); "
-                  @"holding the engine awake with the keep-alive instead.");
-        });
-    }
-    os_unfair_lock_unlock(&gPowerLock);
-    return ok;
-}
-
-void h3_ane_power_release(void) {
-    os_unfair_lock_lock(&gPowerLock);
-    if (gPowerHeld && gPowerClient) {
-        @try {
-            ((BOOL(*)(id, SEL))objc_msgSend)(gPowerClient, @selector(endRealTimeTask));
-        } @catch (NSException *exception) {
-            NSLog(@"[H3ANEBridge] private runtime exception while releasing the "
-                  @"power bracket: %@", exception);
-        }
-    }
-    gPowerHeld = false;
-    os_unfair_lock_unlock(&gPowerLock);
-}
-
-#pragma mark - Keep-alive
-
-/// Why this exists, and why it is not optional.
-///
-/// The driver sleeps five seconds after its last work, and a program create
-/// landing inside that sleep *transition* wedges the machine — the driver skips
-/// the action block that completes the transition, and the blocking, gated
-/// power-on it then issues waits forever inside the command gate every other
-/// ANE client needs. Nothing faults, so there is no panic. See "Machine safety"
-/// in `docs/ANE_STATUS.md`.
-///
-/// The supported way to prevent that is `-[_ANEClient beginRealTimeTask]`,
-/// which declares the engine in use. It is entitlement-gated and refuses this
-/// process (measured on both connections, sub-millisecond, on retries), so the
-/// bracket is unavailable and this is what is left: submit trivial work to both
-/// dies more often than the five-second timer, so the timer never fires while
-/// this process intends to use the engine, so no transition is ever open for a
-/// create to land in.
-///
-/// **The residual risk is the keep-alive's own first create**, plus any real
-/// create that races it from another thread before the timer is running. The
-/// transition is 8-15 ms wide and a fully-asleep die powers on correctly, so
-/// the exposure is that window against a handful of creates at startup rather
-/// than against every create in the session — one per new shape, dozens across
-/// a benchmark. That is a large reduction in dice rolls, not a proof, and it is
-/// the best available without the entitlement.
-static dispatch_source_t gKeepAliveTimer = nil;
-static bool gKeepAliveSettingUp = false;
-static H3ANEProgram *gKeepAliveP0 = NULL, *gKeepAliveP1 = NULL;
-static H3ANETensor *gKeepAliveX = NULL, *gKeepAliveW = NULL;
-static H3ANETensor *gKeepAliveY0 = NULL, *gKeepAliveY1 = NULL;
-static os_unfair_lock gKeepAliveLock = OS_UNFAIR_LOCK_INIT;
-
-/// Small enough to be free, large enough to be a legal program: 64x64x64 fp16
-/// is 8 KB a surface and runs in microseconds.
-#define H3_ANE_KEEPALIVE_DIM 64
-/// Under the driver's five-second idle timer with room for a late tick.
-#define H3_ANE_KEEPALIVE_SECONDS 2.0
-
-bool h3_ane_keepalive_is_running(void) {
-    os_unfair_lock_lock(&gKeepAliveLock);
-    bool running = gKeepAliveTimer != nil;
-    os_unfair_lock_unlock(&gKeepAliveLock);
-    return running;
-}
-
-static void H3ANEKeepAliveTearDown(void) {
-    if (gKeepAliveTimer) { dispatch_source_cancel(gKeepAliveTimer); gKeepAliveTimer = nil; }
-    if (gKeepAliveP0) { h3_ane_program_free(gKeepAliveP0); gKeepAliveP0 = NULL; }
-    if (gKeepAliveP1) { h3_ane_program_free(gKeepAliveP1); gKeepAliveP1 = NULL; }
-    if (gKeepAliveX)  { h3_ane_tensor_free(gKeepAliveX);  gKeepAliveX = NULL; }
-    if (gKeepAliveW)  { h3_ane_tensor_free(gKeepAliveW);  gKeepAliveW = NULL; }
-    if (gKeepAliveY0) { h3_ane_tensor_free(gKeepAliveY0); gKeepAliveY0 = NULL; }
-    if (gKeepAliveY1) { h3_ane_tensor_free(gKeepAliveY1); gKeepAliveY1 = NULL; }
-}
-
-/// Starts the keep-alive if it is not already running. Returns false only if
-/// the engine could not be set up at all, in which case the caller must not
-/// create programs either — an engine that cannot hold itself awake is one this
-/// bridge will not keep creating on.
-static bool H3ANEKeepAliveEnsure(void) {
-    // OFF BY DEFAULT AS OF 2026-08-27, because it is a suspect rather than a
-    // fix. Seventy-two seconds after `Tools/ANE/ane-hold.m` started — with
-    // nothing else on the machine touching the engine, no benchmark, no render,
-    // only this ticking every two seconds — the kernel panicked:
-    //
-    //   sptm_t8110dart_clear_err: dart (dart-ane0:46): DART instance 1:
-    //   Unrecoverable secondary error 0x80080008
-    //
-    // That is an IOMMU fault on ANE die 0's DART, not the gate wedge this was
-    // written for. Submitting work every two seconds and letting the engine
-    // power-cycle in between produces a rate of DART teardown and restore that
-    // Apple's own stack never generates, and that is the one thing this code
-    // does. Until that is understood it does not run unless asked for.
-    static dispatch_once_t enabledOnce;
-    static bool enabled = false;
-    dispatch_once(&enabledOnce, ^{
-        enabled = [NSProcessInfo.processInfo.environment[@"H3_ANE_KEEPALIVE"]
-                      isEqualToString:@"1"];
-    });
-    if (!enabled) return true;
-
-    os_unfair_lock_lock(&gKeepAliveLock);
-    if (gKeepAliveTimer) { os_unfair_lock_unlock(&gKeepAliveLock); return true; }
-    if (gKeepAliveSettingUp) { os_unfair_lock_unlock(&gKeepAliveLock); return true; }
-    gKeepAliveSettingUp = true;
-    os_unfair_lock_unlock(&gKeepAliveLock);
-
-    // Best effort, and free when it works: if the bracket ever becomes
-    // reachable the keep-alive becomes belt and braces rather than the belt.
-    h3_ane_power_acquire();
-
-    const int d = H3_ANE_KEEPALIVE_DIM;
-    bool ok = false;
-    // This is the one exposed create in the process. It goes first, so every
-    // real create that follows happens with the idle timer held off.
-    gKeepAliveP0 = h3_ane_program_create(d, d, d);
-    gKeepAliveP1 = h3_ane_program_create(d, d, d);
-    gKeepAliveX  = h3_ane_tensor_create(d, d);
-    gKeepAliveW  = h3_ane_tensor_create(d, d);
-    gKeepAliveY0 = h3_ane_tensor_create(d, d);
-    gKeepAliveY1 = h3_ane_tensor_create(d, d);
-    ok = gKeepAliveP0 && gKeepAliveP1 && gKeepAliveX && gKeepAliveW
-        && gKeepAliveY0 && gKeepAliveY1;
-
-    os_unfair_lock_lock(&gKeepAliveLock);
-    gKeepAliveSettingUp = false;
-    if (!ok) {
-        NSLog(@"[H3ANEBridge] keep-alive setup failed; refusing to create programs. "
-              @"See docs/ANE_STATUS.md, 'Machine safety'.");
-        H3ANEKeepAliveTearDown();
-        os_unfair_lock_unlock(&gKeepAliveLock);
-        return false;
-    }
-
-    dispatch_queue_t queue = dispatch_queue_create("h3.ane.keepalive", DISPATCH_QUEUE_SERIAL);
-    gKeepAliveTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
-    dispatch_source_set_timer(gKeepAliveTimer,
-                              dispatch_time(DISPATCH_TIME_NOW, 0),
-                              (uint64_t)(H3_ANE_KEEPALIVE_SECONDS * NSEC_PER_SEC),
-                              NSEC_PER_SEC / 4);
-    dispatch_source_set_event_handler(gKeepAliveTimer, ^{
-        // Both dies: an idle die sleeps on its own timer even while the other
-        // is busy, and the idle second die is the one that got hit.
-        if (!h3_ane_run_pair(gKeepAliveP0, gKeepAliveX, gKeepAliveW, gKeepAliveY0,
-                             gKeepAliveP1, gKeepAliveX, gKeepAliveW, gKeepAliveY1)) {
-            static dispatch_once_t once;
-            dispatch_once(&once, ^{
-                NSLog(@"[H3ANEBridge] keep-alive tick failed; the engine is no longer "
-                      @"being held awake.");
-            });
-        }
-    });
-    dispatch_resume(gKeepAliveTimer);
-    os_unfair_lock_unlock(&gKeepAliveLock);
-    return true;
 }
 
 #pragma mark - Programs
@@ -544,12 +329,6 @@ H3ANEForm h3_ane_program_form(H3ANEProgram *p) { return p ? p->form : H3ANEFormM
 
 H3ANEProgram* h3_ane_program_create_form(int s, int k, int n, H3ANEForm form) {
     if (!h3_ane_is_available() || s <= 0 || k <= 0 || n <= 0) return NULL;
-    // Before anything else reaches the driver: a create landing inside the
-    // idle sleep transition is what takes the machine down, and the keep-alive
-    // is what stops that transition from ever starting while this process is
-    // using the engine. Its own setup creates through this function, hence the
-    // reentrancy flag rather than a second create path.
-    if (!H3ANEKeepAliveEnsure()) return NULL;
 
     H3ANEProgram *p = NULL;
     @try {
@@ -654,39 +433,19 @@ bool h3_ane_run(H3ANEProgram *p, H3ANETensor *x, H3ANETensor *w, H3ANETensor *y,
     }
 
     @try {
-    // **A fresh `_ANEIOSurfaceObject` per evaluation, not the one cached on the
-    // tensor.** `h3_ane_job_submit_pair` runs two evaluations concurrently
-    // against two dies, each with its own DART, and every caller passes the
-    // same input tensor to both — the island, the shard path, and the
-    // keep-alive all do. Sharing one surface object across two in-flight
-    // requests shares whatever per-evaluation mapping state the private class
-    // keeps on it, and a request programmed with an IOVA that is not valid in
-    // its own DART is exactly the fault this machine panicked with on
-    // 2026-08-27:
-    //
-    //   sptm_t8110dart_clear_err: dart-ane0: DART instance 1:
-    //   Unrecoverable secondary error 0x80080008
-    //
-    // The class is private and undocumented, so whether it is safe to share is
-    // unknowable by reading; wrapping the same IOSurface again is cheap and
-    // removes the question. **This is untested against the hardware.**
-    // **Measured, and it is not the fault.** The theory was that sharing one
-    // `_ANEIOSurfaceObject` between two concurrent requests on two dies — two
-    // DARTs — races whatever per-evaluation mapping state the private class
-    // holds, and programs one request with an IOVA invalid in its own DART.
-    // Tested head to head at production submission rates on 2026-08-27:
+    // **Sharing one `_ANEIOSurfaceObject` across both dies is not a fault.**
+    // `h3_ane_job_submit_pair` runs two evaluations concurrently against two
+    // dies, each with its own DART, and every caller binds the same input
+    // tensor to both. The theory was that this races whatever per-evaluation
+    // mapping state the private class holds. Measured head to head at
+    // production submission rates on 2026-08-27:
     //
     //   shared object      671,438 pairs in 180 s, 0 failures
     //   per-request object 636,432 pairs in 180 s, 0 failures
     //
-    // Both clean, so the shared object stays: it is the simpler code and the
-    // change was not earned. `H3_ANE_PER_REQUEST_SURFACE_OBJECT=1` keeps the
-    // alternative available for a future run that has reason to suspect it.
-    //
-    // What those runs did establish is where the fault is not. 1.3 million pair
-    // submissions across six minutes did nothing, while 36 submissions spread
-    // over 72 seconds panicked the machine. Failures track **power
-    // transitions**, not submission volume.
+    // So the shared object stays — simpler code, and the change was not
+    // earned. `H3_ANE_PER_REQUEST_SURFACE_OBJECT=1` keeps the alternative for a
+    // future run with reason to suspect it.
     static dispatch_once_t shareOnce;
     static bool perRequest = false;
     dispatch_once(&shareOnce, ^{
