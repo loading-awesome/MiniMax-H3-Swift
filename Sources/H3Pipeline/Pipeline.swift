@@ -84,6 +84,8 @@ package enum PipelineRuntime {
         package let aneCFGOverlap: Bool
         package let aneNativeIO: Bool
         package let aneQueryTiles: Int
+        /// Pieces the contraction was cut into, 0 if it was never split.
+        package let aneSplitContraction: Int
 
         package static func observed() -> ArithmeticProfile {
             let dtype: String
@@ -98,7 +100,8 @@ package enum PipelineRuntime {
                 aneDeclinedProjections: ANELinearBackend.declinedProjections,
                 aneCFGOverlap: ANELinearBackend.overlappedCFG,
                 aneNativeIO: ANELinearBackend.usedNativeIO,
-                aneQueryTiles: ANELinearBackend.queryTilesUsed)
+                aneQueryTiles: ANELinearBackend.queryTilesUsed,
+                aneSplitContraction: ANELinearBackend.splitContractions)
         }
     }
 

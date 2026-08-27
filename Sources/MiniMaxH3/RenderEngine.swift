@@ -153,7 +153,8 @@ private enum RenderOperation {
                      aneDeclinedProjections: profile.aneDeclinedProjections,
                      aneCFGOverlap: profile.aneCFGOverlap,
                      aneNativeIO: profile.aneNativeIO,
-                     aneQueryTiles: profile.aneQueryTiles)
+                     aneQueryTiles: profile.aneQueryTiles,
+                     aneSplitContraction: profile.aneSplitContraction)
     }
 
     static func execute(jobID: UUID, request: RenderRequest, models: ModelSet,

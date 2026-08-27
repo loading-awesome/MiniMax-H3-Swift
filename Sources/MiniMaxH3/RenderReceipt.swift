@@ -80,16 +80,26 @@ public struct RenderReceipt: Codable, Sendable {
         /// Number of query tiles used by the block scheduler. Zero means the
         /// observed render stayed on the ordinary whole-attention route.
         public let aneQueryTiles: Int?
+        /// Pieces the engine's contraction was cut into, 0 if it ran whole.
+        ///
+        /// **This is arithmetic, not scheduling.** Splitting replaces one fp16
+        /// reduction over the whole `k` with `n` shorter ones summed in fp32,
+        /// which is a different — measurably closer to fp32 — accumulation. Two
+        /// renders from the same seed and checkpoint that differ only here are
+        /// different samples, which is exactly what this section exists to say.
+        public let aneSplitContraction: Int?
 
         public init(ditDType: String, aneRoutedProjections: [String],
                     aneDeclinedProjections: [String], aneCFGOverlap: Bool? = nil,
-                    aneNativeIO: Bool? = nil, aneQueryTiles: Int? = nil) {
+                    aneNativeIO: Bool? = nil, aneQueryTiles: Int? = nil,
+                    aneSplitContraction: Int? = nil) {
             self.ditDType = ditDType
             self.aneRoutedProjections = aneRoutedProjections
             self.aneDeclinedProjections = aneDeclinedProjections
             self.aneCFGOverlap = aneCFGOverlap
             self.aneNativeIO = aneNativeIO
             self.aneQueryTiles = aneQueryTiles
+            self.aneSplitContraction = aneSplitContraction
         }
     }
 
@@ -142,7 +152,10 @@ public struct RenderReceipt: Codable, Sendable {
         // a v5 file can.
         // 6 adds native-I/O and query-tile observations. They are optional so
         // older receipts remain readable; nil means unrecorded, not disabled.
-        schemaVersion = 6
+        // 7 adds `compute.aneSplitContraction`, which is arithmetic rather than
+        // scheduling: a split contraction is a different accumulation, so a v6
+        // receipt cannot distinguish two renders that differ only in it.
+        schemaVersion = 7
         self.jobID = jobID
         status = .running
         startedAt = .now
