@@ -12,13 +12,14 @@ research.
 ## The position in three lines
 
 **A production block runs 1162.7 ms unrouted and 1047.5 ms routed: 1.110x**,
-against a 1.15x gate. Every hardware objection is discharged and the remaining
-gap is one projection, `fc2`, which is held off the engine because its partial
-sums cannot be proven clear of the 2^15 saturation cliff on the data that
-exists.
+against a 1.15x gate. Every hardware objection is discharged. `fc2` stays off
+the engine (saturation).
 
-That is not a scheduling problem, and this document said for some time that it
-was. See below.
+**Overlapping the two CFG branches was the last idea with a multiple in it, and
+it is measured and closed.** It works — the schedule is bit-identical and
+recovers real overlap — but it never beats the plain routed path in absolute
+time. The engine is too slow relative to the GPU for the columns it would have
+to take. See *The CFG overlap ceiling*.
 
 ## Discharged
 
@@ -88,8 +89,141 @@ of 11:
 | routing on | **1047.5 ms** |
 | | **1.110x** — 5.8 s off a 50-block forward |
 
-**This is short of the 1.15x gate, and `fc2` is what is left — and `fc2` is not
-coming.** `Tools/ANE/saturation_bound.py` settles it.
+**This is short of the 1.15x gate, and `fc2` is not coming** without oracles
+for every block. `Tools/ANE/saturation_bound.py` settles it.
+
+## The CFG overlap ceiling
+
+Classifier-free guidance is two independent forwards, and run back to back the
+engine is idle for the 37.5% of each block that is GPU attention. Overlapping
+them was the remaining idea. It is implemented, it is correct, and it does not
+pay. All of the following is measured on this machine.
+
+**The hardware cooperates completely.** An engine evaluation and a GPU burst
+submitted together cost `max`, not `sum` — 134.7 ms of engine fully hidden
+inside 341.1 ms of GPU, 340.1 ms together against 475.7 serial, 100.7% of the
+smaller job recovered (`ANEFormTests.engineBesideGPU`). Nothing about the
+silicon is in the way.
+
+**The engine's rate is the wall.** Swept across the whole decomposition — cut by
+output column at full length, by sequence tile at full width, and the rectangles
+between — the private path holds 7.7–7.95 TFLOP/s across both dies and never
+exceeds it (`ANEFormTests.aneForm`):
+
+| s | n | matmul TF/s | conv 1x1 TF/s |
+|---|---|---|---|
+| 15744 | 3072 | 7.69 | 3.90 |
+| 15744 | 10752 | 7.9 | 3.9 |
+| 15744 | 21504 | 4.44 | refused |
+| 8192 | 10752 | **7.95** | 3.96 |
+| 2048 | 3072 | 7.65 | 3.90 |
+
+Expressing the projection as a **1x1 convolution** — the engine's native form,
+and what Core ML's own harness measured at 5.46 TFLOP/s a die — is bit-identical
+and **2.6x slower** here. That gap was the one candidate for a faster lowering
+and it is refuted. Core ML's figure does not transfer: it was measured on a
+different decomposition, and the shapes that produced it are ones the ANE
+compiler refuses through this path (`C5376H1W21504` is outside its supported
+range). The engine wants spatial reuse; a linear over a `1 x S` image has none,
+which is also why the public 18.6 TOPS fp16 figures come from 64x64
+convolutions and why projects that measure this hardware honestly report 5–9%
+of peak.
+
+**So the arithmetic closes.** The GPU sustains 19.0–19.4 TFLOP/s on every
+projection in the block and 16.7 on attention (`GEMMCeilingTests`), against the
+engine's 7.9. Per CFG pair at production width, 2339.0 ms of GPU-equivalent
+work, of which 1050.4 ms is routable. Moving a fraction of the columns to an
+engine at 0.41 of the GPU's rate, and paying 180–255 ms a pair to convert,
+upload, copy back and re-join, gives:
+
+| engine share | serial | pipelined |
+|---|---:|---:|
+| unrouted | 2339.0 ms | 2339.5 ms |
+| **0.286 (shipping)** | **2219.8 ms** | 2226.8 ms |
+| 0.33 | 2318.8 ms | 2244.4 ms |
+| 0.38 | 2464.8 ms | 2285.7 ms |
+| 0.45 | 2617.2 ms | 2341.0 ms |
+| 0.60 | 3069.7 ms | 2546.6 ms |
+
+The pipeline does what it claims — 1.205x against a serial block at the same
+share — and the minimum of the table is still the configuration that already
+shipped. Raising the engine's share buys overlap and loses more than it buys.
+
+`H3_ANE_CFG_OVERLAP=1` enables the schedule; it is off by default. The receipt
+records `aneCFGOverlap` when it ran.
+
+### What the schedule is, since it is kept
+
+Two threads was the wrong shape and measured 0.987x. mlx-swift serialises every
+`eval` behind one global recursive lock, so a thread blocking on the engine
+holds the GPU's turn and the two halves take turns. There is one MLX thread; the
+engine has its own thread and never touches MLX (`ANELinearBackend.Engine`), and
+projections are submitted with `begin` and collected with `value` as late as the
+data dependency allows. The branches run half a block out of phase so every
+engine job has GPU work already queued to hide behind. Two ordering rules were
+each worth over 200 ms a pair and are easy to get backwards:
+
+- The engine's activation upload goes on **its own stream**. On the default
+  stream it queues behind the attention it was supposed to run beside.
+- A branch's post-attention elementwise must be queued **before** the other
+  branch's attention is submitted. Metal runs a stream in order, so an `fc1`
+  whose `h2` sits behind 441 ms of unrelated attention cannot start until that
+  attention ends, cancelling exactly the overlap it was meant to provide.
+
+### Query tiling, measured and closed
+
+Tiling the queries opens a seam the channel split does not have: everything
+after attention in a block is row-wise, so tile `i-1`'s `out` and `fc1` can run
+on the engine while the GPU attends tile `i`. Softmax is over the key axis, so
+splitting queries and keeping the whole KV is arithmetically free — **measured
+bit-identical at T = 2, 4, 8, 16** (`TiledAttentionTests`), and the tiled block
+is bit-identical to the untiled one at the same share (`QueryTilingTests`).
+
+It works, and it is not enough. One production block, one configuration per
+process, each interleaved against the untiled block at the same share:
+
+| post share | T | untiled | tiled | tiling recovers |
+|---|---:|---:|---:|---:|
+| **0.286 (shipping)** | — | **1082.0 ms** | — | — |
+| 0.286 | 4 | 1108.9 ms | 1130.1 ms | −21 ms |
+| 0.35 | 4 | 1155.6 ms | 1136.1 ms | +20 ms |
+| 0.40 | 4 | 1216.4 ms | 1170.0 ms | +46 ms |
+| 0.45 | 8 | 1260.3 ms | 1209.4 ms | +51 ms |
+| 0.45 | 16 | 1270.8 ms | 1255.8 ms | +15 ms |
+
+Same-share tiling does nothing, as predicted — it costs the 21 ms of tiling tax
+and recovers nothing, because at 0.286 the GPU shard and the engine shard are
+already balanced and there is nothing exposed to hide. Tiling recovers 15–51 ms
+once the share is raised, which is the right order for the ~58 ms the Gantt
+predicted. **But every increase in the share costs more than tiling gives
+back**, monotonically, so the minimum of the table is the configuration that
+already ships. Best tiled is 1136.1 ms against a 1011 ms gate.
+
+The reason is one number. Moving the share from 0.286 to 0.45 removes 54 ms of
+GPU work and adds **144 ms** of engine work, because the engine runs at 0.373 of
+the GPU's rate on this shape. Tiling can only hide engine time inside the
+attention window; it cannot make it smaller.
+
+**The lever's perfect-execution ceiling is the gate itself.** With 100% engine
+duty for the whole window, the post-attention phase costs only its GPU shard:
+161 ms at the largest share whose engine time still fits inside 448 ms of
+attention, against 252 ms today — a 91 ms saving, landing at **~991 ms against
+a 1011 ms gate**. Two percent of margin, requiring the engine to be busy every
+millisecond the GPU attends while one MLX thread also runs sixteen uploads and
+every gather and norm in the block. Measured duty is about half that, which is
+the 1136 ms above. There is no version of this that clears the gate with room.
+
+### What would move it
+
+Nothing on this path — the CFG overlap and the query tiling were the two
+schedules the arithmetic allowed, and both are measured and closed. The engine would have to reach ~9.3 TFLOP/s — 18% above
+anything measured here — before overlapping beats not overlapping, and 1.5x on
+a guided step needs the pair under 1560 ms, which is below the GPU-only floor of
+1288.6 ms plus any engine share at all. The levers that remain all change the
+output: the cross-step cache (shipping, 1.9x, an approximation), sparse
+attention over the 37.5% that is attention, or int8 weights against a
+bf16-pinned contract.
+
 
 ### The saturation bound
 

@@ -95,6 +95,39 @@ typedef struct H3ANEProgram H3ANEProgram;
 /// Compiles and loads. Returns NULL if the engine refuses the shape, which is
 /// a normal outcome to fall back from rather than an error to report.
 H3ANEProgram* _Nullable h3_ane_program_create(int s, int k, int n);
+
+/// How the linear is expressed to the engine's compiler.
+///
+/// The two forms compute the same thing and differ only in what the ANE
+/// compiler is handed, which is worth 40% of the rate. `H3ANEFormMatmul`
+/// declares `a` as `[1,k,1,s]` and transposes it to `[1,1,s,k]` **inside the
+/// graph**, so the engine moves a 169 MB activation before it multiplies
+/// anything. `H3ANEFormConv` is a 1x1 convolution over `[1,k,1,s]` — channels
+/// in, channels out, sequence as the spatial axis — which is the engine's
+/// native shape and needs no transpose.
+///
+/// The two forms want the weight in different orientations, and the conv form
+/// wants the one the checkpoint already holds:
+///
+/// | form | x | w | y |
+/// |---|---|---|---|
+/// | matmul | `[k,s]` | `[k,n]` | `[s,n]` |
+/// | conv   | `[k,s]` | `[n,k]` | `[n,s]` |
+///
+/// The conv form's output arrives channel-major, so the caller transposes it
+/// on the GPU — which is where transposes are cheap — instead of asking the
+/// engine to do it.
+typedef enum {
+    H3ANEFormMatmul = 0,
+    H3ANEFormConv   = 1,
+} H3ANEForm;
+
+H3ANEProgram* _Nullable h3_ane_program_create_form(int s, int k, int n, H3ANEForm form);
+
+/// Which form this program was compiled in; it decides the tensor shapes the
+/// run calls demand.
+H3ANEForm h3_ane_program_form(H3ANEProgram* _Nonnull p);
+
 void h3_ane_program_free(H3ANEProgram* _Nullable p);
 
 /// Tensor shapes this program requires: x is `[k, s]`, w is `[k, n]`,

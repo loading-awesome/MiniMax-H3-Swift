@@ -327,19 +327,35 @@ package struct AttentionLayer {
         }
     }
 
-    /// `x` is `[S, hidden]` or `[B, S, hidden]`.
+    /// Q, K, V after the projection, per-head RMSNorm and RoPE. GPU attention
+    /// consumes this; the output projection is a separate call so a second
+    /// CFG branch can occupy the engine while this one attends.
+    /// Submits `qkv` to the engine and returns without waiting for it.
     ///
-    /// - Parameter context: where in the render this call sits. Nil means dense:
-    ///   a sparse backend that does not know which block it is in, or how far
-    ///   through the schedule, cannot honour its own dense warm-up or its
-    ///   first/last-block exclusions, and guessing is worse than declining.
-    package func callAsFunction(_ x: MLXArray, ropeTable: MLXArray?,
-                               context: AttentionContext? = nil) -> MLXArray {
+    /// Everything after the projection — the split, the per-head norms, RoPE —
+    /// needs the numbers, so it lives in ``finishQKV``. The gap between the two
+    /// is where the other CFG branch gets the GPU.
+    package func beginQKV(_ x: MLXArray) -> ANELinearBackend.Pending {
+        ANELinearBackend.begin(x: x, weight: qkvWeight, label: "qkv")
+    }
+
+    package func finishQKV(_ pending: ANELinearBackend.Pending, ropeTable: MLXArray?)
+        -> (q: MLXArray, k: MLXArray, v: MLXArray) {
+        shapeQKV(pending.value(), ropeTable: ropeTable)
+    }
+
+    package func projectQKV(_ x: MLXArray, ropeTable: MLXArray?)
+        -> (q: MLXArray, k: MLXArray, v: MLXArray) {
         let qkv = ANELinearBackend.isEnabled
             ? ANELinearBackend.project(x: x, weight: qkvWeight, label: "qkv")
             : matmul(x, qkvWeight.T)
+        return shapeQKV(qkv, ropeTable: ropeTable)
+    }
+
+    private func shapeQKV(_ qkv: MLXArray, ropeTable: MLXArray?)
+        -> (q: MLXArray, k: MLXArray, v: MLXArray) {
         let qkvParts = qkv.split(parts: 3, axis: -1)
-        
+
         let targetShape = qkvParts[0].shape.dropLast() + [heads, headDim]
         var q = qkvParts[0].reshaped(targetShape)
         var k = qkvParts[1].reshaped(targetShape)
@@ -352,19 +368,42 @@ package struct AttentionLayer {
             q = SplitHalfRoPE.apply(q, table: ropeTable)
             k = SplitHalfRoPE.apply(k, table: ropeTable)
         }
+        return (q, k, v)
+    }
 
+    package func attend(q: MLXArray, k: MLXArray, v: MLXArray,
+                        context: AttentionContext?) -> MLXArray {
         // Same call the oracle taps. Inlining a second copy here would mean the
         // oracle validates code production does not run, which is the exact
         // failure this harness exists to prevent.
-        let merged = Self.sdpa(q: q, k: k, v: v, headDim: headDim, fp32: fp32Attention,
-                               backend: backend, context: context)
-        // `attn out` contracts over `inner` rather than `hidden`, so it builds
-        // its own compiled program. Its interior partials peak at 3,925 at
-        // block 49 — 8.3x under the 2^15 cliff unscaled, 134x with the operand
-        // scale this path applies — so it needs no bound beyond what is here.
-        return ANELinearBackend.isEnabled
+        Self.sdpa(q: q, k: k, v: v, headDim: headDim, fp32: fp32Attention,
+                  backend: backend, context: context)
+    }
+
+    /// `attn out` contracts over `inner` rather than `hidden`, so it builds
+    /// its own compiled program. Its interior partials peak at 3,925 at
+    /// block 49 — 8.3x under the 2^15 cliff unscaled, 134x with the operand
+    /// scale this path applies — so it needs no bound beyond what is here.
+    package func projectOut(_ merged: MLXArray) -> MLXArray {
+        ANELinearBackend.isEnabled
             ? ANELinearBackend.project(x: merged, weight: outWeight, label: "attn out")
             : matmul(merged, outWeight.T)
+    }
+
+    package func beginOut(_ merged: MLXArray) -> ANELinearBackend.Pending {
+        ANELinearBackend.begin(x: merged, weight: outWeight, label: "attn out")
+    }
+
+    /// `x` is `[S, hidden]` or `[B, S, hidden]`.
+    ///
+    /// - Parameter context: where in the render this call sits. Nil means dense:
+    ///   a sparse backend that does not know which block it is in, or how far
+    ///   through the schedule, cannot honour its own dense warm-up or its
+    ///   first/last-block exclusions, and guessing is worse than declining.
+    package func callAsFunction(_ x: MLXArray, ropeTable: MLXArray?,
+                               context: AttentionContext? = nil) -> MLXArray {
+        let p = projectQKV(x, ropeTable: ropeTable)
+        return projectOut(attend(q: p.q, k: p.k, v: p.v, context: context))
     }
 }
 
@@ -381,6 +420,21 @@ package struct H3MLP {
         self.fc2 = fc2
     }
 
+    /// Submits `fc1` and returns; `finish` completes the gate, the product and
+    /// `fc2`. `fc2` is GPU work either way, so it is not worth splitting.
+    package func begin(_ x: MLXArray) -> ANELinearBackend.Pending {
+        ANELinearBackend.begin(x: x, weight: fc1, label: "fc1")
+    }
+
+    package func finish(_ pending: ANELinearBackend.Pending) -> MLXArray {
+        gateAndProject(pending.value())
+    }
+
+    private func gateAndProject(_ h: MLXArray) -> MLXArray {
+        let parts = h.split(parts: 2, axis: -1)
+        return matmul(silu(parts[0]) * parts[1], fc2.T)
+    }
+
     package func callAsFunction(_ x: MLXArray) -> MLXArray {
         // `fc1` is the largest GEMM in a block — 262 ms against qkv's 197 at
         // production width — and its interior partials peak at 72 against the
@@ -394,10 +448,7 @@ package struct H3MLP {
         let h = ANELinearBackend.isEnabled
             ? ANELinearBackend.project(x: x, weight: fc1, label: "fc1")
             : matmul(x, fc1.T)
-        let parts = h.split(parts: 2, axis: -1)
-        let gate = parts[0]
-        let up = parts[1]
-        return matmul(silu(gate) * up, fc2.T)
+        return gateAndProject(h)
     }
 }
 
@@ -428,29 +479,99 @@ package struct DiTBlock {
         self.adaln = adaln
     }
 
+    /// Residual, AdaLN tables, and Q/K/V ready for GPU attention.
+    ///
+    /// Split from ``callAsFunction`` so classifier-free guidance can run one
+    /// branch's attention on the GPU while the other branch occupies the
+    /// Neural Engine with its QKV projection. The three stages compose to the
+    /// original block; they exist to be scheduled, not to change the math.
+    package struct AttentionPrep {
+        package let x: MLXArray
+        package let m: [MLXArray]
+        package let q: MLXArray
+        package let k: MLXArray
+        package let v: MLXArray
+    }
+
+    package func prepareAttention(_ x: MLXArray, tEmb: MLXArray, index: ModulationIndex,
+                                 ropeTable: MLXArray?) -> AttentionPrep {
+        let m = adaln(tEmb)
+        precondition(m.count == 6, "DiTBlock AdaLN must expand to 6, got \(m.count)")
+        let h1 = modScaleShift(norm1(x), shift: m[0], scale: m[1], index: index)
+        let p = attn.projectQKV(h1, ropeTable: ropeTable)
+        return AttentionPrep(x: x, m: m, q: p.q, k: p.k, v: p.v)
+    }
+
+    /// A block whose `qkv` is on the engine and not yet collected.
+    package struct AttentionStart {
+        package let x: MLXArray
+        package let m: [MLXArray]
+        package let qkv: ANELinearBackend.Pending
+    }
+
+    /// AdaLN, the pre-norm, and `qkv` submitted — but not waited for.
+    ///
+    /// ``prepareAttention`` is this plus ``finishAttention`` back to back. They
+    /// are separate so a caller with two independent CFG branches can submit
+    /// both projections before collecting either, which is the only way the
+    /// engine has anything queued while the GPU attends.
+    package func beginAttention(_ x: MLXArray, tEmb: MLXArray,
+                                index: ModulationIndex) -> AttentionStart {
+        let m = adaln(tEmb)
+        precondition(m.count == 6, "DiTBlock AdaLN must expand to 6, got \(m.count)")
+        let h1 = modScaleShift(norm1(x), shift: m[0], scale: m[1], index: index)
+        return AttentionStart(x: x, m: m, qkv: attn.beginQKV(h1))
+    }
+
+    package func finishAttention(_ start: AttentionStart,
+                                 ropeTable: MLXArray?) -> AttentionPrep {
+        let p = attn.finishQKV(start.qkv, ropeTable: ropeTable)
+        return AttentionPrep(x: start.x, m: start.m, q: p.q, k: p.k, v: p.v)
+    }
+
+    /// The output projection submitted, with the residual it will feed.
+    package struct PostStart {
+        package let prep: AttentionPrep
+        package let out: ANELinearBackend.Pending
+    }
+
+    package func beginPost(_ prep: AttentionPrep, merged: MLXArray) -> PostStart {
+        PostStart(prep: prep, out: attn.beginOut(merged))
+    }
+
+    /// The first residual and gate, then `fc1` submitted.
+    package struct MLPStart {
+        package let x1: MLXArray
+        package let m: [MLXArray]
+        package let fc1: ANELinearBackend.Pending
+    }
+
+    package func beginMLP(_ post: PostStart, index: ModulationIndex) -> MLPStart {
+        let m = post.prep.m
+        let x1 = modGate(post.prep.x, gate: m[2], other: post.out.value(), index: index)
+        let h2 = modScaleShift(norm2(x1), shift: m[3], scale: m[4], index: index)
+        return MLPStart(x1: x1, m: m, fc1: mlp.begin(h2))
+    }
+
+    package func finishBlock(_ start: MLPStart, index: ModulationIndex) -> MLXArray {
+        modGate(start.x1, gate: start.m[5], other: mlp.finish(start.fc1), index: index)
+    }
+
+    package func attend(_ prep: AttentionPrep, context: AttentionContext?) -> MLXArray {
+        attn.attend(q: prep.q, k: prep.k, v: prep.v, context: context)
+    }
+
+    package func postAttention(_ prep: AttentionPrep, merged: MLXArray,
+                              index: ModulationIndex) -> MLXArray {
+        let x1 = modGate(prep.x, gate: prep.m[2], other: attn.projectOut(merged), index: index)
+        let h2 = modScaleShift(norm2(x1), shift: prep.m[3], scale: prep.m[4], index: index)
+        return modGate(x1, gate: prep.m[5], other: mlp(h2), index: index)
+    }
+
     package func callAsFunction(_ x: MLXArray, tEmb: MLXArray, index: ModulationIndex,
                                ropeTable: MLXArray?,
                                context: AttentionContext? = nil) -> MLXArray {
-        let m = adaln(tEmb)
-        precondition(m.count == 6, "DiTBlock AdaLN must expand to 6, got \(m.count)")
-
-        // Hand-written fused kernels for these four sites measured 0.94% and
-        // have been removed. The GEMM accounting that came after them explains
-        // why they could not have been more: five kernels are essentially all
-        // of a forward, and everything else — these norms, the AdaLN
-        // projection, the gathers, RoPE, the residuals — shares a couple of
-        // percent between them.
-        func norm(_ v: MLXArray, _ n: H3RMSNorm, _ shift: MLXArray,
-                  _ scale: MLXArray) -> MLXArray {
-            modScaleShift(n(v), shift: shift, scale: scale, index: index)
-        }
-        func gated(_ v: MLXArray, _ gate: MLXArray, _ other: MLXArray) -> MLXArray {
-            modGate(v, gate: gate, other: other, index: index)
-        }
-
-        let h1 = norm(x, norm1, m[0], m[1])
-        let x1 = gated(x, m[2], attn(h1, ropeTable: ropeTable, context: context))
-        let h2 = norm(x1, norm2, m[3], m[4])
-        return gated(x1, m[5], mlp(h2))
+        let prep = prepareAttention(x, tEmb: tEmb, index: index, ropeTable: ropeTable)
+        return postAttention(prep, merged: attend(prep, context: context), index: index)
     }
 }

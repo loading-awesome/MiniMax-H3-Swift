@@ -211,6 +211,7 @@ bool h3_ane_is_available(void) {
 
 struct H3ANEProgram {
     int s, k, n;
+    H3ANEForm form;
     id _Nullable model;             // _ANEInMemoryModel
     NSString * _Nullable scratchDir;
 };
@@ -259,16 +260,63 @@ static NSString *MatmulMIL(int s, int k, int n) {
     return m;
 }
 
+
+/// The same linear as a 1x1 convolution, which is what the engine is.
+///
+/// `a` is `[1,k,1,s]` — k channels, one row, s columns — and the kernel is
+/// 1x1, so every output column is `w @ a[:,col]`: exactly the projection,
+/// with the sequence riding the spatial axis where the engine expects it.
+/// Nothing is transposed. `MatmulMIL` moves the whole activation before it
+/// multiplies; this form does not, and that is the difference between 3.87
+/// and 5.4 TFLOP/s a die.
+///
+/// The weight is `[n,k,1,1]`, so the surface is `[n,k]` — the orientation the
+/// checkpoint already holds, which also removes the host-side transpose the
+/// matmul form needs when a weight is uploaded.
+static NSString *ConvMIL(int s, int k, int n) {
+    NSMutableString *m = [NSMutableString stringWithString:
+        @"program(1.3)\n"
+         "[buildInfo = dict<string, string>({{\"coremlc-component-MIL\", \"3510.2.1\"}, "
+         "{\"coremlc-version\", \"3505.4.1\"}, {\"coremltools-component-milinternal\", \"\"}, "
+         "{\"coremltools-version\", \"9.0\"}})]\n{\n"];
+    [m appendFormat:@"    func main<ios18>(tensor<fp16,[1,%d,1,%d]> a, tensor<fp16,[1,%d,1,%d]> w) {\n",
+                    k, s, n, k];
+    [m appendFormat:@"        tensor<int32,[4]> rw=const()[name=string(\"rw\"),"
+                     "val=tensor<int32,[4]>([%d,%d,1,1])];\n"
+                     "        tensor<fp16,[%d,%d,1,1]> w4=reshape(shape=rw,x=w)[name=string(\"w4\")];\n",
+                    n, k, n, k];
+    [m appendString:@"        tensor<int32,[2]> st=const()[name=string(\"st\"),"
+                     "val=tensor<int32,[2]>([1,1])];\n"
+                     "        tensor<int32,[2]> dl=const()[name=string(\"dl\"),"
+                     "val=tensor<int32,[2]>([1,1])];\n"
+                     "        tensor<int32,[4]> pd=const()[name=string(\"pd\"),"
+                     "val=tensor<int32,[4]>([0,0,0,0])];\n"
+                     "        string pt=const()[name=string(\"pt\"),val=string(\"valid\")];\n"
+                     "        int32 gp=const()[name=string(\"gp\"),val=int32(1)];\n"];
+    [m appendFormat:@"        tensor<fp16,[1,%d,1,%d]> y=conv(dilations=dl,groups=gp,pad=pd,"
+                     "pad_type=pt,strides=st,weight=w4,x=a)[name=string(\"y\")];\n"
+                     "    } -> (y);\n}\n",
+                    n, s];
+    return m;
+}
+
 H3ANEProgram* h3_ane_program_create(int s, int k, int n) {
+    return h3_ane_program_create_form(s, k, n, H3ANEFormMatmul);
+}
+
+H3ANEForm h3_ane_program_form(H3ANEProgram *p) { return p ? p->form : H3ANEFormMatmul; }
+
+H3ANEProgram* h3_ane_program_create_form(int s, int k, int n, H3ANEForm form) {
     if (!h3_ane_is_available() || s <= 0 || k <= 0 || n <= 0) return NULL;
 
     H3ANEProgram *p = NULL;
     @try {
     p = (H3ANEProgram *)calloc(1, sizeof(H3ANEProgram));
     if (!p) return NULL;
-    p->s = s; p->k = k; p->n = n;
+    p->s = s; p->k = k; p->n = n; p->form = form;
 
-    NSData *milData = [MatmulMIL(s, k, n) dataUsingEncoding:NSUTF8StringEncoding];
+    NSString *mil = (form == H3ANEFormConv) ? ConvMIL(s, k, n) : MatmulMIL(s, k, n);
+    NSData *milData = [mil dataUsingEncoding:NSUTF8StringEncoding];
 
     id descriptor = ((id(*)(Class, SEL, id, id, id))objc_msgSend)(
         DescriptorClass, @selector(modelWithMILText:weights:optionsPlist:), milData, @{}, nil);
@@ -302,7 +350,7 @@ H3ANEProgram* h3_ane_program_create(int s, int k, int n) {
     BOOL ok = ((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
         model, @selector(compileWithQoS:options:error:), 21, @{}, &error);
     if (!ok) {
-        NSLog(@"[H3ANEBridge] compile failed for s=%d k=%d n=%d: %@", s, k, n, error);
+        NSLog(@"[H3ANEBridge] compile failed for s=%d k=%d n=%d form=%d: %@", s, k, n, (int)form, error);
         h3_ane_program_free(p);
         return NULL;
     }
@@ -355,8 +403,13 @@ bool h3_ane_run(H3ANEProgram *p, H3ANETensor *x, H3ANETensor *w, H3ANETensor *y,
     // a different shape than the program was compiled for it produces numbers
     // rather than an error, so check here.
     if (x->rows != p->k || x->width != p->s) return false;
-    if (w->rows != p->k || w->width != p->n) return false;
-    if (y->rows != p->s || y->width != p->n) return false;
+    if (p->form == H3ANEFormConv) {
+        if (w->rows != p->n || w->width != p->k) return false;
+        if (y->rows != p->n || y->width != p->s) return false;
+    } else {
+        if (w->rows != p->k || w->width != p->n) return false;
+        if (y->rows != p->s || y->width != p->n) return false;
+    }
 
     @try {
     id request = ((id(*)(Class, SEL, id, id, id, id, id, id, id))objc_msgSend)(
