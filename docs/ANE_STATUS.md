@@ -437,6 +437,42 @@ Two consequences:
   already falls back to the GPU on a failed submission, so correctness holds and
   the only cost is speed — and the receipts can count it.
 
+### The GPU baseline is unchanged on 27.0
+
+Re-measured because every number in this document was from 25F84 and the engine
+share was swept against a GPU rate that a new Metal driver could have moved.
+Same recipe as the render gate — 864x480, 124 frames, 20 steps, `balanced`,
+single pass:
+
+| | 25F84 | 27.0 |
+|---|---:|---:|
+| per step, mean | 28.22 s | **28.03 s** |
+| full step, median of the 10 that ran the stack | 54.54 s | **54.84 s** |
+| sampling | 564.5 s | **560.6 s** |
+| whole render | 10m 56s | **10m 46s** |
+| branch-steps reused | 10/20 | 10/20 |
+
+Within half a percent, with identical cache behaviour. The GEMM ceiling agrees:
+
+```
+qkv 19.3   attn out 19.3   fc1 19.5   fc2 19.1   square 8192^3 19.5  TFLOP/s
+attention S=15731 H=56 D=128   417.4 ms   17.0 TFLOP/s
+```
+
+against the ~18.6 TFLOP/s the share was tuned to, so the balance point has not
+moved and the tuning stands. **`fc1` at 19.5 TFLOP/s on the large-M shape is
+also a live check on `patches/mlx-m3-ultra-large-m-gemm.patch`**: that shape is
+exactly where unpatched MLX falls 11-18% behind, and `Scripts/check-mlx-patch.sh`
+reports it present after the Xcode upgrade re-fetched the SwiftPM checkout —
+which is precisely the scenario that would otherwise have dropped it silently.
+
+One methodological note, recorded because it wasted a render: the first attempt
+at this baseline was run at `--cfg-scale 5.0` and came out at 114.7 s a step,
+which looked like a 2.1x regression and was reported as one. It was two forward
+passes per step against the gate's one. The header says
+`guidance 5.00 (two forward passes per step)` and it was read past twice. The
+gate's numbers are single-pass; anything compared against them must be too.
+
 ### What the upgrade does not change
 
 `fc2`'s bound, the seam economics, the 1.478x hardware ceiling, and the fact
