@@ -627,6 +627,46 @@ Four failures in one day on a machine with no prior history: three watchdog
 resets and one DART panic. Two mitigations have now been tried and one of them
 made things worse.
 
+### One surface object, two dies, two DARTs — the leading hypothesis
+
+`h3_ane_job_submit_pair` dispatches its two evaluations **concurrently**, with
+instance hints 1 and 2 — two dies, each behind its own DART. Every caller passes
+the *same input tensor* to both: the island (`handles.xs[split]` to gate0 and
+gate1), the shard path, and the keep-alive. Inside `h3_ane_run` each thread then
+built its `_ANERequest` from `x->object` — one cached `_ANEIOSurfaceObject`
+shared between two in-flight requests against two different IOMMUs.
+
+If that private class keeps per-evaluation mapping state — which IOVA the
+surface is currently mapped to for the requesting device — two concurrent uses
+race on it, and one request is programmed with an address not valid in its own
+DART. That is the fault the machine panicked with.
+
+The class is undocumented, so whether sharing is legal cannot be settled by
+reading. Wrapping the same IOSurface once per evaluation is cheap and removes
+the question, and `h3_ane_run` now does that. **The fix is untested against the
+hardware**, because the rule below says nothing runs.
+
+Two things make this the leading candidate rather than one of many:
+
+- It is the only structure found that can hand the device an address belonging
+  to a different mapping. Allocation size (`rows x align64(width x 2)`, floored
+  at 16 KB), `write_prefix` bounds, and padded-sequence agreement between the
+  compiled program and the allocated surface were all audited and are
+  conservative.
+- It scales with exactly what changed. The sharing is longstanding, but today
+  was the first day of sustained high-rate pair submission — dual-die spikes all
+  morning, the island routing for the first time, then a keep-alive doing it
+  every two seconds indefinitely.
+
+**And the IOMMU is not the safety net it first appears.** DART maps at 16 KB
+page granularity, so a device access that overruns a surface but stays inside
+the same page is never faulted — it silently reads or writes whatever else is
+there, and within one DART the neighbouring mappings belong to other ANE
+clients, which are Apple's. The panic is the page-crossing tail of that
+distribution. Silent corruption of another client's compute is a plausible
+outcome of the same defect, and is what the machine's owner suspected before
+this was found.
+
 ### The rule this leaves
 
 - **Nothing runs on the engine.** As of the DART panic there is no configuration

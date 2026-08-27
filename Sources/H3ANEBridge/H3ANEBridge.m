@@ -89,6 +89,11 @@ H3ANETensor* h3_ane_tensor_create(int rows, int width) {
     void *base = IOSurfaceGetBaseAddress(t->surface);
     if (base) memset(base, 0, allocSize);
 
+    // Kept as a construction-time check that the private class accepts this
+    // surface — a clear failure here beats one inside an evaluation. It is
+    // deliberately **not** used to build requests: see `h3_ane_run`, where each
+    // evaluation wraps the surface itself so no object is ever bound to two
+    // concurrent requests on two dies.
     t->object = ((id(*)(Class, SEL, IOSurfaceRef, size_t))objc_msgSend)(
         IOSurfaceObjectClass, @selector(objectWithIOSurface:startOffset:), t->surface, 0);
     if (!t->object) {
@@ -636,10 +641,34 @@ bool h3_ane_run(H3ANEProgram *p, H3ANETensor *x, H3ANETensor *w, H3ANETensor *y,
     }
 
     @try {
+    // **A fresh `_ANEIOSurfaceObject` per evaluation, not the one cached on the
+    // tensor.** `h3_ane_job_submit_pair` runs two evaluations concurrently
+    // against two dies, each with its own DART, and every caller passes the
+    // same input tensor to both — the island, the shard path, and the
+    // keep-alive all do. Sharing one surface object across two in-flight
+    // requests shares whatever per-evaluation mapping state the private class
+    // keeps on it, and a request programmed with an IOVA that is not valid in
+    // its own DART is exactly the fault this machine panicked with on
+    // 2026-08-27:
+    //
+    //   sptm_t8110dart_clear_err: dart-ane0: DART instance 1:
+    //   Unrecoverable secondary error 0x80080008
+    //
+    // The class is private and undocumented, so whether it is safe to share is
+    // unknowable by reading; wrapping the same IOSurface again is cheap and
+    // removes the question. **This is untested against the hardware.**
+    id xObject = ((id(*)(Class, SEL, IOSurfaceRef, size_t))objc_msgSend)(
+        IOSurfaceObjectClass, @selector(objectWithIOSurface:startOffset:), x->surface, 0);
+    id wObject = ((id(*)(Class, SEL, IOSurfaceRef, size_t))objc_msgSend)(
+        IOSurfaceObjectClass, @selector(objectWithIOSurface:startOffset:), w->surface, 0);
+    id yObject = ((id(*)(Class, SEL, IOSurfaceRef, size_t))objc_msgSend)(
+        IOSurfaceObjectClass, @selector(objectWithIOSurface:startOffset:), y->surface, 0);
+    if (!xObject || !wObject || !yObject) return false;
+
     id request = ((id(*)(Class, SEL, id, id, id, id, id, id, id))objc_msgSend)(
         RequestClass,
         @selector(requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:procedureIndex:),
-        @[x->object, w->object], @[@0, @1], @[y->object], @[@0], nil, nil, @0);
+        @[xObject, wObject], @[@0, @1], @[yObject], @[@0], nil, nil, @0);
     if (!request) return false;
 
     NSDictionary *opts = @{
