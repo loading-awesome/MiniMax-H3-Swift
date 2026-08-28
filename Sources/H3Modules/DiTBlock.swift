@@ -451,20 +451,42 @@ package struct H3MLP {
                                               blockIndex: blockIndex)
     }
 
-    package func finish(_ pending: ANELinearBackend.Pending) -> MLXArray {
+    package func finish(_ pending: ANELinearBackend.Pending,
+                        blockIndex: Int? = nil) -> MLXArray {
         let gated = pending.swiGLUValue()
         DiTBlock.saturationProbe.recordMLPIslandFC2(x: gated, weight: fc2)
-        return matmul(gated, fc2.T)
+        return projectFC2(gated, blockIndex: blockIndex)
     }
 
-    private func gateAndProject(_ h: MLXArray) -> MLXArray {
+    /// `fc2` on the engine, but only at a scale measured for *this* block.
+    ///
+    /// Nil block index, no calibrated entry, or the opt-in off all keep it on
+    /// the GPU. That is deliberate: the failure mode for an under-scaled `fc2`
+    /// is silent zeros, not a rounding error, so there is no safe default to
+    /// guess. See `ANEFC2Scales`.
+    private func projectFC2(_ gated: MLXArray, blockIndex: Int?) -> MLXArray {
+        guard ANELinearBackend.fc2Enabled,
+              let blockIndex,
+              let scale = ANEFC2Scales.scale(forBlock: blockIndex)
+        else { return matmul(gated, fc2.T) }
+        let routed = ANELinearBackend.begin(x: gated, weight: fc2, label: "fc2",
+                                            scale: scale).value()
+        guard ANELinearBackend.fc2Verify else { return routed }
+        // Both paths take the same `gated`, so this isolates fc2's arithmetic
+        // exactly, over every block and every step rather than a few captures.
+        DiTBlock.fc2Audit.compare(routed: routed, reference: matmul(gated, fc2.T),
+                                  block: blockIndex, scale: scale)
+        return routed
+    }
+
+    private func gateAndProject(_ h: MLXArray, fc2BlockIndex: Int? = nil) -> MLXArray {
         let parts = h.split(parts: 2, axis: -1)
         let gated = silu(parts[0]) * parts[1]
         // `fc2` is the projection the bound exists to rule on, and this is the
         // only place its real input exists.
         DiTBlock.saturationProbe.record("fc2", x: gated, weight: fc2)
         DiTBlock.saturationProbe.recordMLPIslandFC2(x: gated, weight: fc2)
-        return matmul(gated, fc2.T)
+        return projectFC2(gated, blockIndex: fc2BlockIndex)
     }
 
     package func callAsFunction(_ x: MLXArray, blockIndex: Int? = nil) -> MLXArray {
@@ -484,13 +506,13 @@ package struct H3MLP {
             return island
         }
         if ANELinearBackend.isEnabled {
-            return finish(begin(x))
+            return finish(begin(x), blockIndex: blockIndex)
         }
         // **Also here, not only in `begin`.** A bound run has the engine off by
         // design — the activations must come from the unrouted path — so
         // instrumenting only the routed entry point measures `fc1` never.
         DiTBlock.saturationProbe.record("fc1", x: x, weight: fc1)
-        return gateAndProject(matmul(x, fc1.T))
+        return gateAndProject(matmul(x, fc1.T), fc2BlockIndex: blockIndex)
     }
 }
 
@@ -725,8 +747,58 @@ package final class SaturationProbe: @unchecked Sendable {
     }
 }
 
+/// Checks routed `fc2` against the GPU's own answer for the same input.
+///
+/// Saturation on this engine fails as **silent zeros**, not as an error, so the
+/// two numbers that matter are the relative error and the fraction of outputs
+/// that came back exactly zero where the reference is not. A scale that is one
+/// power of two too large shows up in the second long before the first.
+package final class FC2Audit: @unchecked Sendable {
+    private let lock = NSLock()
+    private var worstError: [Int: Float] = [:]
+    private var worstZeros: [Int: Float] = [:]
+    private var scales: [Int: Float] = [:]
+
+    package func compare(routed: MLXArray, reference: MLXArray,
+                         block: Int, scale: Float) {
+        let r = reference.asType(.float32), a = routed.asType(.float32)
+        let d = r - a
+        let error = MLX.sqrt(MLX.sum(d * d)).item(Float.self)
+            / max(MLX.sqrt(MLX.sum(r * r)).item(Float.self), 1e-30)
+        // Zeros the reference does not have are the saturation signature.
+        let zeroed = MLX.logicalAnd(MLX.equal(a, MLXArray(Float(0))),
+                                    MLX.notEqual(r, MLXArray(Float(0))))
+        let fraction = MLX.mean(zeroed.asType(.float32)).item(Float.self)
+        lock.lock()
+        worstError[block] = max(worstError[block] ?? 0, error)
+        worstZeros[block] = max(worstZeros[block] ?? 0, fraction)
+        scales[block] = scale
+        lock.unlock()
+    }
+
+    package func report() -> String {
+        lock.lock()
+        let e = worstError, z = worstZeros, s = scales
+        lock.unlock()
+        guard !e.isEmpty else { return "fc2 audit: nothing routed\n" }
+        var lines = ["fc2 audit over \(e.count) blocks (worst per block):"]
+        let ranked = e.sorted { $0.value > $1.value }.prefix(6)
+        for (block, error) in ranked {
+            lines.append(String(format: "  b%02d scale 1/%-5d rel_rms %.3e  spurious_zeros %.3e",
+                                block, Int((1 / (s[block] ?? 1)).rounded()),
+                                error, z[block] ?? 0))
+        }
+        let peakError = e.values.max() ?? 0
+        let peakZeros = z.values.max() ?? 0
+        lines.append(String(format: "  worst overall: rel_rms %.3e, spurious zeros %.3e",
+                            peakError, peakZeros))
+        return lines.joined(separator: "\n") + "\n"
+    }
+}
+
 package struct DiTBlock {
     package static let saturationProbe = SaturationProbe()
+    package static let fc2Audit = FC2Audit()
 
     package let norm1: H3RMSNorm
     package let norm2: H3RMSNorm
@@ -815,6 +887,9 @@ package struct DiTBlock {
         package let x1: MLXArray
         package let m: [MLXArray]
         let work: Work
+        /// Carried from `beginMLP` so `finishBlock` can pick this block's
+        /// calibrated `fc2` scale. Without it `fc2` stays on the GPU.
+        let blockIndex: Int?
 
         enum Work {
             case linear(ANELinearBackend.Pending)
@@ -836,15 +911,16 @@ package struct DiTBlock {
         let x1 = modGate(post.prep.x, gate: m[2], other: post.out.value(), index: index)
         let h2 = modScaleShift(norm2(x1), shift: m[3], scale: m[4], index: index)
         if island, let island = mlp.beginIsland(h2, blockIndex: blockIndex) {
-            return MLPStart(x1: x1, m: m, work: .island(island))
+            return MLPStart(x1: x1, m: m, work: .island(island), blockIndex: blockIndex)
         }
-        return MLPStart(x1: x1, m: m, work: .linear(mlp.begin(h2)))
+        return MLPStart(x1: x1, m: m, work: .linear(mlp.begin(h2)),
+                        blockIndex: blockIndex)
     }
 
     package func finishBlock(_ start: MLPStart, index: ModulationIndex) -> MLXArray {
         let out: MLXArray
         switch start.work {
-        case .linear(let pending): out = mlp.finish(pending)
+        case .linear(let pending): out = mlp.finish(pending, blockIndex: start.blockIndex)
         case .island(let pending): out = pending.value()
         }
         return modGate(start.x1, gate: start.m[5], other: out, index: index)

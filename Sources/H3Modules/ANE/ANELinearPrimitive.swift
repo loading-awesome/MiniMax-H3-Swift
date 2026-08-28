@@ -47,6 +47,18 @@ public enum ANELinearBackend {
         return h3_ane_is_available()
     }()
 
+    /// `fc2` is a separate opt-in from the rest of the linear route. Its
+    /// per-block scales are calibrated against one prompt at one shape, and an
+    /// under-scaled `fc2` fails as silent zeros rather than as an error, so it
+    /// does not ride along on `H3_ANE=experimental`.
+    public static let fc2Enabled: Bool =
+        isEnabled && ProcessInfo.processInfo.environment["H3_ANE_FC2"] == "1"
+
+    /// Recomputes every routed `fc2` on the GPU and compares. Expensive by
+    /// construction — it does the work twice — and only for calibration runs.
+    public static let fc2Verify: Bool =
+        ProcessInfo.processInfo.environment["H3_ANE_FC2_VERIFY"] == "1"
+
     /// The native IOSurface pack/merge path is a separately gated research
     /// arm. It changes the synchronization seam, not the model decomposition,
     /// and remains opt-in until its production block clears the 1.15x gate.
@@ -855,8 +867,11 @@ public enum ANELinearBackend {
     ///   The caller is saying something else owns the dies for this stretch —
     ///   the MLP island does — and the decline is recorded, because with the
     ///   backend on it is a real routing decision the receipt should carry.
+    /// - Parameter scale: operand scale for this call, defaulting to the
+    ///   shipping 1/16. `fc2` passes a per-block value from `ANEFC2Scales`.
     package static func begin(x: MLXArray, weight: MLXArray, label: String,
-                              engine: Bool = true) -> Pending {
+                              engine: Bool = true,
+                              scale: Float = operandScale) -> Pending {
         // Without the opt-in nothing is offered, so nothing is recorded. A
         // decline noted here would put entries on the receipt of a render that
         // never went near the engine, and the receipt's whole job is to say
@@ -866,7 +881,8 @@ public enum ANELinearBackend {
             note(label, routed: false)
             return Pending(.plain(MLX.matmul(x, weight.transposed())))
         }
-        guard let body = start(x: x, weight: weight, share: share(for: label)) else {
+        guard let body = start(x: x, weight: weight, share: share(for: label),
+                               scale: scale) else {
             note(label, routed: false)
             return Pending(.plain(MLX.matmul(x, weight.transposed())))
         }

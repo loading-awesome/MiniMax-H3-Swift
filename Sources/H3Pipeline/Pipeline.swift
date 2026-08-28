@@ -94,6 +94,17 @@ package enum PipelineRuntime {
             case .float32: dtype = "fp32"
             default:       dtype = "bf16"
             }
+            if ANELinearBackend.fc2Verify {
+                FileHandle.standardError.write(Data(DiTBlock.fc2Audit.report().utf8))
+            }
+            // Busy-seconds against wall time says whether the unrealized linear
+            // gain is a bad GPU/ANE split or dies sitting idle between
+            // submissions. Those want opposite fixes, so measure before tuning.
+            if ProcessInfo.processInfo.environment["H3_ANE_UTILISATION"] == "1" {
+                let busy = ANELinearBackend.EngineMeter.busySeconds
+                FileHandle.standardError.write(Data(
+                    String(format: "ane engine busy %.1f s\n", busy).utf8))
+            }
             return ArithmeticProfile(
                 ditDType: dtype,
                 aneRoutedProjections: ANELinearBackend.routedProjections,

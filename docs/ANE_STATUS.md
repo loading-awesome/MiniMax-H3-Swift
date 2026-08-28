@@ -1467,6 +1467,49 @@ proven under any accumulation order, and **splitting nearly triples it to
 9.6x**. The contraction split is therefore a safety argument as well as a speed
 one, on the projection that sits closest to the cliff.
 
+### `fc2` routes, on a per-block scale, and is worth 1.6% (2026-08-27)
+
+The refusal above was right, and the condition it named — "a measured per-block
+bound rather than an operand scale that is merely probably enough" — is now met.
+A faithful bound render on this arm puts `fc2`'s worst at **4,573,078 at block
+45**, 9x past the cliff at the shipping 1/16 scale.
+
+What makes a scale work where splitting does not is the spread: the bounds vary
+**790x across blocks**, from 5,781 at block 09 to 4,573,078 at block 45. Only one
+block needs 1/512 and fourteen need no scaling at all, so `ANEFC2Scales` is per
+block. That also conditions the arithmetic rather than merely permitting it —
+each entry being the largest power of two holding `bound * scale` in a fixed
+window puts every block's typical product in **0.10 to 0.28**, about 1,650x above
+the fp16 denormal floor. One global scale would be harsh on the quiet blocks and
+push them toward it.
+
+Audited against the GPU's own answer for the same input, every block and every
+step, `H3_ANE_FC2_VERIFY=1`:
+
+| extra halvings | cliff margin | worst block | worst rel-RMS | spurious zeros |
+|---:|---:|---|---:|---:|
+| 0 | 2x | b45 at 1/512 | 1.548e-3 | 8.0e-6 |
+| 2 | 8x | b45 at 1/2048 | 1.808e-3 | 1.006e-5 |
+
+**No saturation.** Spurious zeros sit near 1e-5 and rise gently as the scale
+shrinks, which is fp16 rounding on near-zero outputs; saturation zeros outputs in
+bulk, not one in a hundred thousand.
+
+The accuracy is the worst in the route — 1.5e-3 against 7e-5 to 5e-4 for the
+other projections — and **it is not the scale's fault**. Four times more scale
+buys only 14%, so the error is not over-scaling underflow: `fc2` contracts over
+`k=14336`, by far the longest accumulation in the model, and that is what it
+costs in fp16. The larger margin is therefore kept, because it is nearly free in
+accuracy and the bounds come from one prompt.
+
+**It is worth 1.6%** — 24.48 s a step to 24.10, and 1.176x end to end with all
+four projections routed. That is a poor trade against being the least accurate
+arithmetic in the route, which is why `H3_ANE_FC2` is a separate opt-in from
+`H3_ANE=experimental` rather than riding along with it. The reason it is small
+is structural: the engine is slower per FLOP than the GPU, so relocating work
+pays only through overlap, and with three projections already routed the dies
+are no longer idle enough to absorb a fourth.
+
 ### Fusing the modulation buys nothing
 
 `modScaleShift` and `modGate` are four elementwise operations around a gather,
