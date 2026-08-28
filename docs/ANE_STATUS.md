@@ -971,6 +971,39 @@ of 11:
 **This is short of the 1.15x gate, and `fc2` is not coming** without oracles
 for every block. `Tools/ANE/saturation_bound.py` settles it.
 
+### The share and the split, swept jointly (2026-08-28)
+
+Sweeping them separately and combining the winners produced a wrong default
+once already, so this is the grid. Full step in seconds, one session, so the
+cells are comparable to each other but not to runs from other sessions — the
+same cell drifted 1 to 5% between sessions, which is larger than any difference
+inside the grid.
+
+| split \ share | 0.30 | 0.375 | 0.45 | 0.52 | 0.60 |
+|---:|---:|---:|---:|---:|---:|
+| 8 | 46.23 | **45.25** | 46.99 | — | — |
+| **4** | — | 43.36 | **43.07** | 44.25 | — |
+| 2 | — | — | 46.98 | 50.83 | 53.55 |
+
+**The shipping pair, split 4 at share 0.45, is the global optimum**, and both
+axes have interior minima rather than running to an edge.
+
+The interaction is real but not monotone, and the half that fails is the
+interesting half. From 8 pieces to 4 the optimum share rises, 0.375 to 0.45,
+which is the predicted direction: fewer pieces means less GPU-side fp32 partial
+summing per column, so the engine can afford more columns. At 2 pieces that
+reverses — the row is monotonically worse as the share grows, so its optimum is
+*below* 0.45, not above.
+
+Both effects are present at once and they pull opposite ways. Cutting the
+contraction reduces reduction cost, which argues for a larger share, but it also
+raises the engine's own rate, and losing that argues for a smaller one. Between
+8 and 4 the first dominates; by 2 the engine has given up too much rate for the
+second to be outrun, which is why that row is 4 s behind wherever its own
+optimum sits. Combined with the collapse at 16 and 32, the split has an interior
+optimum at 4 from both directions: too few pieces and the engine is slow, too
+many and the pieces are too thin to reuse.
+
 ### Two shipping constants were calibrated on a machine that no longer exists (2026-08-28)
 
 Re-swept end to end on the fixed arm once attention was also routed. Both
