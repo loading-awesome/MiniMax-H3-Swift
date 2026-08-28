@@ -694,7 +694,9 @@ lineage: 864x480x124, 20 steps, seed 0, cache threshold 0.1.
 | `sdpa`, GPU only | 28.34 s | 55.28 s | 566.8 s | — |
 | `ane` attention, 4 heads a die | 27.20 s | 51.97 s | 544.0 s | 1.042x |
 | `ane` attention, repeat | 27.21 s | 52.08 s | 544.3 s | 1.042x |
-| **attention + linear** | **24.48 s** | **46.28 s** | **490.6 s** | **1.158x** |
+| attention + linear | 24.48 s | 46.28 s | 490.6 s | 1.158x |
+| + `fc2` | 24.10 s | 44.99 s | 482.9 s | 1.176x |
+| **+ split-k 4 (shipping)** | **23.17 s** | **43.26 s** | **464.0 s** | **1.223x** |
 
 Attention alone is **1.042x end to end, 1.063x on the ten steps that run the
 stack**, reproducing to 0.04% across two renders. With the linear route also
