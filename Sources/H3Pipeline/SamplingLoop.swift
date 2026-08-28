@@ -40,6 +40,10 @@ enum SamplingLoop {
                     onStep: (Int, Int) -> Void = { _, _ in },
                     log: (String) -> Void = { _ in }) throws -> Output {
 
+        if request.cfgScale > 1.0 && ANELinearBackend.isEnabled {
+            log("  CFG overlap: GPU attention on one branch beside engine linears on the other")
+        }
+
         MLXRandom.seed(request.seed)
         let noiseVideo = MLXRandom.normal([1, 24, geometry.latentT,
                                            geometry.latentH, geometry.latentW])

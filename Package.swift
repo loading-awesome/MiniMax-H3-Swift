@@ -42,15 +42,24 @@ let package = Package(
         .target(
             name: "H3Attention",
             dependencies: [
-                "H3Foundation", "H3Hardware",
+                "H3Foundation", "H3Hardware", "H3ANEBridge",
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXFast", package: "mlx-swift"),
             ]
         ),
         .target(
+            name: "H3ANEBridge",
+            publicHeadersPath: "include",
+            linkerSettings: [
+                .linkedFramework("Foundation"),
+                .linkedFramework("IOSurface"),
+                .linkedFramework("Metal"),
+            ]
+        ),
+        .target(
             name: "H3Modules",
             dependencies: [
-                "H3Foundation", "H3Catalog", "H3Attention",
+                "H3Foundation", "H3Catalog", "H3Attention", "H3ANEBridge",
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXFast", package: "mlx-swift"),
@@ -80,6 +89,30 @@ let package = Package(
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ]
         ),
+        // The external oracles in Tools/. They ask "is the output any good"
+        // rather than "does it match a golden", which is the only question that
+        // can be asked of a render nobody has captured a reference for — and
+        // the only one that survives an arithmetic change, since a change in
+        // precision reselects the sample rather than degrading it (see
+        // `docs/ANE_PRECISION_RESULTS.md`).
+        //
+        // They are targets rather than loose files because they were neither:
+        // `LipSyncCheck` still imported `H3Core`, a module this package has not
+        // had for some time, so it could not be built by any documented means
+        // and nothing noticed.
+        .executableTarget(
+            name: "h3-facecheck",
+            dependencies: [.product(name: "ArgumentParser", package: "swift-argument-parser")],
+            path: "Tools", exclude: ["ANE", "LipSyncCheck.swift", "__pycache__", "anchor_check.py", "arm_compare.py", "audio_match.py", "coherence_check.py", "speech_check.py"], sources: ["FaceCheck.swift"]
+        ),
+        .executableTarget(
+            name: "h3-lipsync",
+            dependencies: [
+                "H3Foundation", "H3Pipeline",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            ],
+            path: "Tools", exclude: ["ANE", "FaceCheck.swift", "__pycache__", "anchor_check.py", "arm_compare.py", "audio_match.py", "coherence_check.py", "speech_check.py"], sources: ["LipSyncCheck.swift"]
+        ),
         .testTarget(name: "H3FoundationTests", dependencies: ["H3Foundation"]),
         .testTarget(name: "H3CatalogTests", dependencies: ["H3Catalog"]),
         .testTarget(name: "H3HardwareTests", dependencies: ["H3Hardware"]),
@@ -96,8 +129,9 @@ let package = Package(
                                    .product(name: "MLXFast", package: "mlx-swift"),
                                    .product(name: "MLXRandom", package: "mlx-swift")]),
         .testTarget(name: "H3ModulesTests",
-                    dependencies: ["H3Modules", "H3Attention", "H3Hardware",
-                                   .product(name: "MLX", package: "mlx-swift")]),
+                    dependencies: ["H3Modules", "H3Attention", "H3Hardware", "H3ANEBridge",
+                                   .product(name: "MLX", package: "mlx-swift")],
+                    linkerSettings: [.linkedFramework("Metal")]),
         .testTarget(name: "H3PipelineTests",
                     dependencies: ["H3Pipeline", "H3Foundation", "H3Catalog",
                                    .product(name: "MLX", package: "mlx-swift")]),

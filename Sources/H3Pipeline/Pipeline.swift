@@ -28,6 +28,90 @@ import H3Modules
 /// make it allocate again.
 package enum PipelineRuntime {
 
+    /// The dtype the DiT block stack runs in, overridable for one specific
+    /// diagnostic and nothing else.
+    ///
+    /// Contract 8 pins production at bf16 and this does not change that: the
+    /// default is unchanged and the override has to be asked for by name. It
+    /// exists because `docs/ANE.md` records the ANE's
+    /// arithmetic as *more* accurate than bf16 per projection — 7e-5 to 5e-4
+    /// against the bf16 GPU path's 1.66e-3 — and that result is single-shot.
+    /// A forward is 50 blocks and a render is 20 of them, so the question it
+    /// cannot answer is whether a per-projection improvement survives a
+    /// thousand evaluations of a diffusion trajectory, which can compound an
+    /// error as easily as it can wash one out.
+    ///
+    /// fp16 with a wide accumulator is the closest proxy for the engine's
+    /// datapath that runs on the GPU, so this answers the propagation question
+    /// without any private API, any bridge, or any of the integration work the
+    /// ANE route would need. If a full render holds at fp16, the arithmetic is
+    /// not what stands in the way; if it drifts, none of the rest matters.
+    ///
+    ///     H3_DIT_DTYPE=fp16 h3 render ...
+    package static func diagnosticComputeDType(log: (String) -> Void) -> DType {
+        switch ProcessInfo.processInfo.environment["H3_DIT_DTYPE"] {
+        case "fp16", "float16":
+            log("DiT compute dtype overridden to fp16 — diagnostic only, "
+                + "contract 8 pins production at bf16")
+            return .float16
+        case "fp32", "float32":
+            log("DiT compute dtype overridden to fp32 — diagnostic only, "
+                + "2x residency")
+            return .float32
+        default:
+            return .bfloat16
+        }
+    }
+
+    /// How this process computed a DiT block, for the render receipt.
+    ///
+    /// Two things change the arithmetic and therefore reselect the diffusion
+    /// sample: the compute dtype, and whether projections ran on the Neural
+    /// Engine. Neither was recorded, so two renders from the same seed and
+    /// checkpoint that produced visibly different videos were indistinguishable
+    /// in their receipts — which is precisely the claim a receipt exists to
+    /// support.
+    package struct ArithmeticProfile: Sendable, Codable, Equatable {
+        /// `bf16`, `fp16` or `fp32`.
+        package let ditDType: String
+        /// Projections the engine actually computed, observed rather than
+        /// declared.
+        package let aneRoutedProjections: [String]
+        /// Projections offered to the engine that fell back to MLX. A render
+        /// that declined partway is not the render that did not offer at all.
+        package let aneDeclinedProjections: [String]
+        /// GPU attention on one CFG branch ran beside engine linears on the other.
+        package let aneCFGOverlap: Bool
+        /// Pieces the contraction was cut into, 0 if it was never split.
+        package let aneSplitContraction: Int
+
+        package static func observed() -> ArithmeticProfile {
+            let dtype: String
+            switch diagnosticComputeDType(log: { _ in }) {
+            case .float16: dtype = "fp16"
+            case .float32: dtype = "fp32"
+            default:       dtype = "bf16"
+            }
+            if ANELinearBackend.fc2Verify {
+                FileHandle.standardError.write(Data(DiTBlock.fc2Audit.report().utf8))
+            }
+            // Busy-seconds against wall time says whether the unrealized linear
+            // gain is a bad GPU/ANE split or dies sitting idle between
+            // submissions. Those want opposite fixes, so measure before tuning.
+            if ProcessInfo.processInfo.environment["H3_ANE_UTILISATION"] == "1" {
+                let busy = ANELinearBackend.EngineMeter.busySeconds
+                FileHandle.standardError.write(Data(
+                    String(format: "ane engine busy %.1f s\n", busy).utf8))
+            }
+            return ArithmeticProfile(
+                ditDType: dtype,
+                aneRoutedProjections: ANELinearBackend.routedProjections,
+                aneDeclinedProjections: ANELinearBackend.declinedProjections,
+                aneCFGOverlap: ANELinearBackend.overlappedCFG,
+                aneSplitContraction: ANELinearBackend.splitContractions)
+        }
+    }
+
     /// Where the checkpoints are.
     ///
     /// Resolved by the caller — usually from `H3Configuration` and `Catalog` —
@@ -163,7 +247,8 @@ package enum PipelineRuntime {
         mark(.sampling, "loading the DiT", completed: 0, total: request.steps)
         phase = Date()
         let weights = try H3Weights(url: checkpoints.dit)
-        let model = try H3Transformer(weights: weights, computeDType: .bfloat16,
+        let model = try H3Transformer(weights: weights,
+                                      computeDType: PipelineRuntime.diagnosticComputeDType(log: log),
                                       backend: selection.backend)
         timings.modelLoad = Date().timeIntervalSince(phase)
         reportMemory("after the DiT load", log: log)

@@ -165,6 +165,79 @@ struct RenderEngineTests {
         #expect(receipt.status == .failed)
         #expect(receipt.errorCode != nil)
         #expect(receipt.request.promptCharacters == 21)
+
+        // A failed render is still a render, and which arithmetic it was
+        // running is exactly the sort of thing you want when working out why
+        // it failed.
+        #expect(receipt.compute?.ditDType == "bf16")
+        #expect(receipt.compute?.aneRoutedProjections.isEmpty == true)
+    }
+
+    /// Two renders that differ only in arithmetic must not produce receipts
+    /// that agree.
+    ///
+    /// This is the whole reason the field exists. A change of compute dtype, or
+    /// of which projections ran on the Neural Engine, reselects the diffusion
+    /// sample rather than degrading it — so the same seed and the same
+    /// checkpoint give a visibly different video, and until schema 4 nothing in
+    /// the receipt said which one you had.
+    @Test("receipts distinguish renders that differ only in arithmetic")
+    func arithmeticIsOnTheReceipt() throws {
+        func receipt(dtype: String, routed: [String]) throws -> String {
+            var r = RenderReceipt(
+                jobID: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!,
+                request: .init(mode: "t2va", width: 864, height: 480, seconds: 5,
+                               steps: 20, seed: 42, promptCharacters: 10,
+                               qualityProfile: "balanced", cacheThreshold: 0.25,
+                               referenceImages: 0, referenceVideos: 0,
+                               referenceAudio: 0, keyframeAnchors: 0),
+                environment: .init(libraryVersion: "test", operatingSystem: "test",
+                                   machine: "test", availableMemoryBytes: 0))
+            r.compute = .init(ditDType: dtype, aneRoutedProjections: routed,
+                              aneDeclinedProjections: [])
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            // `startedAt` is wall-clock, so compare everything else.
+            var text = String(decoding: try encoder.encode(r), as: UTF8.self)
+            if let range = text.range(of: "\"startedAt\":[^,]*,", options: .regularExpression) {
+                text.removeSubrange(range)
+            }
+            return text
+        }
+
+        let production = try receipt(dtype: "bf16", routed: [])
+        let fp16       = try receipt(dtype: "fp16", routed: [])
+        let routed     = try receipt(dtype: "bf16", routed: ["fc1", "qkv"])
+
+        #expect(production != fp16, "a dtype override must show on the receipt")
+        #expect(production != routed, "engine routing must show on the receipt")
+        #expect(fp16 != routed)
+
+        // And it must survive the round trip a receipt exists to be read after.
+        var original = RenderReceipt(
+            jobID: UUID(),
+            request: .init(mode: "t2va", width: 864, height: 480, seconds: 5, steps: 20,
+                           seed: 42, promptCharacters: 10, qualityProfile: "balanced",
+                           cacheThreshold: 0.25, referenceImages: 0, referenceVideos: 0,
+                           referenceAudio: 0, keyframeAnchors: 0),
+            environment: .init(libraryVersion: "test", operatingSystem: "test",
+                               machine: "test", availableMemoryBytes: 0))
+        original.compute = .init(ditDType: "bf16",
+                                 aneRoutedProjections: ["fc1", "qkv"],
+                                 aneDeclinedProjections: ["attn out"],
+                                 aneCFGOverlap: true,
+                                 aneSplitContraction: 4)
+
+        let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
+        let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
+        let decoded = try decoder.decode(RenderReceipt.self,
+                                         from: try encoder.encode(original))
+        #expect(decoded.schemaVersion == 7)
+        #expect(decoded.compute?.ditDType == "bf16")
+        #expect(decoded.compute?.aneRoutedProjections == ["fc1", "qkv"])
+        #expect(decoded.compute?.aneDeclinedProjections == ["attn out"])
+        #expect(decoded.compute?.aneCFGOverlap == true)
+        #expect(decoded.compute?.aneSplitContraction == 4)
     }
 
     @Test("stable error codes do not depend on prose")

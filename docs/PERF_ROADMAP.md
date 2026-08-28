@@ -1307,6 +1307,33 @@ Routing one, two and four projections, everything else identical:
 | 4 crossings (all) | 1239.2 ms | +14.9 | −83.2 | 24.5 /crossing |
 
 **A crossing costs about 28 ms.** The four GEMMs are worth 83 ms. Everything
+
+> **Re-measured 2026-08-26: a crossing costs about 40 ms.** The barrier did not
+> get slower — MLX got faster. The baseline block fell from 1224 ms to 1157
+> while the cost of interrupting it did not, so the same barrier is now a larger
+> share of a smaller block. Routing fc2 alone, recorded below as a 6.6 ms win,
+> is a 5.9 ms **loss** today.
+>
+> | | recorded | re-measured |
+> |---|---:|---:|
+> | 1 crossing | 31.0 | **43.5** |
+> | 2 crossings | 29.1 | **39.9** |
+> | 4 crossings | 24.5 | **37.3** |
+>
+> The table below therefore reads, today: 4 crossings **+78 ms / +6.7%**, one
+> crossing per block **−43 ms / −3.7%**, one per step **−82 ms / −7.1%**. The
+> shape of the argument is unchanged and the conclusion is unchanged; the
+> margins are thinner, and a baseline that keeps improving keeps making them
+> thinner.
+>
+> `crossingBreakdown` also attributes it, which this section did not: of 149 ms
+> across four crossings, **29 ms is copying the result home and 120 ms is fusion
+> and scheduling loss**. In isolation there is no barrier at all — MPS-only runs
+> the four GEMMs in 637 ms against MLX's 662. The copy is now removable:
+> `MLXSeamTests.metalWriteIsVisibleToMLX` shows a Metal write lands in an
+> MLXArray's own backing, so a result computed outside MLX need not be copied
+> in. The fusion loss is not removable without avoiding the drain.
+
 follows from those two numbers, on a 1224 ms block:
 
 | design | change |

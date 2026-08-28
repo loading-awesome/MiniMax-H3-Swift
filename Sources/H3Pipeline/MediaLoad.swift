@@ -33,7 +33,10 @@ private final class AudioBufferBox: @unchecked Sendable {
     init(_ value: AVAudioPCMBuffer) { self.value = value }
 }
 
-enum MediaLoad {
+// `package` rather than internal so the external oracles in Tools/ can
+// decode the same audio the pipeline does, rather than carrying a second
+// decoder that could disagree with it.
+package enum MediaLoad {
     enum Error: Swift.Error, CustomStringConvertible {
         case unreadable(String, String)
         case noTrack(String, String)
@@ -186,7 +189,7 @@ enum MediaLoad {
     ///
     /// Mono is duplicated across both channels rather than left silent on one
     /// side; anything above two channels keeps the first two.
-    static func audio(at path: String) throws -> MLXArray {
+    package static func audio(at path: String) throws -> MLXArray {
         let url = URL(fileURLWithPath: path)
         let file: AVAudioFile
         do { file = try AVAudioFile(forReading: url) }

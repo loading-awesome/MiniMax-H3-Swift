@@ -229,7 +229,10 @@ package enum AttentionRegistry {
     /// FLOPs at our verified shape, so sparsification alone caps near 1.5x
     /// there — rising with sequence length, which is where it earns its place.
     /// See docs/SOL_ATTN.md.
-    static let available: [any H3AttentionBackend.Type] = [SDPABackend.self]
+    static let available: [any H3AttentionBackend.Type] = [
+        ANEAttentionBackend.self,
+        SDPABackend.self,
+    ]
 
     package static func resolve(requested: String, machine: Machine,
                                ordering: TokenOrdering? = nil) throws -> Selection {

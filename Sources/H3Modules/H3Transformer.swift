@@ -257,6 +257,29 @@ package struct H3Transformer {
     /// Which block outputs get recorded. Matches the contract's `block_NN` taps.
     package static let tappedBlocks: Set<Int> = [0, 1, 24, 49]
 
+    /// Packed hidden state and the per-pass tables the block stack consumes.
+    ///
+    /// Split out of ``packedForward`` so classifier-free guidance can run two
+    /// packs and then overlap their block stacks, rather than two full forwards
+    /// back to back.
+    struct PackedPass {
+        var h: MLXArray
+        let tEmb: MLXArray
+        let table: MLXArray
+        let layout: PackedLayout
+        let plan: TimestepPlan
+        let index: ModulationIndex
+    }
+
+    func attentionContext(block: Int, stepIndex: Int?, stepCount: Int?,
+                          layout: PackedLayout) -> AttentionContext? {
+        guard let step = stepIndex, let total = stepCount, total > 0 else { return nil }
+        return AttentionContext(blockIndex: block, blockCount: blocks.count,
+                                scheduleProgress: Double(step) / Double(total),
+                                sequenceLength: layout.totalTokens,
+                                videoSpan: layout.videoRange)
+    }
+
     /// Precompute the exact prompt- and geometry-invariant DiT inputs for one
     /// render. Call once before the sampler loop and pass the result to every
     /// ``velocity`` / ``guidedVelocity`` invocation in that loop.
@@ -275,36 +298,78 @@ package struct H3Transformer {
                            refined: refined, ropeTable: rope)
     }
 
-    /// One forward pass, in packed-row space.
-    ///
-    /// Returns the final layer's raw head outputs — `[videoTokens, 96]` and
-    /// `[audioTokens, 32]` — which is where the contract's `final_layer.0` and
-    /// `final_layer.1` taps sit. Latent-shaped velocity comes from
-    /// ``velocity(videoLatent:audioLatent:context:sigmaVideo:geometry:textTags:taps:)``.
-    ///
-    /// - Parameters:
-    ///   - videoLatent:    ///   - audioLatent: `[1,32,2,audioT]`
-    ///   - context: `[1, textLen, textDim]` — the conditioning the contract feeds you
-    ///   - layout: carries the segment table and `[S,3]` position ids
-    ///   - stepIndex: where in the sampling schedule this call sits. Two things
-    ///     need it — the cross-step cache, which will not reuse a residual
-    ///     during warm-up or on the final step, and a sparse attention backend,
-    ///     which has a dense warm-up of its own. One pair of arguments serves
-    ///     both; two pairs would eventually disagree. (These were `cacheStep`
-    ///     and `cacheTotalSteps`, named for their first consumer.) Omitted, the
-    ///     cache is inactive and attention runs dense.
-    package func packedForward(videoLatent: MLXArray, audioLatent: MLXArray,
-                              context: MLXArray, layout: PackedLayout,
-                              plan: TimestepPlan, index: ModulationIndex,
-                              tapsOut: inout Taps,
-                              renderState: RenderState? = nil,
-                              condVideo: MLXArray? = nil,
-                              condAudio: MLXArray? = nil,
-                              stepCache: H3StepCache? = nil,
-                              stepIndex: Int? = nil,
-                              stepCount: Int? = nil)
-        throws -> (video: MLXArray, audio: MLXArray) {
+    /// Tells the saturation probe where it is. Only the block loop knows, and
+    /// the probe needs it to say which block produced the worst bound.
+    private func markProbe(block: Int, stepIndex: Int?, stepCount: Int?) {
+        guard DiTBlock.saturationProbe.needsContext else { return }
+        DiTBlock.saturationProbe.block = block
+        if let s = stepIndex, let n = stepCount, n > 0 {
+            DiTBlock.saturationProbe.progress = Double(s) / Double(n)
+        }
+    }
 
+    func applyBlocks(to h: inout MLXArray, tEmb: MLXArray, index: ModulationIndex,
+                     table: MLXArray, layout: PackedLayout, plan: TimestepPlan,
+                     tapsOut: inout Taps,
+                     stepCache: H3StepCache?,
+                     stepIndex: Int?, stepCount: Int?) {
+        // The index goes through the closure rather than being marked at each
+        // call site: there are three of them, they have already been refactored
+        // once underneath a marker that was written per-site, and a probe that
+        // silently reports nothing is worse than no probe.
+        let evalBlock: (Int, DiTBlock, MLXArray, AttentionContext?) -> MLXArray = { i, b, xIn, ctx in
+            self.markProbe(block: i, stepIndex: stepIndex, stepCount: stepCount)
+            return b(xIn, tEmb: tEmb, index: index, ropeTable: table, context: ctx)
+        }
+
+        // Cross-step residual reuse. Block 0 always runs and doubles as the
+        // probe; if its residual barely moved since the previous step, the
+        // other 49 blocks are skipped and last step's total residual is
+        // re-applied. See `H3StepCache` for why the *total residual* is what
+        // gets cached rather than the output.
+        //
+        // With no cache this is the plain loop, unchanged and bit-identical.
+        if let cache = stepCache, let step = stepIndex, let total = stepCount {
+            let hIn = h
+            // **Block 0 runs dense whenever the cache is on, and this is not a
+            // conservatism — it is measured.** Block 0's residual is the cache's
+            // probe. Sol-Attn's error at block 0 is rel_rms 0.132 at beta 1.2,
+            // and the probe signal the cache thresholds on is 0.077: the
+            // approximation is 1.7x the quantity being measured. Sparsify here
+            // and the cache stops thresholding on how much the step moved and
+            h = evalBlock(0, blocks[0], h, nil)
+            if Self.tappedBlocks.contains(0) { tapsOut.blocks[0] = h }
+
+            switch cache.decide(probe: h - hIn, audioRange: layout.audioRange,
+                                videoRange: layout.videoRange,
+                                step: step, totalSteps: total,
+                                sigma: Double(plan.sigmaVideo)) {
+            case .reuse(let residual):
+                h = hIn + residual
+            case .runFull:
+                for i in 1 ..< blocks.count {
+                    h = evalBlock(i, blocks[i], h, attentionContext(block: i, stepIndex: stepIndex,
+                                                                 stepCount: stepCount, layout: layout))
+                    if Self.tappedBlocks.contains(i) { tapsOut.blocks[i] = h }
+                }
+                cache.record(totalResidual: h - hIn)
+            }
+        } else {
+            for (i, block) in blocks.enumerated() {
+                h = evalBlock(i, block, h, attentionContext(block: i, stepIndex: stepIndex,
+                                                         stepCount: stepCount, layout: layout))
+                if Self.tappedBlocks.contains(i) { tapsOut.blocks[i] = h }
+            }
+        }
+    }
+
+    func makePackedPass(videoLatent: MLXArray, audioLatent: MLXArray,
+                        context: MLXArray, layout: PackedLayout,
+                        plan: TimestepPlan, index: ModulationIndex,
+                        tapsOut: inout Taps,
+                        renderState: RenderState?,
+                        condVideo: MLXArray?,
+                        condAudio: MLXArray?) throws -> PackedPass {
         // text path — the context sets the compute dtype in the reference, so
         // cast it here rather than inheriting whatever the caller supplied. A
         // fp32 golden read straight in would silently run the whole stack at
@@ -315,8 +380,6 @@ package struct H3Transformer {
             precondition(renderState.layout == layout && renderState.contextTokens == context.dim(1),
                          "RenderState does not match this render's packed layout or context length")
             refined = renderState.refined
-            // These are capture-once artifacts in the reference, but keep the
-            // same values available on every call for existing diagnostics.
             textStates = renderState.textStates
         } else {
             textStates = linear(context[0].asType(computeDType), conditionProj)
@@ -325,8 +388,6 @@ package struct H3Transformer {
         tapsOut.conditionProj = textStates
         tapsOut.tokenRefiner = refined
 
-        // media path — patch projections are part of the fp32 island, so the
-        // rows go in as fp32 and the result is cast down to the compute dtype.
         let videoRows = H3Packing.patchifyVideo(videoLatent.asType(.float32),
                                                 patch: config.patchSize)
         let audioRows = H3Packing.packAudio(audioLatent.asType(.float32))
@@ -335,10 +396,6 @@ package struct H3Transformer {
         var condVideoOffset = 0
         for s in layout.segments {
             if s.kind == .cond || s.kind == .refImage {
-                // The layout says there are conditioning rows and the caller did
-                // not supply them. Reachable from ordinary wrong input — a
-                // keyframe declared but never encoded — so it refuses rather
-                // than trapping.
                 guard let condVideo = condVideo else {
                     throw H3Error.invalidRequest(
                         rule: "missing conditioning rows",
@@ -380,12 +437,10 @@ package struct H3Transformer {
         tapsOut.videoPatchProj = videoEmbed
         tapsOut.audioPatchProj = audioEmbed
 
-        // pack segments in the layout's segment table order
         let dtype = computeDType
         var hSegments = [MLXArray]()
         var vEmbedOffset = 0
         var aEmbedOffset = 0
-        
         for s in layout.segments {
             switch s.kind {
             case .text:
@@ -400,14 +455,10 @@ package struct H3Transformer {
                 aEmbedOffset += s.count
             }
         }
-        var h = concatenated(hSegments, axis: 0)
-
+        let h = concatenated(hSegments, axis: 0)
         precondition(h.dim(0) == layout.totalTokens,
                      "packed \(h.dim(0)) rows, layout says \(layout.totalTokens)")
 
-        // The reference taps the time embedder's own fp32 output and casts
-        // afterwards. Recording the cast value instead compares bf16 against
-        // fp32 and shows a half-ULP difference on a tap that is otherwise exact.
         let tEmbFP32 = timeEmbedder(MLXArray(plan.values))
         tapsOut.timeEmbedder = tEmbFP32
         let tEmb = tEmbFP32.asType(dtype)
@@ -420,81 +471,59 @@ package struct H3Transformer {
             table = H3RoPE.rotationTable(
                 angles: H3RoPE.angles(positionIds: pos, invFreq: ropeInvFreq)).asType(dtype)
         }
+        return PackedPass(h: h, tEmb: tEmb, table: table, layout: layout, plan: plan, index: index)
+    }
 
-        // Where each attention call sits in the render. Built here because this
-        // is the only place that knows all of it at once: the block index, how
-        // far through the schedule we are, and — from the layout — which rows
-        // are the generated video and which are conditioning a sparse backend
-        // must keep exact.
-        //
-        // Nil when the caller did not say what step this is, which is the
-        // oracles and any single forward pass. A backend that cannot tell
-        // whether it is in its own dense warm-up should not be guessing, so nil
-        // means dense.
-        func attentionContext(block: Int) -> AttentionContext? {
-            guard let step = stepIndex, let total = stepCount, total > 0 else { return nil }
-            return AttentionContext(blockIndex: block, blockCount: blocks.count,
-                                    scheduleProgress: Double(step) / Double(total),
-                                    sequenceLength: layout.totalTokens,
-                                    videoSpan: layout.videoRange)
-        }
-
-        // Cross-step residual reuse. Block 0 always runs and doubles as the
-        // probe; if its residual barely moved since the previous step, the
-        // other 49 blocks are skipped and last step's total residual is
-        // re-applied. See `H3StepCache` for why the *total residual* is what
-        // gets cached rather than the output.
-        //
-        // With no cache this is the plain loop, unchanged and bit-identical.
-        if let cache = stepCache, let step = stepIndex, let total = stepCount {
-            let hIn = h
-            // **Block 0 runs dense whenever the cache is on, and this is not a
-            // conservatism — it is measured.** Block 0's residual is the cache's
-            // probe. Sol-Attn's error at block 0 is rel_rms 0.132 at beta 1.2,
-            // and the probe signal the cache thresholds on is 0.077: the
-            // approximation is 1.7x the quantity being measured. Sparsify here
-            // and the cache stops thresholding on how much the step moved and
-            // starts thresholding on backend noise — reusing when it should not
-            // and refusing when it should, with every shape still correct.
-            //
-            // The cost is 1/50th of the stack. Passing nil, rather than asking
-            // the backend to exclude block 0 itself, keeps the rule where its
-            // reason lives instead of in each backend's policy.
-            h = blocks[0](h, tEmb: tEmb, index: index, ropeTable: table, context: nil)
-            if Self.tappedBlocks.contains(0) { tapsOut.blocks[0] = h }
-
-            switch cache.decide(probe: h - hIn, audioRange: layout.audioRange,
-                                videoRange: layout.videoRange,
-                                step: step, totalSteps: total,
-                                sigma: Double(plan.sigmaVideo)) {
-            case .reuse(let residual):
-                h = hIn + residual
-            case .runFull:
-                for i in 1 ..< blocks.count {
-                    h = blocks[i](h, tEmb: tEmb, index: index, ropeTable: table,
-                                  context: attentionContext(block: i))
-                    if Self.tappedBlocks.contains(i) { tapsOut.blocks[i] = h }
-                }
-                cache.record(totalResidual: h - hIn)
-            }
-        } else {
-            for (i, block) in blocks.enumerated() {
-                h = block(h, tEmb: tEmb, index: index, ropeTable: table,
-                          context: attentionContext(block: i))
-                if Self.tappedBlocks.contains(i) { tapsOut.blocks[i] = h }
-            }
-        }
-
-        // The final layer's AdaLN has one modality, so these rows are timestep
-        // rows — not the `row * 3 + tag` a block uses.
-        let videoSeg = ModSegment(start: layout.videoRange.lowerBound,
-                                  stop: layout.videoRange.upperBound, row: plan.row(for: .video))
-        let audioSeg = ModSegment(start: layout.audioRange.lowerBound,
-                                  stop: layout.audioRange.upperBound, row: plan.row(for: .audio))
-        let (v, a) = finalLayer(h, tEmb: tEmb, videoSeg: videoSeg, audioSeg: audioSeg)
+    func finalize(_ pass: PackedPass, tapsOut: inout Taps) -> (video: MLXArray, audio: MLXArray) {
+        let videoSeg = ModSegment(start: pass.layout.videoRange.lowerBound,
+                                  stop: pass.layout.videoRange.upperBound,
+                                  row: pass.plan.row(for: .video))
+        let audioSeg = ModSegment(start: pass.layout.audioRange.lowerBound,
+                                  stop: pass.layout.audioRange.upperBound,
+                                  row: pass.plan.row(for: .audio))
+        let (v, a) = finalLayer(pass.h, tEmb: pass.tEmb, videoSeg: videoSeg, audioSeg: audioSeg)
         tapsOut.finalVideo = v
         tapsOut.finalAudio = a
         return (v, a)
+    }
+
+    /// One forward pass, in packed-row space.
+    ///
+    /// Returns the final layer's raw head outputs — `[videoTokens, 96]` and
+    /// `[audioTokens, 32]` — which is where the contract's `final_layer.0` and
+    /// `final_layer.1` taps sit. Latent-shaped velocity comes from
+    /// ``velocity(videoLatent:audioLatent:context:sigmaVideo:geometry:textTags:taps:)``.
+    ///
+    /// - Parameters:
+    ///   - videoLatent:    ///   - audioLatent: `[1,32,2,audioT]`
+    ///   - context: `[1, textLen, textDim]` — the conditioning the contract feeds you
+    ///   - layout: carries the segment table and `[S,3]` position ids
+    ///   - stepIndex: where in the sampling schedule this call sits. Two things
+    ///     need it — the cross-step cache, which will not reuse a residual
+    ///     during warm-up or on the final step, and a sparse attention backend,
+    ///     which has a dense warm-up of its own. One pair of arguments serves
+    ///     both; two pairs would eventually disagree. (These were `cacheStep`
+    ///     and `cacheTotalSteps`, named for their first consumer.) Omitted, the
+    ///     cache is inactive and attention runs dense.
+    package func packedForward(videoLatent: MLXArray, audioLatent: MLXArray,
+                              context: MLXArray, layout: PackedLayout,
+                              plan: TimestepPlan, index: ModulationIndex,
+                              tapsOut: inout Taps,
+                              renderState: RenderState? = nil,
+                              condVideo: MLXArray? = nil,
+                              condAudio: MLXArray? = nil,
+                              stepCache: H3StepCache? = nil,
+                              stepIndex: Int? = nil,
+                              stepCount: Int? = nil)
+        throws -> (video: MLXArray, audio: MLXArray) {
+        var pass = try makePackedPass(videoLatent: videoLatent, audioLatent: audioLatent,
+                                      context: context, layout: layout, plan: plan, index: index,
+                                      tapsOut: &tapsOut, renderState: renderState,
+                                      condVideo: condVideo, condAudio: condAudio)
+        applyBlocks(to: &pass.h, tEmb: pass.tEmb, index: pass.index, table: pass.table,
+                    layout: pass.layout, plan: pass.plan, tapsOut: &tapsOut,
+                    stepCache: stepCache, stepIndex: stepIndex, stepCount: stepCount)
+        return finalize(pass, tapsOut: &tapsOut)
     }
 
     /// Latent-shaped velocity for one sampler step, matching the reference's
@@ -546,10 +575,19 @@ package struct H3Transformer {
     /// negative-prompt form, and the trajectory is pushed away from those
     /// concepts at every step rather than merely not toward them.
     ///
-    /// The two passes run **sequentially**, not as a batch. This model is
-    /// batch-1 only — the reference raises on `video_x.shape[0] != 1` — and the
-    /// packed sequence has no batch axis to widen, so guidance costs a second
-    /// full forward. At production shape that is 61 s per pass.
+    /// The two passes are independent — this model is batch-1 only, and the
+    /// packed sequence has no batch axis to widen — so guidance is a second
+    /// full forward. At production shape that is 61 s per pass if they run
+    /// back to back.
+    ///
+    /// Under `H3_ANE_CFG_OVERLAP=1` the two block stacks are **pipelined**, the
+    /// branches half a block out of phase, so the engine works on one while the
+    /// GPU attends on the other. The math of each branch is unchanged — the
+    /// schedule is bit-identical to the sequential path — and it is off by
+    /// default because it does not win: the engine runs at 7.9 TFLOP/s against
+    /// the GPU's 19.4, and the routing overhead of moving more columns to it
+    /// exceeds what overlapping them recovers. `docs/ANE.md` carries the
+    /// table and the arithmetic.
     ///
     /// Taps come from the CONDITIONAL pass, so a parity run at scale 1.0 is
     /// byte-comparable with a run with guidance off.
@@ -575,6 +613,32 @@ package struct H3Transformer {
                                stepIndex: Int? = nil,
                                stepCount: Int? = nil,
                                taps: inout Taps) throws -> (video: MLXArray, audio: MLXArray) {
+        // scale 1.0 is the identity; skip the second pass rather than paying
+        // 61 s to multiply by one.
+        guard scale != 1.0 else {
+            return try velocity(videoLatent: videoLatent, audioLatent: audioLatent,
+                                context: context, sigmaVideo: sigmaVideo,
+                                geometry: geometry, textTags: textTags,
+                                keyframes: keyframes, refs: refs,
+                                condVideo: condVideo, condAudio: condAudio,
+                                renderState: renderState,
+                                stepCache: stepCache, stepIndex: stepIndex,
+                                stepCount: stepCount, taps: &taps)
+        }
+
+        if ANELinearBackend.isEnabled && ANELinearBackend.cfgOverlapEnabled {
+            return try overlappedGuidedVelocity(
+                videoLatent: videoLatent, audioLatent: audioLatent,
+                context: context, negative: negative, scale: scale,
+                sigmaVideo: sigmaVideo, geometry: geometry,
+                textTags: textTags, negativeTextTags: negativeTextTags,
+                keyframes: keyframes, refs: refs,
+                condVideo: condVideo, condAudio: condAudio,
+                renderState: renderState, negativeRenderState: negativeRenderState,
+                stepCache: stepCache, negativeStepCache: negativeStepCache,
+                stepIndex: stepIndex, stepCount: stepCount, taps: &taps)
+        }
+
         let cond = try velocity(videoLatent: videoLatent, audioLatent: audioLatent,
                             context: context, sigmaVideo: sigmaVideo,
                             geometry: geometry, textTags: textTags,
@@ -584,9 +648,6 @@ package struct H3Transformer {
                             stepCache: stepCache, stepIndex: stepIndex,
                             stepCount: stepCount,
                             taps: &taps)
-        // scale 1.0 is the identity; skip the second pass rather than paying
-        // 61 s to multiply by one.
-        guard scale != 1.0 else { return cond }
 
         var negTaps = Taps()
         let uncondContext = negative ?? MLXArray.zeros(
@@ -605,6 +666,72 @@ package struct H3Transformer {
         let s = MLXArray(scale)
         return (uncond.video + s * (cond.video - uncond.video),
                 uncond.audio + s * (cond.audio - uncond.audio))
+    }
+
+    func overlappedGuidedVelocity(videoLatent: MLXArray, audioLatent: MLXArray,
+                                  context: MLXArray, negative: MLXArray?,
+                                  scale: Float, sigmaVideo: Double,
+                                  geometry: LatentGeometry,
+                                  textTags: [Int]?, negativeTextTags: [Int]?,
+                                  keyframes: [KeyframeConfig], refs: [ReferenceBlock],
+                                  condVideo: MLXArray?, condAudio: MLXArray?,
+                                  renderState: RenderState?,
+                                  negativeRenderState: RenderState?,
+                                  stepCache: H3StepCache?,
+                                  negativeStepCache: H3StepCache?,
+                                  stepIndex: Int?, stepCount: Int?,
+                                  taps: inout Taps) throws -> (video: MLXArray, audio: MLXArray) {
+        let layoutC = try renderState?.layout ?? PackedLayout(textTokens: context.dim(1),
+                                                             geometry: geometry,
+                                                             keyframes: keyframes, refs: refs)
+        let planC = TimestepPlan(sigmaVideo: sigmaVideo, segments: layoutC.segments)
+        let indexC = ModulationIndex(layout: layoutC, plan: planC, textTags: textTags)
+        var condPass = try makePackedPass(videoLatent: videoLatent, audioLatent: audioLatent,
+                                          context: context, layout: layoutC, plan: planC,
+                                          index: indexC, tapsOut: &taps,
+                                          renderState: renderState,
+                                          condVideo: condVideo, condAudio: condAudio)
+
+        let uncondContext = negative ?? MLXArray.zeros(
+            [context.dim(0), context.dim(1), context.dim(2)], dtype: context.dtype)
+        let uncondTags = negative == nil ? textTags : negativeTextTags
+        let layoutU = try negativeRenderState?.layout
+            ?? PackedLayout(textTokens: uncondContext.dim(1), geometry: geometry,
+                            keyframes: keyframes, refs: refs)
+        let planU = TimestepPlan(sigmaVideo: sigmaVideo, segments: layoutU.segments)
+        let indexU = ModulationIndex(layout: layoutU, plan: planU, textTags: uncondTags)
+        var negTaps = Taps()
+        var uncondPass = try makePackedPass(videoLatent: videoLatent, audioLatent: audioLatent,
+                                            context: uncondContext, layout: layoutU, plan: planU,
+                                            index: indexU, tapsOut: &negTaps,
+                                            renderState: negativeRenderState,
+                                            condVideo: condVideo, condAudio: condAudio)
+
+        ANELinearBackend.markCFGOverlap()
+        overlapStacks(cond: &condPass, uncond: &uncondPass,
+                      condCache: stepCache, uncondCache: negativeStepCache,
+                      stepIndex: stepIndex, stepCount: stepCount,
+                      condTaps: &taps)
+
+        let cond = decodeVelocity(finalize(condPass, tapsOut: &taps),
+                                  geometry: geometry, plan: planC)
+        let uncond = decodeVelocity(finalize(uncondPass, tapsOut: &negTaps),
+                                    geometry: geometry, plan: planU)
+        let s = MLXArray(scale)
+        return (uncond.video + s * (cond.video - uncond.video),
+                uncond.audio + s * (cond.audio - uncond.audio))
+    }
+
+    func decodeVelocity(_ heads: (video: MLXArray, audio: MLXArray),
+                        geometry: LatentGeometry, plan: TimestepPlan)
+        -> (video: MLXArray, audio: MLXArray) {
+        let video = H3Packing.unpatchifyVideo(heads.video, t: geometry.latentT,
+                                              h: geometry.latentH / config.patchSize[1],
+                                              w: geometry.latentW / config.patchSize[2],
+                                              channels: config.videoLatentDim,
+                                              patch: config.patchSize)
+        let audio = H3Packing.unpackAudio(heads.audio)
+        return (-video, MLXArray(-plan.audioSlope) * audio)
     }
 }
 

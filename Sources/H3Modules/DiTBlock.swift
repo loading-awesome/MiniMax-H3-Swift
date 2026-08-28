@@ -327,17 +327,43 @@ package struct AttentionLayer {
         }
     }
 
-    /// `x` is `[S, hidden]` or `[B, S, hidden]`.
+    /// Q, K, V after the projection, per-head RMSNorm and RoPE. GPU attention
+    /// consumes this; the output projection is a separate call so a second
+    /// CFG branch can occupy the engine while this one attends.
+    /// Submits `qkv` to the engine and returns without waiting for it.
     ///
-    /// - Parameter context: where in the render this call sits. Nil means dense:
-    ///   a sparse backend that does not know which block it is in, or how far
-    ///   through the schedule, cannot honour its own dense warm-up or its
-    ///   first/last-block exclusions, and guessing is worse than declining.
-    package func callAsFunction(_ x: MLXArray, ropeTable: MLXArray?,
-                               context: AttentionContext? = nil) -> MLXArray {
-        let qkv = matmul(x, qkvWeight.T)
+    /// Everything after the projection — the split, the per-head norms, RoPE —
+    /// needs the numbers, so it lives in ``finishQKV``. The gap between the two
+    /// is where the other CFG branch gets the GPU.
+    /// `engine: false` keeps the projection on the GPU even with the backend
+    /// on. The MLP island owns both dies for the whole block, and a `qkv`
+    /// queued beside it is a third and fourth concurrent evaluation on a
+    /// private runtime that hard-locked the machine under exactly that load.
+    package func beginQKV(_ x: MLXArray, engine: Bool = true)
+        -> ANELinearBackend.Pending {
+        DiTBlock.saturationProbe.record("qkv", x: x, weight: qkvWeight)
+        return ANELinearBackend.begin(x: x, weight: qkvWeight, label: "qkv",
+                                      engine: engine)
+    }
+
+    package func finishQKV(_ pending: ANELinearBackend.Pending, ropeTable: MLXArray?)
+        -> (q: MLXArray, k: MLXArray, v: MLXArray) {
+        shapeQKV(pending.value(), ropeTable: ropeTable)
+    }
+
+    package func projectQKV(_ x: MLXArray, ropeTable: MLXArray?)
+        -> (q: MLXArray, k: MLXArray, v: MLXArray) {
+        DiTBlock.saturationProbe.record("qkv", x: x, weight: qkvWeight)
+        let qkv = ANELinearBackend.isEnabled
+            ? ANELinearBackend.project(x: x, weight: qkvWeight, label: "qkv")
+            : matmul(x, qkvWeight.T)
+        return shapeQKV(qkv, ropeTable: ropeTable)
+    }
+
+    private func shapeQKV(_ qkv: MLXArray, ropeTable: MLXArray?)
+        -> (q: MLXArray, k: MLXArray, v: MLXArray) {
         let qkvParts = qkv.split(parts: 3, axis: -1)
-        
+
         let targetShape = qkvParts[0].shape.dropLast() + [heads, headDim]
         var q = qkvParts[0].reshaped(targetShape)
         var k = qkvParts[1].reshaped(targetShape)
@@ -350,13 +376,46 @@ package struct AttentionLayer {
             q = SplitHalfRoPE.apply(q, table: ropeTable)
             k = SplitHalfRoPE.apply(k, table: ropeTable)
         }
+        return (q, k, v)
+    }
 
+    package func attend(q: MLXArray, k: MLXArray, v: MLXArray,
+                        context: AttentionContext?) -> MLXArray {
         // Same call the oracle taps. Inlining a second copy here would mean the
         // oracle validates code production does not run, which is the exact
         // failure this harness exists to prevent.
-        let merged = Self.sdpa(q: q, k: k, v: v, headDim: headDim, fp32: fp32Attention,
-                               backend: backend, context: context)
-        return matmul(merged, outWeight.T)
+        Self.sdpa(q: q, k: k, v: v, headDim: headDim, fp32: fp32Attention,
+                  backend: backend, context: context)
+    }
+
+    /// `attn out` contracts over `inner` rather than `hidden`, so it builds
+    /// its own compiled program. Its interior partials peak at 3,925 at
+    /// block 49 — 8.3x under the 2^15 cliff unscaled, 134x with the operand
+    /// scale this path applies — so it needs no bound beyond what is here.
+    package func projectOut(_ merged: MLXArray) -> MLXArray {
+        DiTBlock.saturationProbe.record("attn out", x: merged, weight: outWeight)
+        return ANELinearBackend.isEnabled
+            ? ANELinearBackend.project(x: merged, weight: outWeight, label: "attn out")
+            : matmul(merged, outWeight.T)
+    }
+
+    package func beginOut(_ merged: MLXArray, engine: Bool = true)
+        -> ANELinearBackend.Pending {
+        DiTBlock.saturationProbe.record("attn out", x: merged, weight: outWeight)
+        return ANELinearBackend.begin(x: merged, weight: outWeight, label: "attn out",
+                                      engine: engine)
+    }
+
+    /// `x` is `[S, hidden]` or `[B, S, hidden]`.
+    ///
+    /// - Parameter context: where in the render this call sits. Nil means dense:
+    ///   a sparse backend that does not know which block it is in, or how far
+    ///   through the schedule, cannot honour its own dense warm-up or its
+    ///   first/last-block exclusions, and guessing is worse than declining.
+    package func callAsFunction(_ x: MLXArray, ropeTable: MLXArray?,
+                               context: AttentionContext? = nil) -> MLXArray {
+        let p = projectQKV(x, ropeTable: ropeTable)
+        return projectOut(attend(q: p.q, k: p.k, v: p.v, context: context))
     }
 }
 
@@ -373,12 +432,70 @@ package struct H3MLP {
         self.fc2 = fc2
     }
 
-    package func callAsFunction(_ x: MLXArray) -> MLXArray {
-        let h = matmul(x, fc1.T)
+    /// Submits `fc1` and returns; `finish` completes the gate, the product and
+    /// `fc2`. `fc2` is GPU work either way, so it is not worth splitting.
+    package func begin(_ x: MLXArray) -> ANELinearBackend.Pending {
+        DiTBlock.saturationProbe.record("fc1", x: x, weight: fc1)
+        return ANELinearBackend.begin(x: x, weight: fc1, label: "fc1")
+    }
+
+
+    package func finish(_ pending: ANELinearBackend.Pending,
+                        blockIndex: Int? = nil) -> MLXArray {
+        let gated = pending.swiGLUValue()
+        DiTBlock.saturationProbe.captureFC2Input(x: gated)
+        return projectFC2(gated, blockIndex: blockIndex)
+    }
+
+    /// `fc2` on the engine, but only at a scale measured for *this* block.
+    ///
+    /// Nil block index, no calibrated entry, or the opt-in off all keep it on
+    /// the GPU. That is deliberate: the failure mode for an under-scaled `fc2`
+    /// is silent zeros, not a rounding error, so there is no safe default to
+    /// guess. See `ANEFC2Scales`.
+    private func projectFC2(_ gated: MLXArray, blockIndex: Int?) -> MLXArray {
+        guard ANELinearBackend.fc2Enabled,
+              let blockIndex,
+              let scale = ANEFC2Scales.scale(forBlock: blockIndex)
+        else { return matmul(gated, fc2.T) }
+        let routed = ANELinearBackend.begin(x: gated, weight: fc2, label: "fc2",
+                                            scale: scale).value()
+        guard ANELinearBackend.fc2Verify else { return routed }
+        // Both paths take the same `gated`, so this isolates fc2's arithmetic
+        // exactly, over every block and every step rather than a few captures.
+        DiTBlock.fc2Audit.compare(routed: routed, reference: matmul(gated, fc2.T),
+                                  block: blockIndex, scale: scale)
+        return routed
+    }
+
+    private func gateAndProject(_ h: MLXArray, fc2BlockIndex: Int? = nil) -> MLXArray {
         let parts = h.split(parts: 2, axis: -1)
-        let gate = parts[0]
-        let up = parts[1]
-        return matmul(silu(gate) * up, fc2.T)
+        let gated = silu(parts[0]) * parts[1]
+        // `fc2` is the projection the bound exists to rule on, and this is the
+        // only place its real input exists.
+        DiTBlock.saturationProbe.record("fc2", x: gated, weight: fc2)
+        DiTBlock.saturationProbe.captureFC2Input(x: gated)
+        return projectFC2(gated, blockIndex: fc2BlockIndex)
+    }
+
+    package func callAsFunction(_ x: MLXArray, blockIndex: Int? = nil) -> MLXArray {
+        // `fc1` is the largest GEMM in a block — 262 ms against qkv's 197 at
+        // production width — and its interior partials peak at 72 against the
+        // engine's 2^15 cliff, so it is the cheapest projection to route and
+        // the one with the most to give.
+        //
+        // `fc2` is deliberately not routed. It breaches saturation at block 49
+        // (34,649) and the failure is silent zeros, so it waits on a measured
+        // per-block bound rather than on an operand scale that is merely
+        // probably enough.
+        if ANELinearBackend.isEnabled {
+            return finish(begin(x), blockIndex: blockIndex)
+        }
+        // **Also here, not only in `begin`.** A bound run has the engine off by
+        // design — the activations must come from the unrouted path — so
+        // instrumenting only the routed entry point measures `fc1` never.
+        DiTBlock.saturationProbe.record("fc1", x: x, weight: fc1)
+        return gateAndProject(matmul(x, fc1.T), fc2BlockIndex: blockIndex)
     }
 }
 
@@ -393,7 +510,261 @@ package struct H3MLP {
 /// The reference mutates `x` in place and returns the same object. We return a
 /// new array — functionally identical, and MLX has no in-place residual to
 /// preserve.
+
+/// The order-free saturation bound, computed **during a render** instead of
+/// from captured tensors.
+///
+/// Captures would be the better instrument if they were complete, but they
+/// cover three blocks of fifty and 6.6% of sequence positions, and `fc2` was
+/// refused on exactly that — its bound moves 95x
+/// across the three blocks that were measured, so twenty-four unmeasured blocks
+/// is not a gap that argument survives.
+///
+/// Nothing has to be captured to close it. What the bound needs is
+/// `max over (row, channel) of sum_k |a_k| |w_k|`, which is one GEMM on the
+/// magnitudes, and every activation it wants is in hand at the moment the
+/// projection runs. Computing it inline covers **every block and every row of
+/// every step**, which is strictly more than the captures ever offered.
+///
+/// Two things this is not. It is not free — the magnitude GEMM is the same
+/// shape as the projection, so a bound run costs about double. And the
+/// activations are *ours*, from the unrouted bf16 path, not the reference's;
+/// that is the arithmetic the conformance suite pins the reference against, and
+/// it is stated here rather than glossed because a bound is only as good as the
+/// data under it.
+///
+///     H3_ANE_BOUND=/tmp/bound.json h3 render ...   (run without H3_ANE)
+///
+/// Add `H3_ANE_BOUND_MLP_ISLAND=1` to also measure the two candidate ANE
+/// `fc2` neuron ranges. It is separate because those bounds add two more
+/// shard-sized magnitude GEMMs per block.
+/// `H3_ANE_BOUND_MLP_ISLAND_ONLY=1` suppresses the older whole-projection
+/// measurements during calibration; it implies the island measurement and
+/// cuts work that cannot affect the per-block scale table.
+package final class SaturationProbe: @unchecked Sendable {
+    package let path: String?
+    /// Optional, one-shot capture of the real SwiGLU activation consumed by
+    /// fc2. This closes the precision half of the scale calibration without
+    /// requiring the CUDA reference environment on the render machine.
+    private let captureDirectory: String?
+    private let captureBlocks: Set<Int>
+    private let captureAfter: Double
+    private let captureRows: Int
+    private var capturedBlocks: Set<Int> = []
+    /// Opt-in because the candidate island adds two shard-sized magnitude
+    /// GEMMs to every fc2 in an already expensive faithful bound render.
+    /// Set by the block loop, which is the only place that knows where it is.
+    package var block = -1
+    package var progress = 0.0
+    private let lock = NSLock()
+    /// Worst bound seen per projection, and where it was seen.
+    private var worst: [String: (bound: Double, block: Int, progress: Double,
+                                 operandScale: Double, lower: Int, upper: Int)] = [:]
+
+    package init() {
+        let env = ProcessInfo.processInfo.environment
+        path = (env["H3_ANE_BOUND"]?.isEmpty == false) ? env["H3_ANE_BOUND"] : nil
+        captureDirectory = (env["H3_CAPTURE_MLP_ISLAND"]?.isEmpty == false)
+            ? env["H3_CAPTURE_MLP_ISLAND"] : nil
+        captureBlocks = Set((env["H3_CAPTURE_MLP_BLOCKS"] ?? "39")
+            .split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) })
+        captureAfter = Double(env["H3_CAPTURE_MLP_AFTER"] ?? "0.8") ?? 0.8
+        captureRows = max(1, Int(env["H3_CAPTURE_MLP_ROWS"] ?? "1024") ?? 1024)
+    }
+
+    package var enabled: Bool { path != nil }
+    package var needsContext: Bool { enabled || captureDirectory != nil }
+
+    /// Pieces the contraction is cut into for the split bound, alongside the
+    /// whole one. Both are reported: the whole-`k` figure is what the current
+    /// unsplit path must clear, and the per-piece figure is what a split path
+    /// must clear, because a split projection never accumulates across a piece.
+    package var splits = 8
+
+    /// `x` is `[s, k]`, `weight` is `[n, k]` — the projection's own operands.
+    /// Records the worst bound for the projection **and** the worst for this
+    /// block on its own.
+    ///
+    /// A single global worst is enough to refuse a projection, which is what
+    /// this was built for. It is not enough to *route* one: a per-block operand
+    /// scale needs a per-block bound, and scaling every block by what block 45
+    /// needs would push the quiet blocks into fp16 denormals — the underflow
+    /// floor `operandScaleHasAnUnderflowFloor` pins. Both entries come from one
+    /// GEMM; only the bookkeeping is duplicated.
+    package func record(_ label: String, x: MLXArray, weight: MLXArray) {
+        guard enabled, block >= 0 else { return }
+        measure(label, x: x, weight: weight, pieces: 1,
+                alsoLabel: String(format: "%@ b%02d", label, block))
+        let k = x.dim(1)
+        if splits > 1, k % splits == 0 {
+            measure(label + " split\(splits)", x: x, weight: weight, pieces: splits,
+                    alsoLabel: String(format: "%@ b%02d split%d", label, block, splits))
+        }
+    }
+
+    /// Bounds the first persistent-MLP candidate: GPU owns the first half of
+    /// the SwiGLU neurons and each ANE consumes one quarter. At H3 width an ANE
+    /// quarter is 3,584 neurons; four pieces keep every private accumulation at
+    /// the measured 896-wide throughput and safety sweet spot.
+    /// Captures the real `fc2` input so `ANEFC2Scales` can be regenerated for
+    /// a new shape. The bound itself is recorded by `record("fc2", ...)`.
+    package func captureFC2Input(x: MLXArray) { maybeCaptureFC2Input(x) }
+
+    /// Save evenly spaced rows rather than a prefix: packed H3 sequences are
+    /// modality ordered, so a prefix silently over-samples text/audio and can
+    /// miss the video rows that dominate a production render. The capture is
+    /// fp32 so a comparison sees arithmetic rather than storage rounding.
+    private func maybeCaptureFC2Input(_ x: MLXArray) {
+        guard let directory = captureDirectory, block >= 0,
+              captureBlocks.contains(block), progress >= captureAfter else { return }
+        lock.lock()
+        let shouldCapture = !capturedBlocks.contains(block)
+        if shouldCapture { capturedBlocks.insert(block) }
+        lock.unlock()
+        guard shouldCapture else { return }
+
+        let count = min(captureRows, x.dim(0))
+        let indices: [Int32] = (0 ..< count).map {
+            count == 1 ? 0 : Int32(($0 * (x.dim(0) - 1)) / (count - 1))
+        }
+        let rows = MLXArray(indices)
+        let sample = x.take(rows, axis: 0).asType(.float32)
+        let name = "mlp_block\(String(format: "%02d", block))"
+                 + "_p\(String(format: "%.2f", progress)).safetensors"
+        let path = URL(fileURLWithPath: directory).appendingPathComponent(name)
+        do {
+            try FileManager.default.createDirectory(at: URL(fileURLWithPath: directory),
+                                                    withIntermediateDirectories: true)
+            try MLX.save(arrays: ["ref.mlp.swiglu": sample, "in.rows": rows], url: path)
+            let note = "  captured fc2 input block \(block) at progress "
+                     + String(format: "%.2f", progress)
+                     + ", \(count)/\(x.dim(0)) rows -> \(path.path)\n"
+            FileHandle.standardError.write(Data(note.utf8))
+        } catch {
+            lock.lock(); capturedBlocks.remove(block); lock.unlock()
+            let note = "  fc2 input capture failed at block \(block): \(error)\n"
+            FileHandle.standardError.write(Data(note.utf8))
+        }
+    }
+
+    private func measure(_ label: String, x: MLXArray, weight: MLXArray, pieces: Int,
+                         contraction: Range<Int>? = nil,
+                         operandScale: Double = 0.0625,
+                         alsoLabel: String? = nil) {
+        // fp32 throughout: this is a safety bound, and bf16's three digits are
+        // not enough to argue a factor-of-two margin with.
+        let span = contraction ?? (0 ..< x.dim(1))
+        guard span.count > 0, span.count % pieces == 0 else { return }
+        let piece = span.count / pieces
+        var pieceMax: [MLXArray] = []
+        for lo in stride(from: span.lowerBound, to: span.upperBound, by: piece) {
+            let hi = min(lo + piece, span.upperBound)
+            let a = MLX.abs(x[0..., lo ..< hi].asType(.float32))
+            // Chunked over output channels so `[15731, 28672]` never exists
+            // whole, but reduced lazily and read **once**: an `.item()` per
+            // chunk is a GPU sync per chunk, seven per `fc1`, fifty blocks a step.
+            let n = weight.dim(0), step = 4096
+            var chunkPeaks: [MLXArray] = []
+            for start in stride(from: 0, to: n, by: step) {
+                let w = MLX.abs(
+                    weight[start ..< min(start + step, n), lo ..< hi].asType(.float32)
+                )
+                chunkPeaks.append(MLX.matmul(a, w.transposed()).max())
+            }
+            pieceMax.append(MLX.stacked(chunkPeaks).max())
+        }
+        let peak = Double(MLX.stacked(pieceMax).max().item(Float.self))
+        lock.lock()
+        for key in alsoLabel.map({ [label, $0] }) ?? [label]
+        where peak > (worst[key]?.bound ?? 0) {
+            worst[key] = (peak, block, progress, operandScale,
+                          span.lowerBound, span.upperBound)
+        }
+        lock.unlock()
+        write()
+    }
+
+    /// Rewritten on every improvement rather than at exit: a bound run is long
+    /// and the answer should survive it being interrupted.
+    private func write() {
+        guard let path else { return }
+        lock.lock(); let snapshot = worst; lock.unlock()
+        // `fc2` runs at a per-block scale, so a single global threshold would
+        // report false failures for arithmetic no block executes. Every
+        // observation carries the scale it was measured at.
+        let defaultThreshold = 32768.0 / 0.0625
+        var rows: [String] = []
+        for (label, v) in snapshot.sorted(by: { $0.key < $1.key }) {
+            let threshold = 32768.0 / v.operandScale
+            var requiredScale = 1.0
+            // Factor-of-two margin, powers of two only. This is the largest
+            // candidate scale the block may use without changing fp16 values
+            // through an inexact multiplier.
+            while v.bound * requiredScale >= 16384.0 && requiredScale > 1.0 / 65536.0 {
+                requiredScale /= 2.0
+            }
+            rows.append("""
+                  "\(label)": { "bound": \(v.bound), "block": \(v.block),             "progress": \(v.progress), "operandScale": \(v.operandScale),             "contraction": [\(v.lower), \(v.upper)], "requiredScale2x": \(requiredScale),             "threshold": \(threshold), "headroom": \(threshold / v.bound),             "proven": \(v.bound < threshold) }
+            """)
+        }
+        let json = "{\n  \"threshold\": \(defaultThreshold),\n\(rows.joined(separator: ",\n"))\n}\n"
+        try? json.write(toFile: path, atomically: true, encoding: .utf8)
+    }
+}
+
+/// Checks routed `fc2` against the GPU's own answer for the same input.
+///
+/// Saturation on this engine fails as **silent zeros**, not as an error, so the
+/// two numbers that matter are the relative error and the fraction of outputs
+/// that came back exactly zero where the reference is not. A scale that is one
+/// power of two too large shows up in the second long before the first.
+package final class FC2Audit: @unchecked Sendable {
+    private let lock = NSLock()
+    private var worstError: [Int: Float] = [:]
+    private var worstZeros: [Int: Float] = [:]
+    private var scales: [Int: Float] = [:]
+
+    package func compare(routed: MLXArray, reference: MLXArray,
+                         block: Int, scale: Float) {
+        let r = reference.asType(.float32), a = routed.asType(.float32)
+        let d = r - a
+        let error = MLX.sqrt(MLX.sum(d * d)).item(Float.self)
+            / max(MLX.sqrt(MLX.sum(r * r)).item(Float.self), 1e-30)
+        // Zeros the reference does not have are the saturation signature.
+        let zeroed = MLX.logicalAnd(MLX.equal(a, MLXArray(Float(0))),
+                                    MLX.notEqual(r, MLXArray(Float(0))))
+        let fraction = MLX.mean(zeroed.asType(.float32)).item(Float.self)
+        lock.lock()
+        worstError[block] = max(worstError[block] ?? 0, error)
+        worstZeros[block] = max(worstZeros[block] ?? 0, fraction)
+        scales[block] = scale
+        lock.unlock()
+    }
+
+    package func report() -> String {
+        lock.lock()
+        let e = worstError, z = worstZeros, s = scales
+        lock.unlock()
+        guard !e.isEmpty else { return "fc2 audit: nothing routed\n" }
+        var lines = ["fc2 audit over \(e.count) blocks (worst per block):"]
+        let ranked = e.sorted { $0.value > $1.value }.prefix(6)
+        for (block, error) in ranked {
+            lines.append(String(format: "  b%02d scale 1/%-5d rel_rms %.3e  spurious_zeros %.3e",
+                                block, Int((1 / (s[block] ?? 1)).rounded()),
+                                error, z[block] ?? 0))
+        }
+        let peakError = e.values.max() ?? 0
+        let peakZeros = z.values.max() ?? 0
+        lines.append(String(format: "  worst overall: rel_rms %.3e, spurious zeros %.3e",
+                            peakError, peakZeros))
+        return lines.joined(separator: "\n") + "\n"
+    }
+}
+
 package struct DiTBlock {
+    package static let saturationProbe = SaturationProbe()
+    package static let fc2Audit = FC2Audit()
+
     package let norm1: H3RMSNorm
     package let norm2: H3RMSNorm
     package let attn: AttentionLayer
@@ -409,29 +780,123 @@ package struct DiTBlock {
         self.adaln = adaln
     }
 
+    /// Residual, AdaLN tables, and Q/K/V ready for GPU attention.
+    ///
+    /// Split from ``callAsFunction`` so classifier-free guidance can run one
+    /// branch's attention on the GPU while the other branch occupies the
+    /// Neural Engine with its QKV projection. The three stages compose to the
+    /// original block; they exist to be scheduled, not to change the math.
+    package struct AttentionPrep {
+        package let x: MLXArray
+        package let m: [MLXArray]
+        package let q: MLXArray
+        package let k: MLXArray
+        package let v: MLXArray
+    }
+
+    package func prepareAttention(_ x: MLXArray, tEmb: MLXArray, index: ModulationIndex,
+                                 ropeTable: MLXArray?) -> AttentionPrep {
+        let m = adaln(tEmb)
+        precondition(m.count == 6, "DiTBlock AdaLN must expand to 6, got \(m.count)")
+        let h1 = modScaleShift(norm1(x), shift: m[0], scale: m[1], index: index)
+        let p = attn.projectQKV(h1, ropeTable: ropeTable)
+        return AttentionPrep(x: x, m: m, q: p.q, k: p.k, v: p.v)
+    }
+
+    /// A block whose `qkv` is on the engine and not yet collected.
+    package struct AttentionStart {
+        package let x: MLXArray
+        package let m: [MLXArray]
+        package let qkv: ANELinearBackend.Pending
+    }
+
+    /// AdaLN, the pre-norm, and `qkv` submitted — but not waited for.
+    ///
+    /// ``prepareAttention`` is this plus ``finishAttention`` back to back. They
+    /// are separate so a caller with two independent CFG branches can submit
+    /// both projections before collecting either, which is the only way the
+    /// engine has anything queued while the GPU attends.
+    package func beginAttention(_ x: MLXArray, tEmb: MLXArray,
+                                index: ModulationIndex,
+                                engine: Bool = true) -> AttentionStart {
+        let m = adaln(tEmb)
+        precondition(m.count == 6, "DiTBlock AdaLN must expand to 6, got \(m.count)")
+        let h1 = modScaleShift(norm1(x), shift: m[0], scale: m[1], index: index)
+        return AttentionStart(x: x, m: m, qkv: attn.beginQKV(h1, engine: engine))
+    }
+
+    package func finishAttention(_ start: AttentionStart,
+                                 ropeTable: MLXArray?) -> AttentionPrep {
+        let p = attn.finishQKV(start.qkv, ropeTable: ropeTable)
+        return AttentionPrep(x: start.x, m: start.m, q: p.q, k: p.k, v: p.v)
+    }
+
+    /// The output projection submitted, with the residual it will feed.
+    package struct PostStart {
+        package let prep: AttentionPrep
+        package let out: ANELinearBackend.Pending
+    }
+
+    package func beginPost(_ prep: AttentionPrep, merged: MLXArray,
+                           engine: Bool = true) -> PostStart {
+        PostStart(prep: prep, out: attn.beginOut(merged, engine: engine))
+    }
+
+    /// The first residual and gate, then the MLP submitted.
+    ///
+    /// Which submission it is depends on what accepted the work: the island
+    /// takes the whole MLP across both dies and the GPU, `fc1` alone goes to
+    /// the plain backend. Either way nothing has been waited for yet, which is
+    /// the property the schedule is built on.
+    package struct MLPStart {
+        package let x1: MLXArray
+        package let m: [MLXArray]
+        let work: Work
+        /// Carried from `beginMLP` so `finishBlock` can pick this block's
+        /// calibrated `fc2` scale. Without it `fc2` stays on the GPU.
+        let blockIndex: Int?
+
+        enum Work {
+            case linear(ANELinearBackend.Pending)
+        }
+    }
+
+    /// - Parameter blockIndex: which block this is, for `fc2`'s per-block
+    ///   operand scale. Nil keeps `fc2` on the GPU rather than guessing one,
+    ///   because guessing there is a silent saturation, not a rounding error.
+    package func beginMLP(_ post: PostStart, index: ModulationIndex,
+                          blockIndex: Int? = nil) -> MLPStart {
+        let m = post.prep.m
+        let x1 = modGate(post.prep.x, gate: m[2], other: post.out.value(), index: index)
+        let h2 = modScaleShift(norm2(x1), shift: m[3], scale: m[4], index: index)
+        return MLPStart(x1: x1, m: m, work: .linear(mlp.begin(h2)),
+                        blockIndex: blockIndex)
+    }
+
+    package func finishBlock(_ start: MLPStart, index: ModulationIndex) -> MLXArray {
+        let out: MLXArray
+        switch start.work {
+        case .linear(let pending): out = mlp.finish(pending, blockIndex: start.blockIndex)
+        }
+        return modGate(start.x1, gate: start.m[5], other: out, index: index)
+    }
+
+    package func attend(_ prep: AttentionPrep, context: AttentionContext?) -> MLXArray {
+        attn.attend(q: prep.q, k: prep.k, v: prep.v, context: context)
+    }
+
+    package func postAttention(_ prep: AttentionPrep, merged: MLXArray,
+                              index: ModulationIndex, blockIndex: Int? = nil) -> MLXArray {
+        let x1 = modGate(prep.x, gate: prep.m[2], other: attn.projectOut(merged), index: index)
+        let h2 = modScaleShift(norm2(x1), shift: prep.m[3], scale: prep.m[4], index: index)
+        return modGate(x1, gate: prep.m[5], other: mlp(h2, blockIndex: blockIndex), index: index)
+    }
+
     package func callAsFunction(_ x: MLXArray, tEmb: MLXArray, index: ModulationIndex,
                                ropeTable: MLXArray?,
                                context: AttentionContext? = nil) -> MLXArray {
-        let m = adaln(tEmb)
-        precondition(m.count == 6, "DiTBlock AdaLN must expand to 6, got \(m.count)")
-
-        // Hand-written fused kernels for these four sites measured 0.94% and
-        // have been removed. The GEMM accounting that came after them explains
-        // why they could not have been more: five kernels are essentially all
-        // of a forward, and everything else — these norms, the AdaLN
-        // projection, the gathers, RoPE, the residuals — shares a couple of
-        // percent between them.
-        func norm(_ v: MLXArray, _ n: H3RMSNorm, _ shift: MLXArray,
-                  _ scale: MLXArray) -> MLXArray {
-            modScaleShift(n(v), shift: shift, scale: scale, index: index)
-        }
-        func gated(_ v: MLXArray, _ gate: MLXArray, _ other: MLXArray) -> MLXArray {
-            modGate(v, gate: gate, other: other, index: index)
-        }
-
-        let h1 = norm(x, norm1, m[0], m[1])
-        let x1 = gated(x, m[2], attn(h1, ropeTable: ropeTable, context: context))
-        let h2 = norm(x1, norm2, m[3], m[4])
-        return gated(x1, m[5], mlp(h2))
+        let prep = prepareAttention(x, tEmb: tEmb, index: index, ropeTable: ropeTable)
+        return postAttention(prep, merged: attend(prep, context: context), index: index,
+                             blockIndex: context?.blockIndex)
     }
 }
