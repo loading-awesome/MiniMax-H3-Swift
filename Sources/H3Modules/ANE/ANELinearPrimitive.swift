@@ -197,14 +197,16 @@ public enum ANELinearBackend {
     /// slower than the unsplit path it replaced — turning the engine's own
     /// speed-up into a regression by leaving one constant behind.
     private static let racingShare = 0.286
-    /// Re-measured 2026-08-28, and it moved. The 0.40-0.50 plateau this was
-    /// picked from was calibrated before attention ran on the dies; with
-    /// attention taking both of them for about 276 ms a block the engine has
-    /// far less spare capacity, so its share of the columns has to shrink.
-    /// Swept end to end on the fixed arm: 0.30 gives 24.69 s a step, 0.375
-    /// gives 23.95, 0.45 gives 24.22 and 0.52 gives 25.44 — the old default is
-    /// now past the optimum and the old cliff edge is well past it.
-    private static let splitShare = 0.375
+    /// Re-swept 2026-08-28 with attention also on the dies, and it survives —
+    /// but only at the split it is paired with. At `H3_ANE_SPLIT_K=8` the sweep
+    /// preferred 0.375 (44.30 s a full step against 0.45's 44.66); at the split
+    /// this now ships, 4, that reverses and 0.45 wins on every sample (43.43
+    /// twice, against 0.375's 43.58, 43.52, 43.61). The two constants are not
+    /// independent: fewer pieces means less GPU-side fp32 partial summing per
+    /// column, so the engine can profitably take more of them. Sweeping them
+    /// separately and combining the winners is invalid, and an earlier version
+    /// of this file did exactly that and moved this to 0.375.
+    private static let splitShare = 0.45
 
     private static var defaultShare: Double {
         splitOverride == 1 ? racingShare : splitShare

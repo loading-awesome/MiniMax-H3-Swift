@@ -985,11 +985,26 @@ than when either constant was chosen.
 | 0.45 *(old default)* | 24.22 s | 44.66 s | 194.8 s |
 | 0.52 | 25.44 s | 47.07 s | 221.0 s |
 
-The old note recorded a plateau at 0.40 to 0.50 with a cliff just past 0.52.
-That plateau has moved down; 0.45 is now on the far side of the optimum. Note
-that engine busy time keeps climbing while wall time turns around — past the
-balance each extra column costs more in GPU-side fp32 partial summing than it
-saves on the engine, which is the same shape the original calibration found.
+Engine busy time keeps climbing across that range while wall time turns around:
+past the balance, each extra column costs more in GPU-side fp32 partial summing
+than it saves on the engine. That is the same shape the original calibration
+found, and 0.30 and 0.52 are firmly outside it.
+
+**But the apparent winner here does not survive being paired with the split, and
+this table is why the two must be swept together.** The sweep above ran at 8
+pieces. At 4 — the split that now ships — the order reverses:
+
+| share, at split 4 | full step |
+|---:|---|
+| **0.45** | **43.43, 43.43** |
+| 0.375 | 43.58, 43.52, 43.61 |
+
+Non-overlapping across five runs, so 0.45 stands and **the default was right all
+along**. Fewer pieces means less partial summing per column, so the engine can
+profitably take more of them: the optimum share rises as the split falls. An
+earlier version of this section swept the two independently, combined the
+winners, and moved the share to 0.375 on the strength of it. That is not a valid
+composition, and only the split change survives.
 
 **The contraction split**, at share 0.375:
 
