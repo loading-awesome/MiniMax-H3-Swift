@@ -417,6 +417,59 @@ int h3_ane_program_s(H3ANEProgram *p) { return p ? p->s : 0; }
 int h3_ane_program_k(H3ANEProgram *p) { return p ? p->k : 0; }
 int h3_ane_program_n(H3ANEProgram *p) { return p ? p->n : 0; }
 
+#pragma mark - Power-transition cancellations
+
+/// 27.0 refuses a request that arrives while the driver is mid power
+/// transition, rather than admitting it against a DART whose mappings are not
+/// installed — the defect that panicked 25F84. The refusal is transient and,
+/// crucially, the request never ran: nothing was submitted, no surface was
+/// touched. It is the one failure that is safe to simply retry.
+///
+/// This matters because the callers treat any failure as evidence that the
+/// runtime may still own their surfaces, and retire the session permanently.
+/// At process start the engine is cold, so the first submissions are exactly
+/// the ones that get cancelled — which retired the route before it had run a
+/// single evaluation.
+static _Atomic uint64_t CancellationRetries = 0;
+static _Atomic uint64_t CancellationGiveUps = 0;
+
+static bool ErrorIsCancellation(NSError *error) {
+    if (!error || error.code != 34) return false;
+    NSString *text = error.localizedDescription ?: @"";
+    return [text containsString:@"Request cancelled"];
+}
+
+static BOOL EvaluateAbsorbingCancellation(id model, NSDictionary *options,
+                                          id request, const char *what) {
+    static dispatch_once_t once;
+    static int budget = 8;
+    dispatch_once(&once, ^{
+        NSString *raw = NSProcessInfo.processInfo.environment[@"H3_ANE_CANCEL_RETRIES"];
+        if (raw.length > 0) budget = MAX(0, raw.intValue);
+    });
+    NSError *error = nil;
+    for (int attempt = 0; attempt <= budget; ++attempt) {
+        error = nil;
+        BOOL ok = ((BOOL(*)(id, SEL, unsigned int, id, id, NSError **))objc_msgSend)(
+            model, @selector(evaluateWithQoS:options:request:error:),
+            21, options, request, &error);
+        if (ok) {
+            if (attempt > 0) atomic_fetch_add(&CancellationRetries, (uint64_t)attempt);
+            return YES;
+        }
+        if (!ErrorIsCancellation(error)) break;
+        // The transition it collides with measures 8-15 ms. Sleep inside that
+        // window rather than spinning, and rather than giving up on one refusal.
+        usleep(3000);
+    }
+    if (ErrorIsCancellation(error)) atomic_fetch_add(&CancellationGiveUps, 1);
+    NSLog(@"[H3ANEBridge] %s evaluate failed: %@", what, error);
+    return NO;
+}
+
+uint64_t h3_ane_cancellation_retries(void) { return atomic_load(&CancellationRetries); }
+uint64_t h3_ane_cancellation_giveups(void) { return atomic_load(&CancellationGiveUps); }
+
 #pragma mark - Fused attention programs
 
 struct H3ANEAttentionProgram {
@@ -620,12 +673,7 @@ bool h3_ane_attention_run(H3ANEAttentionProgram *p,
             @"kANEFProcedureVariantHint": @1,
             @"kANEFAneInstanceHint": @(instance_hint)
         };
-        NSError *error = nil;
-        BOOL ok = ((BOOL(*)(id, SEL, unsigned int, id, id, NSError **))objc_msgSend)(
-            p->model, @selector(evaluateWithQoS:options:request:error:),
-            21, options, request, &error);
-        if (!ok) NSLog(@"[H3ANEBridge] attention evaluate failed: %@", error);
-        return ok;
+        return EvaluateAbsorbingCancellation(p->model, options, request, "attention");
     } @catch (NSException *exception) {
         NSLog(@"[H3ANEBridge] private runtime exception evaluating attention: %@", exception);
         atomic_store(&p->poisoned, true);
@@ -711,11 +759,7 @@ bool h3_ane_run(H3ANEProgram *p, H3ANETensor *x, H3ANETensor *w, H3ANETensor *y,
         @"kANEFAneInstanceHint":      @(instance_hint)
     };
 
-    NSError *error = nil;
-    BOOL ok = ((BOOL(*)(id, SEL, unsigned int, id, id, NSError **))objc_msgSend)(
-        p->model, @selector(evaluateWithQoS:options:request:error:), 21, opts, request, &error);
-    if (!ok) NSLog(@"[H3ANEBridge] evaluate failed: %@", error);
-    return ok;
+    return EvaluateAbsorbingCancellation(p->model, opts, request, "linear");
     } @catch (NSException *exception) {
         NSLog(@"[H3ANEBridge] private runtime exception while evaluating: %@", exception);
         return false;

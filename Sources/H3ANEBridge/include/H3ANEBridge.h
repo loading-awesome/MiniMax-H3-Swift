@@ -66,6 +66,11 @@ bool h3_ane_run_pair(H3ANEProgram* _Nonnull p0, H3ANETensor* _Nonnull x0,
                      H3ANEProgram* _Nonnull p1, H3ANETensor* _Nonnull x1,
                      H3ANETensor* _Nonnull w1, H3ANETensor* _Nonnull y1);
 
+/// Counts of power-transition cancellations absorbed by retry, and of those
+/// that exhausted the retry budget. `H3_ANE_CANCEL_RETRIES` sets the budget.
+uint64_t h3_ane_cancellation_retries(void);
+uint64_t h3_ane_cancellation_giveups(void);
+
 #pragma mark - Fused Attention Programs
 
 /// A fixed-shape, explicit-stable-softmax attention program. Q is expected to

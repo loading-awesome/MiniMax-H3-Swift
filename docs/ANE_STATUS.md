@@ -436,6 +436,40 @@ Two consequences:
   already falls back to the GPU on a failed submission, so correctness holds and
   the only cost is speed — and the receipts can count it.
 
+### The cancellation is transient, and retrying it removes it entirely (2026-08-27)
+
+**This corrects the two consequences drawn in the section above.** They were
+read off a failure rate without asking what happens on a second attempt.
+
+Measured back to back in one session, the documented worst case — one pair every
+2000 ms, the cadence that refused 114 of 120 before:
+
+| retry budget | pairs | submission failures |
+|---|---:|---:|
+| 0 (previous behaviour) | 120 | **108** |
+| 8, 3 ms apart | 120 | **0** |
+
+Not reduced — **eliminated**. A cancelled request is refused *before admission*:
+nothing was submitted and no surface was touched, which is exactly what "fails
+closed" means. The power transition it collides with lasts 8-15 ms, so a handful
+of 3 ms retries lands after it. Nothing here forces admission — every refusal is
+still honoured, and the retry is an ordinary resubmission — so this does not
+reopen the 25F84 panic path.
+
+Two claims above are therefore withdrawn. The engine does **not** "require
+sustained feeding", and a low-rate heartbeat is **not** ruled out: a 2 s cadence
+is completely usable once the transient is absorbed.
+
+**What this was actually costing.** The linear route died in every render, and
+not because renders submit sparsely. At process start the engine is cold, so the
+*first* submissions are the ones cancelled — and the slot pool treats any failure
+as evidence that the runtime may still own its surfaces, calling `quarantine`,
+which sets `poisoned` permanently. Six cancellations inside the first five
+seconds retired the route before it had completed a single evaluation, and the
+receipts recorded a render with no ANE linear work rather than a failure. The
+quarantine is right for a failure that may have left work in flight; it was
+being applied to the one failure that provably has not.
+
 ### The GPU baseline is unchanged on 27.0
 
 Re-measured because every number in this document was from 25F84 and the engine
@@ -655,17 +689,21 @@ decision inside the compiler, and no rule covering both columns is established.
 Both arms rendered fresh in one session, same prompt, seed, shape and binary
 lineage: 864x480x124, 20 steps, seed 0, cache threshold 0.1.
 
-| arm | per step | full step | sampling |
-|---|---:|---:|---:|
-| `sdpa`, GPU only | 28.34 s | 55.28 s | 566.8 s |
-| `ane`, 4 heads a die | 27.20 s | 51.97 s | 544.0 s |
-| `ane`, repeat | 27.21 s | 52.08 s | 544.3 s |
+| arm | per step | full step | sampling | vs GPU |
+|---|---:|---:|---:|---:|
+| `sdpa`, GPU only | 28.34 s | 55.28 s | 566.8 s | — |
+| `ane` attention, 4 heads a die | 27.20 s | 51.97 s | 544.0 s | 1.042x |
+| `ane` attention, repeat | 27.21 s | 52.08 s | 544.3 s | 1.042x |
+| **attention + linear** | **24.48 s** | **46.28 s** | **490.6 s** | **1.158x** |
 
-**1.042x end to end, 1.063x on the ten steps that run the stack**, reproducing
-to 0.04% across two renders.
+Attention alone is **1.042x end to end, 1.063x on the ten steps that run the
+stack**, reproducing to 0.04% across two renders. With the linear route also
+alive — which it had never been in a render before the cancellation fix — the
+pair is **1.158x end to end and 1.194x on full steps**, with zero submission
+failures and `aneRoutedProjections = [attn out, fc1, qkv]`, nothing declined.
 
-That is far below the 1.16-1.18x the route measures in isolation, and it should
-be. Attention is about 37% of DiT FLOPs and the head cliff caps the dies at 8 of
+Attention alone is far below the 1.16-1.18x that route measures in isolation,
+and it should be. Attention is about 37% of DiT FLOPs and the head cliff caps the dies at 8 of
 56 heads, so Amdahl gives `1/(0.63 + 0.37/1.156)` = 1.053x against a measured
 1.063x on full steps. The route behaves as its own micro-benchmarks predict:
 there is no hidden loss here, and no hidden upside either.
