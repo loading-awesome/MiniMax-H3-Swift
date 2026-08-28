@@ -40,7 +40,7 @@ enum ANEFC2Scales {
     /// Extra halvings beyond the probe's factor-of-two margin.
     static let halvings: Int =
         ProcessInfo.processInfo.environment["H3_ANE_FC2_HALVINGS"]
-            .flatMap(Int.init).map { max(0, min(8, $0)) } ?? 2
+            .flatMap(Int.init).map { max(0, min(8, $0)) } ?? 1
 
     static let base: [Float] = [
         1.0 / 4,          // block 00  bound       43,676

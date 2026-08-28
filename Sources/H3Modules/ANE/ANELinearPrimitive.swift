@@ -197,7 +197,14 @@ public enum ANELinearBackend {
     /// slower than the unsplit path it replaced — turning the engine's own
     /// speed-up into a regression by leaving one constant behind.
     private static let racingShare = 0.286
-    private static let splitShare = 0.45
+    /// Re-measured 2026-08-28, and it moved. The 0.40-0.50 plateau this was
+    /// picked from was calibrated before attention ran on the dies; with
+    /// attention taking both of them for about 276 ms a block the engine has
+    /// far less spare capacity, so its share of the columns has to shrink.
+    /// Swept end to end on the fixed arm: 0.30 gives 24.69 s a step, 0.375
+    /// gives 23.95, 0.45 gives 24.22 and 0.52 gives 25.44 — the old default is
+    /// now past the optimum and the old cliff edge is well past it.
+    private static let splitShare = 0.375
 
     private static var defaultShare: Double {
         splitOverride == 1 ? racingShare : splitShare
@@ -257,8 +264,15 @@ public enum ANELinearBackend {
 
     static func splitFactor(k: Int) -> Int {
         if let forced = splitOverride, forced >= 1, k % forced == 0 { return forced }
+        // Measured 2026-08-28 with attention also on the dies: 4 is best and 8
+        // is equal or slightly worse (43.98 s a full step against 44.30), while
+        // 16 collapses to 31.81 s a step and 32 to 54.89 — worse than not
+        // routing at all. That is not reduction cost: engine busy time rose
+        // from 176 s to 294 s and then 595 s for the same work, so the engine
+        // itself slows down. At 16 pieces `qkv` and `fc1` contract over k=336,
+        // which is too thin for the reuse this hardware needs.
         var best = 1
-        for c in [2, 4, 8] where k % c == 0 && k / c >= 896 { best = c }
+        for c in [2, 4] where k % c == 0 && k / c >= 896 { best = c }
         return best
     }
 

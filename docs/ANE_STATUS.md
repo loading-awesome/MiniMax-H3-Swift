@@ -969,6 +969,57 @@ of 11:
 **This is short of the 1.15x gate, and `fc2` is not coming** without oracles
 for every block. `Tools/ANE/saturation_bound.py` settles it.
 
+### Two shipping constants were calibrated on a machine that no longer exists (2026-08-28)
+
+Re-swept end to end on the fixed arm once attention was also routed. Both
+defaults moved, and the reason is the same in each case: attention now occupies
+both dies for about 276 ms a block, so the engine has far less spare capacity
+than when either constant was chosen.
+
+**The engine's share of the columns**, `postShare`:
+
+| share | per step | full step | ANE busy |
+|---:|---:|---:|---:|
+| 0.30 | 24.69 s | 45.83 s | 160.9 s |
+| **0.375** | **23.95 s** | **44.30 s** | 176.4 s |
+| 0.45 *(old default)* | 24.22 s | 44.66 s | 194.8 s |
+| 0.52 | 25.44 s | 47.07 s | 221.0 s |
+
+The old note recorded a plateau at 0.40 to 0.50 with a cliff just past 0.52.
+That plateau has moved down; 0.45 is now on the far side of the optimum. Note
+that engine busy time keeps climbing while wall time turns around — past the
+balance each extra column costs more in GPU-side fp32 partial summing than it
+saves on the engine, which is the same shape the original calibration found.
+
+**The contraction split**, at share 0.375:
+
+| split | per step | full step | ANE busy |
+|---:|---:|---:|---:|
+| **4** | **23.95 s** | **43.98 s** | 176.5 s |
+| 8 *(old default)* | 23.95 s | 44.30 s | 176.4 s |
+| 16 | 31.81 s | 59.32 s | 293.9 s |
+| 32 | 54.89 s | 103.86 s | 595.4 s |
+
+**16 and 32 are worse than not routing at all**, and not because of reduction
+cost: engine busy time triples and then quadruples for identical work, so the
+engine itself slows down. At 16 pieces `qkv` and `fc1` contract over `k=336`,
+too thin for the reuse this hardware needs. This is the third shape cliff
+recorded here — heads per attention graph, sequence length, and now contraction
+pieces — all with one signature: flat, then catastrophic, with no rule that
+predicts the edge.
+
+`qkv` keeps its own share but no longer wants a different value. It was 0.286 on
+the reasoning that nothing covers it, since it gates attention; with attention
+itself partly on the dies that no longer holds, and the full step rises
+monotonically as it drops — 43.55 s at 0.375, 44.38 at 0.286, 45.10 at 0.20.
+
+**On the precision of these numbers.** Two runs of one config gave 23.97 and
+23.27 s a step, so the per-step mean carries about 3% of run-to-run spread and
+the 0.375-against-0.45 margin sits inside it. The full step repeats far better
+(43.58 against 43.52) because it excludes the cached steps, so it is the metric
+to compare on. What the sweep establishes firmly is the direction and the
+cliffs, not the third significant figure.
+
 ## What the whole route can be worth, and why it is not 1.5x
 
 Measured on the fixed arm — 864x480x124, 20 steps, seed 0, cache 0.1, one
