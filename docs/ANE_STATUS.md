@@ -545,15 +545,35 @@ The fused dynamic-weight graph therefore executes and produces conformant
 arithmetic away from underflow *at the tiny shape*. The old architectural and
 layout conclusions are both retired.
 
-**It does not yet conform at production width, and underflow is not the
-reason.** Widening the contraction to `hiddenSize` 5,376 with a bounded 512-
-neuron island leaves rel-RMS at **0.0395** — an order of magnitude outside the
-0.003 equivalence class. Rescaling inside the graph, which is arithmetically
-neutral and which moved the tiny fixture from 0.248 to 0.102, moves this from
-0.03953 to 0.03934: nothing. Whatever is wrong at width is a different fault
-from the flush-to-zero seen at the tiny shape, and it is unidentified. The fused
-island is therefore **executable but not usable**, and the chained island stays
-the production path until this is explained.
+**At production width it is the same underflow, and the fixture was the
+problem.** Widening the contraction to `hiddenSize` 5,376 with a bounded 512-
+neuron island reads rel-RMS **0.0395** at the default fixture — ten times
+outside the 0.003 class. `H3_MLP_INTERNAL_SCALE`, which is arithmetically
+neutral, moves that only from 0.03953 to 0.03934, and an earlier version of this
+section concluded from that a second, unidentified fault. That was wrong: the
+internal scale was swept, the *operand magnitudes* were not. Sweeping
+`H3_MLP_FIXTURE_SCALE` at width:
+
+| fixture scale | reference max abs | rel-RMS | cosine |
+|---:|---:|---:|---:|
+| 0.25 | 1.7e-4 | 1.0 (zero output) | 0 |
+| 0.5 | 1.1e-3 | 0.205 | 0.979 |
+| 1 | 6.8e-3 | 0.0395 | 0.9992 |
+| 2 | 4.0e-2 | 0.00648 | 0.99998 |
+| **4** | 0.21 | **9.06e-4** | 1.0 |
+| **8** | 3.9 | **4.35e-4** | 1.0 |
+
+Monotonically decreasing in operand magnitude, which is the flush-to-zero
+signature; saturation would run the other way. It is the same fault as the tiny
+shape, shifted, and there is no second defect.
+
+What this exposes is the fixture. At scale 1 the largest reference output is
+**0.0068** — not a magnitude any real DiT activation takes. At scale 4 to 8 the
+fused island is inside the equivalence class. The blocking question is therefore
+**not** "why is it wrong at width" but "what magnitude do real MLP inputs
+have", and a captured production tensor answers it. Until that capture exists
+the chained island stays the production path, but the fused island is a live
+candidate rather than a closed one.
 
 ### Fused attention works with an explicit softmax (2026-08-27)
 
@@ -629,6 +649,80 @@ fast, 5 = 2.309 GiB slow) and then fails: 1.803 GiB at S=11,000 is *slow* while
 1.847 GiB at S=15,744 is *fast*. Nor is it monotone in heads — at S=11,000 one
 and two heads are slow and four and five are fast. It is a per-shape tiling
 decision inside the compiler, and no rule covering both columns is established.
+
+### The render gate for routed attention: 1.042x end to end (2026-08-27)
+
+Both arms rendered fresh in one session, same prompt, seed, shape and binary
+lineage: 864x480x124, 20 steps, seed 0, cache threshold 0.1.
+
+| arm | per step | full step | sampling |
+|---|---:|---:|---:|
+| `sdpa`, GPU only | 28.34 s | 55.28 s | 566.8 s |
+| `ane`, 4 heads a die | 27.20 s | 51.97 s | 544.0 s |
+| `ane`, repeat | 27.21 s | 52.08 s | 544.3 s |
+
+**1.042x end to end, 1.063x on the ten steps that run the stack**, reproducing
+to 0.04% across two renders.
+
+That is far below the 1.16-1.18x the route measures in isolation, and it should
+be. Attention is about 37% of DiT FLOPs and the head cliff caps the dies at 8 of
+56 heads, so Amdahl gives `1/(0.63 + 0.37/1.156)` = 1.053x against a measured
+1.063x on full steps. The route behaves as its own micro-benchmarks predict:
+there is no hidden loss here, and no hidden upside either.
+
+Routing was verified live rather than inferred. `H3_ANE_ATTENTION_TRACE=1`
+reports every hundredth routed call and the first decline of each kind; the
+render logged calls 1 through 400 with **zero declines and zero evaluate
+failures**. An earlier arm was discarded before it was believed: it had been run
+with `H3_ANE=experimental`, which also enables the linear primitive, and that
+route failed six times with `Request cancelled` and poisoned its session. The
+attention gate is now `H3_ANE_ATTENTION` alone, because these two routes share
+no code and coupling them silently confounded the measurement.
+
+**The linear route failing closed under render load is the larger finding here.**
+It is the path carrying the banked 1.179x, and it needs its own investigation.
+
+### The sequence is a lottery, and 64-alignment is not the ticket (2026-08-27)
+
+The head count is not the only shape term that decides throughput. At a fixed
+H=1, sweeping the sequence:
+
+| S | TFLOP/s | S | TFLOP/s |
+|---:|---:|---:|---:|
+| 11,000 | 0.49 | 14,000 | 1.52 |
+| 11,008 | 0.49 | 15,000 | 1.43 |
+| 11,072 | 0.49 | 15,360 | 1.72 |
+| 12,000 | 1.60 | **15,731** | **0.41** |
+| 12,288 | 1.62 | **15,744** | **1.71** |
+| 13,000 | 0.94 | | |
+
+**Thirteen elements of sequence separate a 4.1x difference.** Nothing tidy
+predicts it:
+
+- **Not 64-alignment.** This was the standing explanation for 15,731 against
+  15,744 and it is refuted directly: S=11,008 and S=11,072 are exact multiples
+  of 64 and run at 0.49, indistinguishable from unaligned S=11,000's 0.49
+  (125.79 ms against 125.64 ms). Padding an unaligned sequence to a multiple of
+  64 buys nothing by itself.
+- **Not capacity.** Larger sequences are *faster*: 15,744 beats 11,072 by 3.5x
+  on a plane twice the size.
+- **Not the power of two dividing S.** 11,072 = 64x173 is slow; 12,000 = 32x375
+  is fast.
+
+What this means for production is a **risk, not a tuning knob**. Any change that
+moves the sequence — resolution, duration, a different padding rule — can land
+on a slow shape with no warning and no way to predict it from the shape alone.
+15,731 is exactly such a shape, and it is a plausible unpadded production
+sequence.
+
+The defensible response is not to explain the compiler but to **measure at
+session creation**. The backend already pays a one-time per-shape compile; a
+calibration evaluation against the GPU's expected cost for the same heads would
+let it either accept the shape, pad to a *measured-fast* neighbour and mask, or
+decline to SDPA. That rehabilitates padding as a remedy chosen by measurement,
+rather than as a rule derived from divisibility — which the table above shows
+does not hold. It is not built yet; today the route is validated only at the
+shapes recorded here.
 
 What production needs is settled: **four heads a die at the production
 sequence**, measured in two harnesses. That caps the dies at 8 of 56 heads —

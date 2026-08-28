@@ -32,10 +32,13 @@ package struct ANEAttentionBackend: H3AttentionBackend {
     }()
     private static var engineHeads: Int { 2 * headsPerDie }
 
+    /// Gated on `H3_ANE_ATTENTION` alone, deliberately. This route shares no
+    /// code with the linear primitive behind `H3_ANE`, and requiring both
+    /// meant enabling attention also enabled linear routing — which on 27.0
+    /// fails closed with `Request cancelled` under render load and poisoned
+    /// the measurement it was supposed to isolate.
     package static func isAvailable(on machine: Machine) -> Bool {
-        let env = ProcessInfo.processInfo.environment
-        return env["H3_ANE"]?.lowercased() == "experimental"
-            && env["H3_ANE_ATTENTION"] == "1"
+        ProcessInfo.processInfo.environment["H3_ANE_ATTENTION"] == "1"
             && h3_ane_is_available()
     }
 
@@ -145,7 +148,7 @@ package struct ANEAttentionBackend: H3AttentionBackend {
     private static func countRouted() {
         guard tracing else { return }
         lock.lock(); routedCalls += 1; let n = routedCalls; lock.unlock()
-        if n == 1 || n % 500 == 0 {
+        if n == 1 || n % 100 == 0 {
             FileHandle.standardError.write(Data("[ane-attn] routed \(n) calls\n".utf8))
         }
     }
