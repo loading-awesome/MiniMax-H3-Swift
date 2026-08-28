@@ -98,6 +98,8 @@ package enum PipelineRuntime {
             // Busy-seconds against wall time says whether the unrealized linear
             // gain is a bad GPU/ANE split or dies sitting idle between
             // submissions. Those want opposite fixes, so measure before tuning.
+            let phases = ANELinearBackend.PhaseMeter.report()
+            if !phases.isEmpty { FileHandle.standardError.write(Data(phases.utf8)) }
             if ProcessInfo.processInfo.environment["H3_ANE_UTILISATION"] == "1" {
                 let busy = ANELinearBackend.EngineMeter.busySeconds
                 FileHandle.standardError.write(Data(

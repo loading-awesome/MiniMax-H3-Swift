@@ -298,6 +298,78 @@ public enum ANELinearBackend {
     /// running at once the total counts concurrent work twice. That is the
     /// honest reading — it is die-seconds, not wall-seconds — and the callers
     /// that divide by wall time say which they mean.
+    /// Where a routed projection's wall time goes, per projection.
+    ///
+    /// The engine runs on its own thread and the GPU shard is queued async, so
+    /// the critical path is `upload + max(engine, gpuShard) + join`. `upload`
+    /// and `join` are serial regions in which the dies have nothing to do.
+    ///
+    /// Every timing in `docs/ANE.md` is one prompt at one shape, and the shape
+    /// cliffs mean none of it can be assumed to transfer. This is what to run
+    /// on a new shape before trusting any of it: `H3_ANE_PHASES=1`.
+    ///
+    /// The upload is split because only part of it is addressable. The GPU
+    /// materialise — transpose, scale and convert — cannot be hidden by
+    /// submitting contraction pieces as they land, and it is deliberately
+    /// first, because it drains the GPU queue before the engine is fed. Only
+    /// the memcpy could be pipelined, and measuring it is what closed that
+    /// idea: 9.6 s against the materialise's 36.5 across a render, so hiding
+    /// three quarters of it would be worth under 2%.
+    ///
+    /// Measured 2026-08-28, 864x480x124, 20 steps, per call:
+    ///
+    ///     qkv       upload 26.5 ms gpu +  3.7 memcpy   wait  96.7   join 15.2
+    ///     attn out  upload 21.6     +  3.8            wait  41.5   join  3.8
+    ///     fc1       upload 12.0     +  3.0            wait 126.3   join 21.3
+    ///     fc2       upload 11.6     +  8.6            wait  91.0   join  3.3
+    ///
+    /// `wait` totalled 180.0 s against the engine's own busy time of 187.8, so
+    /// the engine is the critical path during the concurrent phase, not the GPU
+    /// shard. That is the mechanical reason the share sits at 0.45: past it,
+    /// every extra column lands on the device that already finishes last.
+    package enum PhaseMeter {
+        struct Phase { var upload = 0.0, materialise = 0.0, wait = 0.0, join = 0.0, calls = 0.0 }
+        private static let lock = NSLock()
+        nonisolated(unsafe) private static var byLabel: [String: Phase] = [:]
+        static let enabled: Bool =
+            ProcessInfo.processInfo.environment["H3_ANE_PHASES"] == "1"
+
+        static func add(_ key: WritableKeyPath<Phase, Double>, _ seconds: Double,
+                        label: String) {
+            guard enabled else { return }
+            lock.lock(); defer { lock.unlock() }
+            var p = byLabel[label] ?? Phase()
+            p[keyPath: key] += seconds
+            if key == \Phase.upload { p.calls += 1 }
+            byLabel[label] = p
+        }
+
+        package static func report() -> String {
+            guard enabled else { return "" }
+            lock.lock(); let snapshot = byLabel; lock.unlock()
+            guard !snapshot.isEmpty else { return "ane phases: nothing routed\n" }
+            var lines = ["ane phase breakdown (total s, and ms per call):"]
+            var totals = Phase()
+            for (label, p) in snapshot.sorted(by: { $0.key < $1.key }) {
+                let n = max(p.calls, 1)
+                lines.append(String(
+                    format: "  %-9@ calls %5.0f  upload %6.1f s (gpu %5.1f + memcpy %5.1f ms)  wait %6.1f s (%5.1f ms)  join %6.1f s (%5.1f ms)",
+                    label as NSString, p.calls,
+                    p.upload, p.materialise / n * 1e3, (p.upload - p.materialise) / n * 1e3,
+                    p.wait, p.wait / n * 1e3,
+                    p.join, p.join / n * 1e3))
+                totals.upload += p.upload; totals.materialise += p.materialise
+                totals.wait += p.wait
+                totals.join += p.join; totals.calls += p.calls
+            }
+            lines.append(String(
+                format: "  TOTAL     upload %.1f s (gpu %.1f + memcpy %.1f), wait %.1f s, join %.1f s  (hideable memcpy = %.1f s)",
+                totals.upload, totals.materialise, totals.upload - totals.materialise,
+                totals.wait, totals.join, totals.upload - totals.materialise))
+            return lines.joined(separator: "\n") + "\n"
+        }
+    }
+
     package enum EngineMeter {
         private static let lock = NSLock()
         nonisolated(unsafe) private static var seconds: Double = 0
@@ -660,7 +732,8 @@ public enum ANELinearBackend {
     ///   arithmetic: the same seed and checkpoint give a different sample.
     public static func project(x: MLXArray, weight: MLXArray, label: String) -> MLXArray {
         guard isEnabled else { return MLX.matmul(x, weight.transposed()) }
-        guard let routed = route(x: x, qkvWeight: weight, share: share(for: label)) else {
+        guard let routed = route(x: x, qkvWeight: weight, share: share(for: label),
+                                 label: label) else {
             // A decline is silent to the caller by design — same numbers, no
             // speedup — but it must not be silent to the receipt, or a render
             // that fell back looks like one that did not.
@@ -723,7 +796,8 @@ public enum ANELinearBackend {
             /// avoid.
             case routed(gpu: MLXArray, job: Engine.Job,
                         session: Session, slot: Slot, rows: Int, perDie: Int,
-                        x: MLXArray, weight: MLXArray, scale: Float)
+                        x: MLXArray, weight: MLXArray, scale: Float,
+                        label: String)
         }
         fileprivate let body: Body
         private var collected: MLXArray?
@@ -741,8 +815,11 @@ public enum ANELinearBackend {
             case .plain(let v):
                 result = v
             case .routed(let gpu, let job, let session, let slot, let rows, let perDie,
-                         let x, let weight, let scale):
-                guard job.wait() else {
+                         let x, let weight, let scale, let phaseLabel):
+                let waitBegan = Date()
+                let ok = job.wait()
+                PhaseMeter.add(\.wait, Date().timeIntervalSince(waitBegan), label: phaseLabel)
+                guard ok else {
                     // The engine failed after the GPU shard was queued. `gpu`
                     // holds only the columns the GPU was given, so the whole
                     // projection is recomputed rather than returned in part.
@@ -754,8 +831,10 @@ public enum ANELinearBackend {
                     collected = result
                     return result
                 }
+                let joinBegan = Date()
                 result = ANELinearBackend.join(gpu: gpu, slot: slot, session: session,
                                                rows: rows, perDie: perDie, scale: scale)
+                PhaseMeter.add(\.join, Date().timeIntervalSince(joinBegan), label: phaseLabel)
                 session.give(slot)
             }
             collected = result
@@ -780,8 +859,11 @@ public enum ANELinearBackend {
                 let parts = v.split(parts: 2, axis: -1)
                 result = silu(parts[0]) * parts[1]
             case .routed(let gpu, let job, let session, let slot, let rows, let perDie,
-                         let x, let weight, let scale):
-                guard job.wait() else {
+                         let x, let weight, let scale, let phaseLabel):
+                let waitBegan = Date()
+                let ok = job.wait()
+                PhaseMeter.add(\.wait, Date().timeIntervalSince(waitBegan), label: phaseLabel)
+                guard ok else {
                     session.quarantine(slot)
                     ANELinearBackend.note("engine failed mid-flight", routed: false)
                     let full = MLX.matmul(x, weight.transposed())
@@ -791,10 +873,12 @@ public enum ANELinearBackend {
                     return result
                 }
                 do {
+                    let joinBegan = Date()
                     let full = ANELinearBackend.join(gpu: gpu, slot: slot, session: session,
                                                      rows: rows, perDie: perDie, scale: scale)
                     let parts = full.split(parts: 2, axis: -1)
                     result = silu(parts[0]) * parts[1]
+                    PhaseMeter.add(\.join, Date().timeIntervalSince(joinBegan), label: phaseLabel)
                 }
                 session.give(slot)
             }
@@ -804,7 +888,7 @@ public enum ANELinearBackend {
 
         deinit {
             guard collected == nil, swigluCollected == nil,
-                  case .routed(_, let job, let session, let slot, _, _, _, _, _) = body
+                  case .routed(_, let job, let session, let slot, _, _, _, _, _, _) = body
             else { return }
             if job.wait() { session.give(slot) }
             else { session.quarantine(slot) }
@@ -848,7 +932,7 @@ public enum ANELinearBackend {
             return Pending(.plain(MLX.matmul(x, weight.transposed())))
         }
         guard let body = start(x: x, weight: weight, share: share(for: label),
-                               scale: scale) else {
+                               scale: scale, label: label) else {
             note(label, routed: false)
             return Pending(.plain(MLX.matmul(x, weight.transposed())))
         }
@@ -863,8 +947,10 @@ public enum ANELinearBackend {
     ///
     /// Returns nil when the engine cannot take this shape or a step fails, so
     /// every caller decides its own fallback.
-    static func route(x: MLXArray, qkvWeight: MLXArray, share: Double? = nil) -> MLXArray? {
-        guard let body = start(x: x, weight: qkvWeight, share: share) else { return nil }
+    static func route(x: MLXArray, qkvWeight: MLXArray, share: Double? = nil,
+                      label: String) -> MLXArray? {
+        guard let body = start(x: x, weight: qkvWeight, share: share,
+                               label: label) else { return nil }
         return Pending(body).value()
     }
 
@@ -876,7 +962,8 @@ public enum ANELinearBackend {
     ///   pins.
     fileprivate static func start(x: MLXArray, weight: MLXArray,
                                   share: Double? = nil,
-                                  scale: Float = operandScale) -> Pending.Body? {
+                                  scale: Float = operandScale,
+                                  label: String) -> Pending.Body? {
         guard h3_ane_is_available(), x.ndim == 2, weight.ndim == 2 else { return nil }
 
         let s = x.shape[0], k = x.shape[1], n = weight.shape[0]
@@ -917,12 +1004,20 @@ public enum ANELinearBackend {
         // On a separate stream this waits only for `x` itself, through the
         // cross-stream dependency MLX inserts, and the attention keeps running.
         let uploaded: Bool
+        let uploadBegan = Date()
+        let phaseLabel = label
         do {
             let scaled = Stream.withNewDefaultStream(device: .gpu) { () -> MLXArray in
                 let v = MLX.contiguous((x * scale).transposed().asType(.float16))
                 v.eval()
                 return v
             }
+            // The GPU materialise and the CPU memcpy are separately addressable:
+            // only the second can be hidden by submitting each contraction piece
+            // as it lands, so knowing the split decides whether that is worth
+            // building.
+            PhaseMeter.add(\.materialise, Date().timeIntervalSince(uploadBegan),
+                           label: phaseLabel)
             uploaded = scaled.asData(access: .noCopyIfContiguous).data.withUnsafeBytes { raw -> Bool in
                 guard let base = raw.baseAddress else { return false }
                 // `scaled` is `[k, s]` row-major, so piece `c` is rows
@@ -938,6 +1033,7 @@ public enum ANELinearBackend {
                 return true
             }
         }
+        PhaseMeter.add(\.upload, Date().timeIntervalSince(uploadBegan), label: phaseLabel)
         guard uploaded else { session.give(slot); return nil }
 
         // The engine goes to its own thread and this one returns immediately.
@@ -972,7 +1068,8 @@ public enum ANELinearBackend {
 
         if splits > 1 { markSplitContraction(splits) }
         return .routed(gpu: gpuOut, job: job, session: session, slot: slot,
-                       rows: s, perDie: plan.perDie, x: x, weight: weight, scale: scale)
+                       rows: s, perDie: plan.perDie, x: x, weight: weight, scale: scale,
+                       label: phaseLabel)
     }
 
     /// The fp32 accumulate, the unscale and the cast back — as **one** kernel.

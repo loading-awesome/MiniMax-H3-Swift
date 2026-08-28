@@ -70,6 +70,26 @@ device's rate and catches cliffs that have not been found yet.
 **Every number here is one prompt at one shape.** Given the sequence cliff,
 none of it should be assumed to transfer to another resolution or duration.
 
+## Measuring a new shape
+
+`H3_ANE_PHASES=1` reports where each routed projection's wall time went —
+upload split into its GPU materialise and its CPU memcpy, the wait on the
+engine, and the join. `H3_ANE_UTILISATION=1` adds the engine's own busy time.
+Run both on any new shape before trusting the figures here.
+
+Measured on the arm above, per call:
+
+    qkv       upload 26.5 ms gpu +  3.7 memcpy   wait  96.7 ms   join 15.2 ms
+    attn out  upload 21.6        +  3.8          wait  41.5      join  3.8
+    fc1       upload 12.0        +  3.0          wait 126.3      join 21.3
+    fc2       upload 11.6        +  8.6          wait  91.0      join  3.3
+
+`wait` totals 180.0 s against the engine's own 187.8 s of busy time, so the
+engine — not the GPU shard — is the critical path while the two run
+concurrently. That is the mechanical reason the share sits at 0.45 rather than
+higher: past it, every extra column is given to the device that already
+finishes last.
+
 ## The ceiling
 
 A block is 1105.6 ms on the GPU alone: attention 401.8, linear 703.8. The GPU
@@ -89,13 +109,21 @@ relocatable work — and at `cfgScale 1` there is no second CFG branch to
 pipeline.
 
 The route is at 1.223x, which is 94% of that ceiling. The remainder is seam
-cost: the dies are idle about a third of the window they could work in, waiting
-on the activation upload and the partial-sum join. Both attacks on it were
-measured and lost — the whole-MLP island (fixed die budget, 10% worse) and
-split-k 1 with a native Metal pack and merge (worse still, and it exhausted
-memory in decode). Within a block the projections are a dependency chain and
-each block feeds the next, so there is no independent work to hide the seam
-behind.
+cost: the activation upload and the partial-sum join are serial regions in which
+the dies have nothing to do.
+
+Four attacks on that seam have been measured and all four lost. The whole-MLP
+island fixes the die budget where routing each projection separately lets the
+share float, and is 10% worse. Split-k 1 with a native Metal pack and merge is
+worse still, and exhausted memory in decode. Submitting each contraction piece
+as it lands would hide only the memcpy, which is 9.6 s against the GPU
+materialise's 36.5 — worth under 2%. And feeding the activation untransposed,
+which would delete the materialise outright, was measured at 2.42 TFLOP/s a die
+against this form's 3.79.
+
+What remains is structural. Within a block the projections are a dependency
+chain and each block feeds the next, so there is no independent work to hide the
+seam behind, and the engine is already the critical path while it runs.
 
 ## Private ABI
 
