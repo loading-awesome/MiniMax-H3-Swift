@@ -40,6 +40,8 @@
 #include <algorithm>
 #include <vector>
 
+static bool DumpAttributes = false;
+
 static int EnvInt(const char *name, int fallback, int minimum, int maximum) {
     const char *raw = getenv(name);
     if (!raw || !*raw) return fallback;
@@ -341,12 +343,24 @@ int main(void) {
 
         printf("ANE fused-attention spike H=%d S=%d D=%d mode=%s fixture=%s\n",
                heads, sequence, dimension, mode.UTF8String, fixture.UTF8String);
+        // The MLP island proved this compiler renames function arguments to
+        // alphabetical input symbols. For q/k/v that is k=0, q=1, v=2 — the
+        // opposite of the textual order everything here binds. Dump the load
+        // reply and settle it rather than relying on two errors cancelling.
+        if (getenv("H3_ATTN_DUMP_ATTRIBUTES")) DumpAttributes = true;
         printf("explicit_io=%.3f MiB hypothetical_exposed_scores=%.3f GiB\n",
                4.0 * elements * 2.0 / 1048576.0, exposedScoreGiB);
 
         uint64_t compileStart = mach_absolute_time();
         BuiltModel model0 = Build(mil, @{});
         double compile0 = Milliseconds(mach_absolute_time() - compileStart);
+        if (DumpAttributes && model0.loaded &&
+            [model0.model respondsToSelector:@selector(modelAttributes)]) {
+            id attributes = ((id(*)(id, SEL))objc_msgSend)(
+                model0.model, @selector(modelAttributes));
+            printf("model_attributes=%s\n",
+                   attributes ? [[attributes description] UTF8String] : "(nil)");
+        }
         if (!model0.loaded) {
             printf("compile_load=REFUSED ms=%.1f error=%s\n",
                    compile0, (model0.error ?: @"unknown").UTF8String);

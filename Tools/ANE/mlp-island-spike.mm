@@ -28,9 +28,26 @@
 #include <algorithm>
 #include <vector>
 
-enum { Hidden = DIFF_K, Intermediate = 256, Sequence = DIFF_S, Samples = 7 };
+#ifndef H3_MLP_HIDDEN
+#define H3_MLP_HIDDEN DIFF_K
+#endif
+#ifndef H3_MLP_INTERMEDIATE
+#define H3_MLP_INTERMEDIATE 256
+#endif
+#ifndef H3_MLP_SEQUENCE
+#define H3_MLP_SEQUENCE DIFF_S
+#endif
+enum {
+    Hidden = H3_MLP_HIDDEN,
+    Intermediate = H3_MLP_INTERMEDIATE,
+    Sequence = H3_MLP_SEQUENCE,
+    Samples = 7
+};
 
 static NSString *MLPIslandMIL(void) {
+    const char *scaleRaw = getenv("H3_MLP_INTERNAL_SCALE");
+    int internalScale = scaleRaw && *scaleRaw ? (int)strtol(scaleRaw, NULL, 10) : 1;
+    if (internalScale < 1) internalScale = 1;
     NSMutableString *m = [NSMutableString stringWithString:MILHeader()];
     [m appendFormat:
         @"    func main<ios18>(tensor<fp16,[1,%d,1,%d]> x, "
@@ -58,38 +75,83 @@ static NSString *MLPIslandMIL(void) {
          "[name=string(\"wg\")];\n"
          "        tensor<fp16,[1,1,%d,%d]> wu=reshape(shape=rw1,x=up_weight)"
          "[name=string(\"wu\")];\n"
-         "        bool bf=const()[name=string(\"bf\"),val=bool(false)];\n"
-         "        tensor<fp16,[1,1,%d,%d]> gate=matmul(transpose_x=bf,"
-         "transpose_y=bf,x=xt,y=wg)[name=string(\"gate\")];\n"
-         "        tensor<fp16,[1,1,%d,%d]> up=matmul(transpose_x=bf,"
-         "transpose_y=bf,x=xt,y=wu)[name=string(\"up\")];\n",
-        Hidden, Intermediate, Hidden, Intermediate, Hidden, Intermediate,
-        Sequence, Intermediate, Sequence, Intermediate];
+         "        bool bf=const()[name=string(\"bf\"),val=bool(false)];\n",
+        Hidden, Intermediate, Hidden, Intermediate, Hidden, Intermediate];
+    NSString *fc1Input = @"xt";
+    NSString *gateInput = @"gate_raw";
+    NSString *upInput = @"up_raw";
+    if (internalScale > 1) {
+        [m appendFormat:
+            @"        fp16 scale=const()[name=string(\"scale\"),val=fp16(%d.0)];\n"
+             "        fp16 inv_scale=const()[name=string(\"inv_scale\"),val=fp16(%.9g)];\n"
+             "        tensor<fp16,[1,1,%d,%d]> xt_scaled=mul(x=xt,y=scale)"
+             "[name=string(\"xt_scaled\")];\n",
+            internalScale, 1.0 / internalScale, Sequence, Hidden];
+        fc1Input = @"xt_scaled";
+    }
+    [m appendFormat:
+        @"        tensor<fp16,[1,1,%d,%d]> gate_raw=matmul(transpose_x=bf,"
+         "transpose_y=bf,x=%@,y=wg)[name=string(\"gate_raw\")];\n"
+         "        tensor<fp16,[1,1,%d,%d]> up_raw=matmul(transpose_x=bf,"
+         "transpose_y=bf,x=%@,y=wu)[name=string(\"up_raw\")];\n",
+        Sequence, Intermediate, fc1Input, Sequence, Intermediate, fc1Input];
+    if (internalScale > 1) {
+        [m appendFormat:
+            @"        tensor<fp16,[1,1,%d,%d]> gate=mul(x=gate_raw,y=inv_scale)"
+             "[name=string(\"gate\")];\n"
+             "        tensor<fp16,[1,1,%d,%d]> up=mul(x=up_raw,y=inv_scale)"
+             "[name=string(\"up\")];\n",
+            Sequence, Intermediate, Sequence, Intermediate];
+        gateInput = @"gate";
+        upInput = @"up";
+    }
 
     [m appendFormat:
-        @"        tensor<fp16,[1,1,%d,%d]> gate_probability=sigmoid(x=gate)"
+        @"        tensor<fp16,[1,1,%d,%d]> gate_probability=sigmoid(x=%@)"
          "[name=string(\"gate_probability\")];\n"
-         "        tensor<fp16,[1,1,%d,%d]> gated=mul(x=gate,y=gate_probability)"
+         "        tensor<fp16,[1,1,%d,%d]> gated=mul(x=%@,y=gate_probability)"
          "[name=string(\"gated\")];\n"
-         "        tensor<fp16,[1,1,%d,%d]> activation=mul(x=gated,y=up)"
+         "        tensor<fp16,[1,1,%d,%d]> activation=mul(x=gated,y=%@)"
          "[name=string(\"activation\")];\n"
          "        tensor<int32,[4]> rw2=const()[name=string(\"rw2\"),"
          "val=tensor<int32,[4]>([1,1,%d,%d])];\n"
          "        tensor<fp16,[1,1,%d,%d]> wd=reshape(shape=rw2,x=down_weight)"
-         "[name=string(\"wd\")];\n"
-         "        tensor<fp16,[1,1,%d,%d]> partial=matmul(transpose_x=bf,"
-         "transpose_y=bf,x=activation,y=wd)[name=string(\"partial\")];\n"
-         "        tensor<fp16,[1,1,%d,%d]> partial_t=transpose(perm=perm,"
-         "x=partial)[name=string(\"partial_t\")];\n"
+         "[name=string(\"wd\")];\n",
+        Sequence, Intermediate, gateInput,
+        Sequence, Intermediate, gateInput,
+        Sequence, Intermediate, upInput,
+        Intermediate, Hidden, Intermediate, Hidden];
+
+    NSString *fc2Input = @"activation";
+    if (internalScale > 1) {
+        [m appendFormat:
+            @"        tensor<fp16,[1,1,%d,%d]> activation_scaled="
+             "mul(x=activation,y=scale)[name=string(\"activation_scaled\")];\n",
+            Sequence, Intermediate];
+        fc2Input = @"activation_scaled";
+    }
+    [m appendFormat:
+        @"        tensor<fp16,[1,1,%d,%d]> partial_raw=matmul(transpose_x=bf,"
+         "transpose_y=bf,x=%@,y=wd)[name=string(\"partial_raw\")];\n",
+        Sequence, Hidden, fc2Input];
+    NSString *partialInput = @"partial_raw";
+    if (internalScale > 1) {
+        [m appendFormat:
+            @"        tensor<fp16,[1,1,%d,%d]> partial="
+             "mul(x=partial_raw,y=inv_scale)[name=string(\"partial\")];\n",
+            Sequence, Hidden];
+        partialInput = @"partial";
+    }
+    [m appendFormat:
+        @"        tensor<fp16,[1,1,%d,%d]> partial_t=transpose(perm=perm,"
+         "x=%@)[name=string(\"partial_t\")];\n"
          "        tensor<int32,[4]> ro=const()[name=string(\"ro\"),"
          "val=tensor<int32,[4]>([1,%d,1,%d])];\n"
          "        tensor<fp16,[1,%d,1,%d]> y=reshape(shape=ro,x=partial_t)"
          "[name=string(\"y\")];\n"
          "    } -> (y);\n}\n",
-        Sequence, Intermediate, Sequence, Intermediate, Sequence, Intermediate,
-        Intermediate, Hidden, Intermediate, Hidden,
-        Sequence, Hidden, Hidden, Sequence,
-        Hidden, Sequence, Hidden, Sequence];
+        Sequence, Hidden, partialInput, Hidden, Sequence,
+        Hidden, Sequence];
     return m;
 }
 
@@ -103,17 +165,21 @@ static float UnitValue(uint32_t x) {
 }
 
 static void FillFixture(_Float16 *x, _Float16 *gate, _Float16 *up, _Float16 *down) {
+    const char *scaleRaw = getenv("H3_MLP_FIXTURE_SCALE");
+    float scale = scaleRaw && *scaleRaw ? strtof(scaleRaw, NULL) : 1.0f;
+    if (!(scale > 0)) scale = 1.0f;
     for (int k = 0; k < Hidden; ++k) for (int s = 0; s < Sequence; ++s)
-        x[(size_t)k * Sequence + s] = (_Float16)(UnitValue(k * 131U + s) * 0.15f);
+        x[(size_t)k * Sequence + s] = (_Float16)(UnitValue(k * 131U + s) * 0.15f * scale);
     for (int k = 0; k < Hidden; ++k) for (int f = 0; f < Intermediate; ++f) {
         gate[(size_t)k * Intermediate + f] =
-            (_Float16)(UnitValue(k * 977U + f + 17U) * 0.08f);
+            (_Float16)(UnitValue(k * 977U + f + 17U) * 0.08f * scale);
         up[(size_t)k * Intermediate + f] =
-            (_Float16)(UnitValue(k * 619U + f + 31U) * 0.08f);
+            (_Float16)(UnitValue(k * 619U + f + 31U) * 0.08f * scale);
     }
     for (int f = 0; f < Intermediate; ++f) for (int h = 0; h < Hidden; ++h)
         down[(size_t)f * Hidden + h] =
-            (_Float16)(UnitValue(f * 811U + h + 47U) * 0.06f);
+            (_Float16)(UnitValue(f * 811U + h + 47U) * 0.06f * scale);
+    printf("fixture_scale=%.4g\n", scale);
 }
 
 static void Reference(const _Float16 *x, const _Float16 *gate, const _Float16 *up,
@@ -139,16 +205,22 @@ static void Reference(const _Float16 *x, const _Float16 *gate, const _Float16 *u
 }
 
 static void Score(const _Float16 *actual, const float *expected) {
-    double error2 = 0, reference2 = 0;
+    double error2 = 0, reference2 = 0, actual2 = 0, dot = 0;
     float maxAbs = 0;
-    for (int i = 0; i < Hidden * Sequence; ++i) {
-        float delta = (float)actual[i] - expected[i];
+    for (int h = 0; h < Hidden; ++h) for (int s = 0; s < Sequence; ++s) {
+        int i = h * Sequence + s;
+        float value = (float)actual[i];
+        float delta = value - expected[i];
         error2 += (double)delta * delta;
         reference2 += (double)expected[i] * expected[i];
+        actual2 += (double)value * value;
+        dot += (double)value * expected[i];
         maxAbs = fmaxf(maxAbs, fabsf(delta));
     }
-    printf("reference max_abs=%.6g rel_rms=%.6g elements=%d\n", maxAbs,
-           sqrt(error2 / fmax(reference2, 1e-30)), Hidden * Sequence);
+    printf("reference max_abs=%.6g rel_rms=%.6g cosine=%.6g norm_ratio=%.6g\n",
+           maxAbs, sqrt(error2 / fmax(reference2, 1e-30)),
+           dot / sqrt(fmax(actual2 * reference2, 1e-30)),
+           sqrt(actual2 / fmax(reference2, 1e-30)));
 }
 
 int main(void) {
@@ -176,6 +248,13 @@ int main(void) {
                    (model.error ?: @"unknown").UTF8String);
             Destroy(model); return 4;
         }
+        if (getenv("H3_ANE_DUMP_ATTRIBUTES") &&
+            [model.model respondsToSelector:@selector(modelAttributes)]) {
+            id attributes = ((id(*)(id,SEL))objc_msgSend)(model.model,
+                @selector(modelAttributes));
+            printf("model_attributes=%s\n",
+                   attributes ? [[attributes description] UTF8String] : "(nil)");
+        }
 
         _Float16 *x = (_Float16 *)calloc((size_t)Hidden * Sequence, 2);
         _Float16 *gate = (_Float16 *)calloc((size_t)Hidden * Intermediate, 2);
@@ -185,26 +264,22 @@ int main(void) {
         float *expected = (float *)calloc((size_t)Hidden * Sequence, sizeof(float));
         FillFixture(x, gate, up, down); Reference(x, gate, up, down, expected);
 
-        // `H3_MLP_PAD=n` oversizes every surface. On macOS 27 this graph's
-        // 0x1D decodes as "IOSurface smaller than the model expects", so the
-        // rejection recorded in docs/ANE_STATUS.md as evidence that the runtime
-        // cannot execute a multi-weight island may only ever have been a
-        // sizing error. If a multiplier makes it run, that is the answer.
-        const char *padRaw = getenv("H3_MLP_PAD");
-        size_t pad = padRaw ? (size_t)strtol(padRaw, NULL, 10) : 1;
-        if (pad < 1) pad = 1;
-        printf("surface_pad=%zux\n", pad);
-        IOSurfaceRef xs = NewSurface(TensorBytes(Hidden, Sequence) * pad);
-        IOSurfaceRef gs = NewSurface(TensorBytes(Hidden, Intermediate) * pad);
-        IOSurfaceRef us = NewSurface(TensorBytes(Hidden, Intermediate) * pad);
-        IOSurfaceRef ds = NewSurface(TensorBytes(Intermediate, Hidden) * pad);
-        IOSurfaceRef ys = NewSurface(TensorBytes(Hidden, Sequence) * pad);
+        IOSurfaceRef xs = NewSurface(TensorBytes(Hidden, Sequence));
+        IOSurfaceRef gs = NewSurface(TensorBytes(Hidden, Intermediate));
+        IOSurfaceRef us = NewSurface(TensorBytes(Hidden, Intermediate));
+        IOSurfaceRef ds = NewSurface(TensorBytes(Intermediate, Hidden));
+        IOSurfaceRef ys = NewSurface(TensorBytes(Hidden, Sequence));
         WriteTensor(xs, x, Hidden, Sequence);
         WriteTensor(gs, gate, Hidden, Intermediate);
         WriteTensor(us, up, Hidden, Intermediate);
         WriteTensor(ds, down, Intermediate, Hidden);
-        NSArray *inputs = @[(__bridge id)xs, (__bridge id)gs, (__bridge id)us,
-                            (__bridge id)ds];
+        // The compiler does not preserve textual function-argument order. Its
+        // model attributes assign input symbols alphabetically here:
+        // down_weight=0, gate_weight=1, up_weight=2, x=3. Binding the textual
+        // order made the 16 KiB x surface occupy the 64 KiB down slot (0x1d);
+        // padding x to 64 KiB only hid that error and ran with swapped tensors.
+        NSArray *inputs = @[(__bridge id)ds, (__bridge id)gs,
+                            (__bridge id)us, (__bridge id)xs];
 
         NSString *error = nil;
         BOOL ok = EvaluateWithOptions(model.model, inputs, ys, NULL, @0,
@@ -216,7 +291,8 @@ int main(void) {
         printf("\n");
         if (!ok) return 5;
 
-        ReadTensor(ys, actual, Hidden, Sequence); Score(actual, expected);
+        ReadTensor(ys, actual, Hidden, Sequence);
+        Score(actual, expected);
         std::vector<double> times;
         for (int i = 0; i < Samples; ++i) {
             uint64_t begin = mach_absolute_time();

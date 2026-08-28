@@ -42,7 +42,7 @@ let package = Package(
         .target(
             name: "H3Attention",
             dependencies: [
-                "H3Foundation", "H3Hardware",
+                "H3Foundation", "H3Hardware", "H3ANEBridge",
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXFast", package: "mlx-swift"),
             ]

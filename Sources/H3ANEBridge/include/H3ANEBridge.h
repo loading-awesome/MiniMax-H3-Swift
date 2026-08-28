@@ -66,6 +66,34 @@ bool h3_ane_run_pair(H3ANEProgram* _Nonnull p0, H3ANETensor* _Nonnull x0,
                      H3ANEProgram* _Nonnull p1, H3ANETensor* _Nonnull x1,
                      H3ANETensor* _Nonnull w1, H3ANETensor* _Nonnull y1);
 
+#pragma mark - Fused Attention Programs
+
+/// A fixed-shape, explicit-stable-softmax attention program. Q is expected to
+/// be pre-scaled by `1/sqrt(head_dim)`; Q, K, V and Y are packed fp16
+/// `[heads, sequence, head_dim]` tensors.
+typedef struct H3ANEAttentionProgram H3ANEAttentionProgram;
+
+H3ANEAttentionProgram* _Nullable h3_ane_attention_program_create(
+    int heads, int sequence, int head_dim);
+void h3_ane_attention_program_free(H3ANEAttentionProgram* _Nullable p);
+
+bool h3_ane_attention_run(
+    H3ANEAttentionProgram* _Nonnull p,
+    H3ANETensor* _Nonnull q, H3ANETensor* _Nonnull k,
+    H3ANETensor* _Nonnull v, H3ANETensor* _Nonnull y,
+    int instance_hint);
+
+/// Runs one head group on each physical ANE concurrently. The runtime assigns
+/// the two simultaneous evaluations to distinct dies; the instance hints alone
+/// do not select a die.
+bool h3_ane_attention_run_pair(
+    H3ANEAttentionProgram* _Nonnull p0,
+    H3ANETensor* _Nonnull q0, H3ANETensor* _Nonnull k0,
+    H3ANETensor* _Nonnull v0, H3ANETensor* _Nonnull y0,
+    H3ANEAttentionProgram* _Nonnull p1,
+    H3ANETensor* _Nonnull q1, H3ANETensor* _Nonnull k1,
+    H3ANETensor* _Nonnull v1, H3ANETensor* _Nonnull y1);
+
 #pragma mark - Asynchronous Bounded Job API (Phase 2)
 
 typedef struct H3ANEJob H3ANEJob;

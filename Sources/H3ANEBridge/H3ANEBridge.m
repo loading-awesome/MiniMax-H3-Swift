@@ -417,6 +417,240 @@ int h3_ane_program_s(H3ANEProgram *p) { return p ? p->s : 0; }
 int h3_ane_program_k(H3ANEProgram *p) { return p ? p->k : 0; }
 int h3_ane_program_n(H3ANEProgram *p) { return p ? p->n : 0; }
 
+#pragma mark - Fused attention programs
+
+struct H3ANEAttentionProgram {
+    int heads, sequence, headDim;
+    _Atomic bool poisoned;
+    id _Nullable model;
+    NSString * _Nullable scratchDir;
+    /// Which of q,k,v (0,1,2) belongs at each compiled input index. The
+    /// compiler renames function arguments to alphabetically ordered input
+    /// symbols, so textual order is not the ABI; this is read from the load
+    /// reply rather than assumed.
+    int binding[3];
+};
+
+/// Stable SDPA with the quadratic score plane kept entirely inside ANE.
+///
+/// The fused MIL `softmax` lowering normalises individual tiles at long
+/// sequence lengths. Expressing max/sub/exp/sum/div separately keeps the
+/// reduction global.
+///
+/// `scores` is the ordinary `q @ k^T`. An earlier version wrote `k @ q^T` and
+/// explained it as the compiler physically transposing a square matmul's
+/// output against its declared type. That was a misdiagnosis. The load reply
+/// shows this compiler renames function arguments to alphabetically ordered
+/// input symbols — `(k, q, v)` at indices `(0, 1, 2)` — so binding textual
+/// order swapped q and k, and the reversed matmul cancelled the swap. Both
+/// halves are now correct rather than compensating: the graph is natural and
+/// `h3_ane_attention_run` binds by the symbol order in the load reply.
+static NSString *AttentionMIL(int heads, int sequence, int dimension) {
+    NSMutableString *m = [NSMutableString stringWithString:
+        @"program(1.3)\n"
+         "[buildInfo = dict<string, string>({{\"coremlc-component-MIL\", \"3510.2.1\"}, "
+         "{\"coremlc-version\", \"3505.4.1\"}, {\"coremltools-component-milinternal\", \"\"}, "
+         "{\"coremltools-version\", \"9.0\"}})]\n{\n"];
+    [m appendFormat:
+        @"    func main<ios18>(tensor<fp16,[1,%d,%d,%d]> q, "
+         "tensor<fp16,[1,%d,%d,%d]> k, tensor<fp16,[1,%d,%d,%d]> v) {\n",
+        heads, sequence, dimension, heads, sequence, dimension,
+        heads, sequence, dimension];
+    [m appendString:
+        @"        tensor<int32,[4]> pk=const()[name=string(\"pk\"),"
+         "val=tensor<int32,[4]>([0,1,3,2])];\n"];
+    [m appendFormat:
+        @"        tensor<fp16,[1,%d,%d,%d]> kt=transpose(perm=pk,x=k)"
+         "[name=string(\"kt\")];\n", heads, dimension, sequence];
+    [m appendString:
+        @"        bool bf=const()[name=string(\"bf\"),val=bool(false)];\n"
+         "        bool kd=const()[name=string(\"kd\"),val=bool(true)];\n"
+         "        tensor<int32,[1]> ax=const()[name=string(\"ax\"),"
+         "val=tensor<int32,[1]>([3])];\n"];
+    [m appendFormat:
+        @"        tensor<fp16,[1,%d,%d,%d]> scores=matmul("
+         "transpose_x=bf,transpose_y=bf,x=q,y=kt)[name=string(\"scores\")];\n"
+         "        tensor<fp16,[1,%d,%d,1]> mx=reduce_max(axes=ax,keep_dims=kd,"
+         "x=scores)[name=string(\"mx\")];\n"
+         "        tensor<fp16,[1,%d,%d,%d]> sh=sub(x=scores,y=mx)"
+         "[name=string(\"sh\")];\n"
+         "        tensor<fp16,[1,%d,%d,%d]> weights=exp(x=sh)"
+         "[name=string(\"weights\")];\n"
+         "        tensor<fp16,[1,%d,%d,1]> denominator=reduce_sum("
+         "axes=ax,keep_dims=kd,x=weights)[name=string(\"denominator\")];\n"
+         "        tensor<fp16,[1,%d,%d,%d]> weighted=matmul("
+         "transpose_x=bf,transpose_y=bf,x=weights,y=v)"
+         "[name=string(\"weighted\")];\n"
+         "        tensor<fp16,[1,%d,%d,%d]> y=real_div(x=weighted,y=denominator)"
+         "[name=string(\"y\")];\n"
+         "    } -> (y);\n}\n",
+        heads, sequence, sequence,
+        heads, sequence,
+        heads, sequence, sequence,
+        heads, sequence, sequence,
+        heads, sequence,
+        heads, sequence, dimension,
+        heads, sequence, dimension];
+    return m;
+}
+
+H3ANEAttentionProgram* h3_ane_attention_program_create(
+    int heads, int sequence, int head_dim) {
+    if (!h3_ane_is_available() || heads <= 0 || sequence <= 0 || head_dim <= 0) return NULL;
+    H3ANEAttentionProgram *p = NULL;
+    @try {
+        p = (H3ANEAttentionProgram *)calloc(1, sizeof(H3ANEAttentionProgram));
+        if (!p) return NULL;
+        p->heads = heads; p->sequence = sequence; p->headDim = head_dim;
+        NSString *mil = AttentionMIL(heads, sequence, head_dim);
+        NSData *milData = [mil dataUsingEncoding:NSUTF8StringEncoding];
+        id descriptor = ((id(*)(Class, SEL, id, id, id))objc_msgSend)(
+            DescriptorClass, @selector(modelWithMILText:weights:optionsPlist:),
+            milData, @{}, nil);
+        if (!descriptor) { h3_ane_attention_program_free(p); return NULL; }
+        id model = ((id(*)(Class, SEL, id))objc_msgSend)(
+            ModelClass, @selector(inMemoryModelWithDescriptor:), descriptor);
+        if (!model) { h3_ane_attention_program_free(p); return NULL; }
+
+        static atomic_uint serial = 0;
+        unsigned mine = atomic_fetch_add(&serial, 1);
+        NSString *identifier = ((id(*)(id, SEL))objc_msgSend)(
+            model, @selector(hexStringIdentifier));
+        p->scratchDir = [NSTemporaryDirectory() stringByAppendingPathComponent:
+            [NSString stringWithFormat:@"h3-ane-attn-%d-%u-%@", getpid(), mine, identifier]];
+        NSFileManager *fm = NSFileManager.defaultManager;
+        [fm createDirectoryAtPath:[p->scratchDir stringByAppendingPathComponent:@"weights"]
+      withIntermediateDirectories:YES attributes:nil error:nil];
+        [milData writeToFile:[p->scratchDir stringByAppendingPathComponent:@"model.mil"]
+                     options:0 error:nil];
+        if ([model respondsToSelector:@selector(setModelURL:)]) {
+            ((void(*)(id, SEL, id))objc_msgSend)(
+                model, @selector(setModelURL:), [NSURL fileURLWithPath:p->scratchDir]);
+        }
+        NSError *error = nil;
+        BOOL ok = ((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
+            model, @selector(compileWithQoS:options:error:), 21, @{}, &error);
+        if (!ok) {
+            NSLog(@"[H3ANEBridge] attention compile failed h=%d s=%d d=%d: %@",
+                  heads, sequence, head_dim, error);
+            h3_ane_attention_program_free(p); return NULL;
+        }
+        ok = ((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
+            model, @selector(loadWithQoS:options:error:), 21, @{}, &error);
+        if (!ok) {
+            NSLog(@"[H3ANEBridge] attention load failed h=%d s=%d d=%d: %@",
+                  heads, sequence, head_dim, error);
+            h3_ane_attention_program_free(p); return NULL;
+        }
+        // Read the compiled input order from the load reply. Guessing it
+        // cost a day on the MLP island: the compiler emits alphabetically
+        // ordered symbols, so a textual q,k,v binding is silently permuted.
+        p->binding[0] = 1; p->binding[1] = 0; p->binding[2] = 2;  // (k,q,v)
+        if ([model respondsToSelector:@selector(modelAttributes)]) {
+            id attributes = ((id(*)(id, SEL))objc_msgSend)(
+                model, @selector(modelAttributes));
+            NSArray *symbols = [attributes isKindOfClass:NSDictionary.class]
+                ? ((NSDictionary *)attributes)[@"kANEFModelInputSymbolsArrayKey"] : nil;
+            if ([symbols isKindOfClass:NSArray.class] && symbols.count == 3) {
+                int resolved[3] = {-1, -1, -1};
+                for (NSUInteger i = 0; i < 3; ++i) {
+                    NSString *name = [symbols[i] description];
+                    if ([name isEqualToString:@"q"]) resolved[i] = 0;
+                    else if ([name isEqualToString:@"k"]) resolved[i] = 1;
+                    else if ([name isEqualToString:@"v"]) resolved[i] = 2;
+                }
+                if (resolved[0] >= 0 && resolved[1] >= 0 && resolved[2] >= 0 &&
+                    resolved[0] != resolved[1] && resolved[1] != resolved[2] &&
+                    resolved[0] != resolved[2]) {
+                    for (int i = 0; i < 3; ++i) p->binding[i] = resolved[i];
+                } else {
+                    NSLog(@"[H3ANEBridge] attention input symbols unrecognised: %@", symbols);
+                    h3_ane_attention_program_free(p); return NULL;
+                }
+            }
+        }
+        p->model = model;
+        return p;
+    } @catch (NSException *exception) {
+        NSLog(@"[H3ANEBridge] private runtime exception compiling attention: %@", exception);
+        h3_ane_attention_program_free(p); return NULL;
+    }
+}
+
+void h3_ane_attention_program_free(H3ANEAttentionProgram *p) {
+    if (!p) return;
+    @try {
+        if (p->model) {
+            NSError *error = nil;
+            ((BOOL(*)(id, SEL, unsigned int, NSError **))objc_msgSend)(
+                p->model, @selector(unloadWithQoS:error:), 21, &error);
+            p->model = nil;
+        }
+    } @catch (NSException *exception) {
+        NSLog(@"[H3ANEBridge] private runtime exception unloading attention: %@", exception);
+        p->model = nil;
+    }
+    if (p->scratchDir) {
+        [NSFileManager.defaultManager removeItemAtPath:p->scratchDir error:nil];
+        p->scratchDir = nil;
+    }
+    free(p);
+}
+
+bool h3_ane_attention_run(H3ANEAttentionProgram *p,
+                          H3ANETensor *q, H3ANETensor *k,
+                          H3ANETensor *v, H3ANETensor *y,
+                          int instance_hint) {
+    if (!p || !p->model || !q || !k || !v || !y || atomic_load(&p->poisoned)) return false;
+    int rows = p->heads * p->sequence;
+    if (q->rows != rows || k->rows != rows || v->rows != rows || y->rows != rows ||
+        q->width != p->headDim || k->width != p->headDim ||
+        v->width != p->headDim || y->width != p->headDim) return false;
+    @try {
+        // Ordered by the compiled input symbols read at load, not by the
+        // order the MIL function declares its arguments in.
+        id supplied[3] = {q->object, k->object, v->object};
+        id request = ((id(*)(Class, SEL, id, id, id, id, id, id, id))objc_msgSend)(
+            RequestClass,
+            @selector(requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:procedureIndex:),
+            @[supplied[p->binding[0]], supplied[p->binding[1]], supplied[p->binding[2]]],
+            @[@0, @1, @2], @[y->object], @[@0], nil, nil, @0);
+        if (!request) return false;
+        NSDictionary *options = @{
+            @"kANEFProcedureVariantHint": @1,
+            @"kANEFAneInstanceHint": @(instance_hint)
+        };
+        NSError *error = nil;
+        BOOL ok = ((BOOL(*)(id, SEL, unsigned int, id, id, NSError **))objc_msgSend)(
+            p->model, @selector(evaluateWithQoS:options:request:error:),
+            21, options, request, &error);
+        if (!ok) NSLog(@"[H3ANEBridge] attention evaluate failed: %@", error);
+        return ok;
+    } @catch (NSException *exception) {
+        NSLog(@"[H3ANEBridge] private runtime exception evaluating attention: %@", exception);
+        atomic_store(&p->poisoned, true);
+        return false;
+    }
+}
+
+bool h3_ane_attention_run_pair(
+    H3ANEAttentionProgram *p0, H3ANETensor *q0, H3ANETensor *k0,
+    H3ANETensor *v0, H3ANETensor *y0,
+    H3ANEAttentionProgram *p1, H3ANETensor *q1, H3ANETensor *k1,
+    H3ANETensor *v1, H3ANETensor *y1) {
+    if (!p0 || !p1) return false;
+    __block bool ok0 = false, ok1 = false;
+    dispatch_group_t group = dispatch_group_create();
+    dispatch_group_async(group, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool { ok0 = h3_ane_attention_run(p0, q0, k0, v0, y0, 1); }
+    });
+    dispatch_group_async(group, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool { ok1 = h3_ane_attention_run(p1, q1, k1, v1, y1, 2); }
+    });
+    dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
+    return ok0 && ok1;
+}
+
 bool h3_ane_run(H3ANEProgram *p, H3ANETensor *x, H3ANETensor *w, H3ANETensor *y,
                 int instance_hint) {
     if (!p || !p->model || !x || !w || !y || atomic_load(&p->poisoned)) return false;

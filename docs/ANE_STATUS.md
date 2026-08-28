@@ -499,31 +499,61 @@ Code=42 "Inference failed — IOSurface smaller than the model expects
 ```
 
 It is a **buffer-size error**, not an architectural rejection. Oversizing every
-surface in `Tools/ANE/mlp-island-spike.mm` makes the same graph run:
+surface in `Tools/ANE/mlp-island-spike.mm` first made the same graph run:
 
 | surface multiplier | result |
 |---|---|
 | 1x, 2x, 3x | `0x1D` |
 | **4x** | **`evaluate=OK`** |
 
-So the runtime does execute a multi-weight island with dynamic weights, and the
-direction that was closed on this evidence should not have been.
+That observation was real; its first explanation was not. The allocation-only
+`Tools/ANE/surface-layout.m` probe calls the runtime's own
+`createIOSurfaceWithWidth:pixel_size:height:bytesPerElement:` factory. It returns
+exactly the packed sizes for all three tensors: 16 KiB for `[1,128,1,64]` and
+64 KiB for both `[1,128,1,256]` and `[1,256,1,128]`. There is no 256-element
+minor-axis floor.
 
-Two things remain before it means anything. The arithmetic is still wrong
-(`rel_rms` 1.016, uncorrelated) because the surfaces are merely *large enough*
-rather than correctly *laid out* — the engine writes at a stride the spike does
-not read at, the same class of mismatch as the transposed score plane in
-`scores-spike.mm`. And the exact rule is not established: 4x is the measured
-boundary for this graph, and it is consistent with a minimum minor-axis extent
-of 256 elements — `xs`/`ys` have a minor axis of 64 and need 4x, `ds` has 128
-and needs 2x — but that is inference from one shape, not a measurement.
+The load reply was already present as `modelAttributes`. It gives both the
+answer and the root cause:
 
-The runtime exposes `+[_ANEIOSurfaceObject createIOSurfaceWithWidth:pixel_size:
-height:bytesPerElement:]`, which this bridge has never used: every surface here
-is allocated by `IOSurfaceCreate` against our own `rows x align64(width*2)`
-guess. That factory, or the load reply the error names, is where the real answer
-is. Production shapes are unaffected — their minor axes are all well above any
-plausible floor — but nothing has verified that, it is only arithmetic.
+```
+input symbols: down_weight=0, gate_weight=1, up_weight=2, x=3
+sizes:         65536          65536          65536        16384
+```
+
+The compiler canonicalized the inputs; it did not preserve the MIL function's
+textual `x, gate_weight, up_weight, down_weight` order. The request bound that
+textual order to indices `0,1,2,3`, putting the 16 KiB `x` surface in the 64 KiB
+down-weight slot. Padding `x` to 64 KiB hid the validation error and evaluated
+with `x` and `down_weight` swapped, which explains both the exact 4x boundary
+and the uncorrelated output. Binding by the compiled symbol order evaluates at
+ordinary 1x allocation.
+
+Numerical conformance is now a separate scale question. The original tiny
+fixture drives the fused fp16 intermediates into the engine's flush-to-zero
+region; increasing all fixture operands shows the transition cleanly:
+
+| fixture scale | rel-RMS | cosine |
+|---:|---:|---:|
+| 0.5 | 1.0 (zero output) | 0 |
+| 1 | 0.248 | 0.9688 |
+| 2 | 0.0575 | 0.9984 |
+| 4 | 0.0127 | 0.9999 |
+| 8 | **0.00160** | **0.999999** |
+
+The fused dynamic-weight graph therefore executes and produces conformant
+arithmetic away from underflow *at the tiny shape*. The old architectural and
+layout conclusions are both retired.
+
+**It does not yet conform at production width, and underflow is not the
+reason.** Widening the contraction to `hiddenSize` 5,376 with a bounded 512-
+neuron island leaves rel-RMS at **0.0395** — an order of magnitude outside the
+0.003 equivalence class. Rescaling inside the graph, which is arithmetically
+neutral and which moved the tiny fixture from 0.248 to 0.102, moves this from
+0.03953 to 0.03934: nothing. Whatever is wrong at width is a different fault
+from the flush-to-zero seen at the tiny shape, and it is unidentified. The fused
+island is therefore **executable but not usable**, and the chained island stays
+the production path until this is explained.
 
 ### Fused attention works with an explicit softmax (2026-08-27)
 
@@ -574,6 +604,37 @@ attention 417 ms to ~347 ms, and the render from 1.179x to roughly **1.28x**.
 It also reopens the ceiling. `A/G` is no longer fixed, so the branch-local model
 `forward = A/G + L/(G+R)` no longer bounds this, and the coarse two-branch
 pipeline is worth costing.
+
+### The head-count cliff, and what it caps the route at (2026-08-27)
+
+The projection above — "about 9 of 56 heads" — is wrong, and the reason is a
+hard boundary rather than a balance point. A graph's cost per head is flat up to
+four heads and then collapses:
+
+| heads in one graph | S=15,744 | S=11,000 |
+|---|---:|---:|
+| 1 | 1.70 TFLOP/s | 0.49 |
+| 2 | 1.88 | 0.48 |
+| **4** | **1.90** | 1.69 |
+| 5 | **0.20** | 1.63 |
+| 8 | — | 0.25 |
+
+Confirmed independently through the integrated backend against a real capture:
+5, 6 and 7 heads a die take 7.7 s, 7.7 s and 11.2 s a call against 374 ms at
+four.
+
+**It is not a capacity limit, and the obvious hypothesis is disproven.** A 2 GiB
+score-plane ceiling predicts the S=15,744 column exactly (4 heads = 1.847 GiB
+fast, 5 = 2.309 GiB slow) and then fails: 1.803 GiB at S=11,000 is *slow* while
+1.847 GiB at S=15,744 is *fast*. Nor is it monotone in heads — at S=11,000 one
+and two heads are slow and four and five are fast. It is a per-shape tiling
+decision inside the compiler, and no rule covering both columns is established.
+
+What production needs is settled: **four heads a die at the production
+sequence**, measured in two harnesses. That caps the dies at 8 of 56 heads —
+14% of attention — which is why the route lands where it does and why it does
+not tune higher. `H3_ANE_ATTENTION_HEADS` re-sweeps it if the shape or the OS
+moves; nothing else should touch the constant.
 
 ### Superseded: the fused attention graph is accepted, and numerically wrong
 
