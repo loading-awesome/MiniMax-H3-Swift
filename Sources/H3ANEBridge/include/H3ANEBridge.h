@@ -66,6 +66,11 @@ bool h3_ane_run_pair(H3ANEProgram* _Nonnull p0, H3ANETensor* _Nonnull x0,
                      H3ANEProgram* _Nonnull p1, H3ANETensor* _Nonnull x1,
                      H3ANETensor* _Nonnull w1, H3ANETensor* _Nonnull y1);
 
+/// How many ANE dies this machine has, measured rather than inferred from the
+/// model string: one evaluation against two concurrent ones. 0 when the engine
+/// is unavailable. `H3_ANE_DIES` overrides it for testing.
+int h3_ane_die_count(void);
+
 /// Counts of power-transition cancellations absorbed by retry, and of those
 /// that exhausted the retry budget. `H3_ANE_CANCEL_RETRIES` sets the budget.
 uint64_t h3_ane_cancellation_retries(void);

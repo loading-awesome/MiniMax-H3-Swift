@@ -180,29 +180,35 @@ bool h3_ane_is_available(void) {
     static dispatch_once_t once;
     static bool available = false;
     dispatch_once(&once, ^{
-        // This bridge is a versioned private ABI, not a generalized ANE API.
-        // Refuse unvalidated machines/builds unless a researcher deliberately
-        // opts into probing them. This turns an OS update into the normal MLX
-        // fallback instead of an unrecognized-selector crash during sampling.
+        // This bridge is a versioned private ABI, not a generalized ANE API,
+        // so it gates on the OS rather than trusting that the selectors exist.
+        // An OS update becomes the normal MLX fallback instead of an
+        // unrecognized-selector crash during sampling.
+        //
+        // **The floor is macOS 27.** Earlier builds carry a driver defect that
+        // admits a request arriving during a power transition and hard-locks
+        // the machine minutes later, with no symptom at submission time. There
+        // is no configuration of this bridge that is safe there. See "Machine
+        // safety" in docs/ANE.md.
+        //
+        // It deliberately does **not** gate on `hw.model`. An allowlist of one
+        // machine made this feature silently unavailable on every other Mac,
+        // including the next one. What actually has to hold is that the driver
+        // is fixed and the private classes resolve, and both are checked here.
+        // Everything tuned to a particular chip — how many dies there are, how
+        // many heads a graph takes, the share and the split — is measured at
+        // runtime rather than assumed. See `ANEAttentionBackend.worthTaking`
+        // and `ANELinearBackend.Calibration`.
         NSDictionary *env = NSProcessInfo.processInfo.environment;
         bool override = [env[@"H3_ANE_ALLOW_UNVALIDATED"] isEqualToString:@"1"];
-        if (!override) {
-            // Builds that have passed both gates: the selector audit
-            // (`Tools/ANE/abi-check.m`) and a clean `Tools/ANE/pair-stress.m`
-            // watch past +900 s.
-            //
-            // **25F84 and earlier are deliberately absent.** They carry a
-            // driver defect that admits a request arriving during a power
-            // transition and hard-locks the machine minutes later, with no
-            // symptom at submission time. See "Machine safety" in
-            // docs/ANE.md. There is no configuration of this bridge that
-            // is safe there, so it does not route.
-            //
-            // The trailing letter on 26A5421a says GM seed; the shipping 27.0
-            // build string will differ and has to be re-audited, not assumed.
-            NSArray<NSString *> *validated = @[@"26A5421a"];
-            if (![validated containsObject:SysctlString("kern.osversion")] ||
-                ![SysctlString("hw.model") isEqualToString:@"Mac15,14"]) return;
+        NSOperatingSystemVersion os = NSProcessInfo.processInfo.operatingSystemVersion;
+        if (!override && os.majorVersion < 27) {
+            NSLog(@"[H3ANEBridge] ANE routing is off: macOS %ld.%ld is below the "
+                  @"macOS 27 floor. Earlier drivers can hard-lock the machine on a "
+                  @"request that lands during an engine power transition, so this "
+                  @"path stays off and rendering falls back to Metal.",
+                  (long)os.majorVersion, (long)os.minorVersion);
+            return;
         }
 
         void *handle = dlopen("/System/Library/PrivateFrameworks/AppleNeuralEngine.framework/"
@@ -416,6 +422,72 @@ void h3_ane_program_free(H3ANEProgram *p) {
 int h3_ane_program_s(H3ANEProgram *p) { return p ? p->s : 0; }
 int h3_ane_program_k(H3ANEProgram *p) { return p ? p->k : 0; }
 int h3_ane_program_n(H3ANEProgram *p) { return p ? p->n : 0; }
+
+static double Milliseconds(uint64_t elapsed) {
+    static mach_timebase_info_data_t tb;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ mach_timebase_info(&tb); });
+    return (double)elapsed * tb.numer / tb.denom / 1e6;
+}
+
+#pragma mark - How many dies this machine has
+
+/// Measured, not inferred from the model string.
+///
+/// `kANEFAneInstanceHint` does not select a die; two dies run only when two
+/// evaluations are in flight at once. So the way to find out how many there
+/// are is to submit one evaluation, then two concurrently, and compare. On an
+/// Ultra the pair costs about what one does; on a single-die part the two
+/// serialise and it costs about twice.
+///
+/// Everything downstream depends on this: the pair submission is pointless
+/// with one die, and the GPU/engine share was calibrated against two.
+static int gDieCount = 0;
+
+int h3_ane_die_count(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        if (!h3_ane_is_available()) { gDieCount = 0; return; }
+        NSString *forced = NSProcessInfo.processInfo.environment[@"H3_ANE_DIES"];
+        if (forced.length > 0) { gDieCount = MAX(1, MIN(2, forced.intValue)); return; }
+
+        const int d = 512;
+        H3ANEProgram *p0 = h3_ane_program_create(d, d, d);
+        H3ANEProgram *p1 = h3_ane_program_create(d, d, d);
+        H3ANETensor *x = h3_ane_tensor_create(d, d);
+        H3ANETensor *w = h3_ane_tensor_create(d, d);
+        H3ANETensor *y0 = h3_ane_tensor_create(d, d);
+        H3ANETensor *y1 = h3_ane_tensor_create(d, d);
+        if (!p0 || !p1 || !x || !w || !y0 || !y1) { gDieCount = 1; goto done; }
+
+        // Warm both programs first: a cold compile or a power-on transition
+        // would otherwise be measured as if it were contention.
+        for (int i = 0; i < 3; ++i) {
+            h3_ane_run(p0, x, w, y0, 1);
+            h3_ane_run_pair(p0, x, w, y0, p1, x, w, y1);
+        }
+        double single = INFINITY, pair = INFINITY;
+        for (int i = 0; i < 5; ++i) {
+            uint64_t t = mach_absolute_time();
+            h3_ane_run(p0, x, w, y0, 1);
+            single = MIN(single, Milliseconds(mach_absolute_time() - t));
+            t = mach_absolute_time();
+            h3_ane_run_pair(p0, x, w, y0, p1, x, w, y1);
+            pair = MIN(pair, Milliseconds(mach_absolute_time() - t));
+        }
+        // Halfway between "free" (1.0x) and "serialised" (2.0x). A second die
+        // is not perfectly free, and one die is not perfectly serial, so the
+        // threshold sits where neither reading is plausible.
+        gDieCount = (pair < single * 1.5) ? 2 : 1;
+        NSLog(@"[H3ANEBridge] %d ANE die%s: one evaluation %.2f ms, two concurrent %.2f ms",
+              gDieCount, gDieCount == 1 ? "" : "s", single, pair);
+    done:
+        h3_ane_program_free(p0); h3_ane_program_free(p1);
+        h3_ane_tensor_free(x); h3_ane_tensor_free(w);
+        h3_ane_tensor_free(y0); h3_ane_tensor_free(y1);
+    });
+    return gDieCount;
+}
 
 #pragma mark - Power-transition cancellations
 

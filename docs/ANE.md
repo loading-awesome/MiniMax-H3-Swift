@@ -146,6 +146,41 @@ at production scale — 0.974 relative RMS at S=15,744. Writing the reduction ou
 as max, subtract, exp, sum, divide keeps it global and gives 8.99e-4, which is
 better than the bf16 GPU path's own 1.66e-3.
 
+## Other Macs
+
+The route gates on macOS 27 or newer and on nothing else. It does not check
+`hw.model`: an allowlist of one machine made the feature silently unavailable
+on every other Mac, and what actually has to hold is that the driver is fixed
+and the private classes resolve.
+
+Everything tuned to a particular chip is measured at startup instead of
+assumed:
+
+- **Die count.** `kANEFAneInstanceHint` does not select a die, so two dies run
+  only when two evaluations are in flight. The probe submits one evaluation,
+  then two concurrently: about the same cost means two dies, about twice means
+  one. On the calibrated machine it reports `one evaluation 0.22 ms, two
+  concurrent 0.26`.
+- **The engine's share of the columns.** 0.45 was measured against two dies at
+  7.9 TFLOP/s combined. With one die the balance `r / (1 + r)` for a halved
+  engine gives **0.263**, and the constant is rescaled accordingly.
+- **Whether routing is worth it at all**, per projection shape. The first call
+  at each `(s, k, n)` runs both ways and takes the faster. This matters in both
+  directions: it is what protects an unfamiliar machine from a route that loses,
+  and on the calibrated machine it keeps the small `s=8` conditioning
+  projections on the GPU, where the engine had been losing 4.5 ms against
+  Metal's 1.9.
+- **Attention**, by the same contract, in `ANEAttentionBackend.worthTaking`.
+
+**This makes other Macs safe and self-tuning, not fast.** A single-die part has
+roughly half the engine, so the 1.303x ceiling here is nearer 1.10 to 1.15
+there, and on some shapes the calibration will correctly decline. `headsPerDie`
+is still a constant measured on this ANE; the attention guard will refuse a
+shape where it is wrong rather than find the right value.
+
+Under macOS 26 or earlier the bridge logs why it is off and everything falls
+back to Metal.
+
 ## Machine safety
 
 macOS 26A5421a or later. On earlier builds a request arriving during the

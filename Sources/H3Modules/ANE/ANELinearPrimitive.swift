@@ -174,8 +174,24 @@ public enum ANELinearBackend {
     /// of this file did exactly that and moved this to 0.375.
     private static let splitShare = 0.45
 
+    /// The share these constants were measured at assumes this machine: a GPU
+    /// at 19.1 TFLOP/s against two ANE dies at 7.9 combined. A single-die Mac
+    /// has roughly half the engine and wants a much smaller share, and a
+    /// different GPU moves the ratio again — so on anything but the calibrated
+    /// machine the constant is scaled by what the hardware actually reports,
+    /// and `Calibration` can replace it outright.
+    ///
+    /// The balance for two devices racing the same GEMM is `r / (1 + r)` for an
+    /// engine at `r` times the GPU's rate. That is where 0.286 came from at
+    /// r = 0.40, and it is the right shape of correction here even though the
+    /// measured optimum sits above it once the contraction is split.
     private static var defaultShare: Double {
-        splitOverride == 1 ? racingShare : splitShare
+        let base = splitOverride == 1 ? racingShare : splitShare
+        guard h3_ane_die_count() == 1 else { return base }
+        // Half the engine: rescale the share by the balance the halved rate
+        // implies, rather than shipping a two-die number to a one-die machine.
+        let r = 0.41, halved = r / 2
+        return base * ((halved / (1 + halved)) / (r / (1 + r)))
     }
 
     private static func envShare(_ name: String) -> Double? {
@@ -919,6 +935,65 @@ public enum ANELinearBackend {
     ///   backend on it is a real routing decision the receipt should carry.
     /// - Parameter scale: operand scale for this call, defaulting to the
     ///   shipping 1/16. `fc2` passes a per-block value from `ANEFC2Scales`.
+    /// Whether routing beats Metal for *this shape* on *this machine*.
+    ///
+    /// Every constant in this file was measured on one Mac: a GPU at 19.1
+    /// TFLOP/s against two ANE dies at 7.9 combined. The share is rescaled when
+    /// only one die is found, but the rest — the split, the seam costs, the
+    /// engine's rate on another generation — cannot be predicted, and a route
+    /// that loses is worse than no route: the answer is right and only the
+    /// clock is wrong, so nothing downstream would ever flag it.
+    ///
+    /// **Per shape, not per machine.** An earlier version decided once, on
+    /// whichever projection came first, and a small one lost — 4.8 ms against
+    /// Metal's 2.0 — which switched routing off for the whole render on a
+    /// machine where it is worth 1.22x. Small projections *should* lose; the
+    /// engine's seam costs more than the GEMM saves below a certain size. That
+    /// is a fact about the shape, and it says nothing about the next one.
+    ///
+    /// So the verdict is cached per `(s, k, n)`: a handful of extra matmuls per
+    /// render, and each projection decides for itself. Same contract as
+    /// `ANEAttentionBackend.worthTaking`.
+    private struct ShapeKey: Hashable { let s: Int, k: Int, n: Int }
+    nonisolated(unsafe) private static var routingVerdict: [ShapeKey: Bool] = [:]
+    private static let calibrationLock = NSLock()
+
+    private static func routingBeatsMetal(x: MLXArray, weight: MLXArray,
+                                          share: Double?, label: String) -> Bool {
+        guard x.ndim == 2, weight.ndim == 2 else { return false }
+        let key = ShapeKey(s: x.shape[0], k: x.shape[1], n: weight.shape[0])
+        calibrationLock.lock()
+        if let known = routingVerdict[key] { calibrationLock.unlock(); return known }
+        calibrationLock.unlock()
+
+        func best(_ n: Int, _ body: () -> Void) -> Double {
+            var best = Double.infinity
+            for _ in 0 ..< n {
+                let began = Date(); body()
+                best = min(best, Date().timeIntervalSince(began))
+            }
+            return best
+        }
+        let metal = best(2) { MLX.eval(MLX.matmul(x, weight.transposed())) }
+        var routed = Double.infinity
+        for _ in 0 ..< 2 {
+            let began = Date()
+            guard let body = start(x: x, weight: weight, share: share,
+                                   label: label) else { routed = .infinity; break }
+            MLX.eval(Pending(body).value())
+            routed = min(routed, Date().timeIntervalSince(began))
+        }
+        let wins = routed < metal * 0.97
+
+        calibrationLock.lock(); routingVerdict[key] = wins; calibrationLock.unlock()
+        if !wins, ProcessInfo.processInfo.environment["H3_ANE_TRACE"] == "1" {
+            FileHandle.standardError.write(Data(String(
+                format: "[h3-ane] %@ %dx%dx%d stays on the GPU: engine %.1f ms against Metal's %.1f\n",
+                label as NSString, key.s, key.k, key.n, routed * 1e3, metal * 1e3).utf8))
+        }
+        return wins
+    }
+
     package static func begin(x: MLXArray, weight: MLXArray, label: String,
                               engine: Bool = true,
                               scale: Float = operandScale) -> Pending {
@@ -931,7 +1006,8 @@ public enum ANELinearBackend {
             note(label, routed: false)
             return Pending(.plain(MLX.matmul(x, weight.transposed())))
         }
-        guard let body = start(x: x, weight: weight, share: share(for: label),
+        guard routingBeatsMetal(x: x, weight: weight, share: share(for: label), label: label),
+              let body = start(x: x, weight: weight, share: share(for: label),
                                scale: scale, label: label) else {
             note(label, routed: false)
             return Pending(.plain(MLX.matmul(x, weight.transposed())))
@@ -949,7 +1025,8 @@ public enum ANELinearBackend {
     /// every caller decides its own fallback.
     static func route(x: MLXArray, qkvWeight: MLXArray, share: Double? = nil,
                       label: String) -> MLXArray? {
-        guard let body = start(x: x, weight: qkvWeight, share: share,
+        guard routingBeatsMetal(x: x, weight: qkvWeight, share: share, label: label),
+              let body = start(x: x, weight: qkvWeight, share: share,
                                label: label) else { return nil }
         return Pending(body).value()
     }
