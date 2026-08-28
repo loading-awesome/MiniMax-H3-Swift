@@ -969,6 +969,43 @@ of 11:
 **This is short of the 1.15x gate, and `fc2` is not coming** without oracles
 for every block. `Tools/ANE/saturation_bound.py` settles it.
 
+## What the whole route can be worth, and why it is not 1.5x
+
+Measured on the fixed arm — 864x480x124, 20 steps, seed 0, cache 0.1, one
+prompt — decomposed from the arms themselves rather than assumed:
+
+    block, GPU only        1105.6 ms  =  attention 401.8  +  linear 703.8
+    attention routed floor  344.4 ms     (GPU keeps 48 of 56 heads)
+
+The model is calibrated, not fitted: it predicts an attention saving of 57.4 ms
+a block against 64.0 measured.
+
+The engine's rate is the term that decides everything, and it is already known:
+`ANEFormTests` swept the decomposition by output column, by sequence tile, and
+the rectangles between, and found **7.7 to 7.95 TFLOP/s across both dies, never
+exceeded**. The one candidate for a faster lowering — the 1x1 convolution, the
+engine's native form — is bit-identical and 2.6x slower. So `R = 7.9` is a wall,
+not a setting.
+
+| R (both dies) | ideal linear | full step | overall |
+|---:|---:|---:|---:|
+| **7.9 (measured wall)** | 497.9 ms | 42.1 s | **1.303x** |
+| 9.0 | 478.4 ms | 41.1 s | 1.332x |
+| 11.1 | 445.1 ms | 39.5 s | 1.387x |
+
+**So the ceiling on this arm is about 1.30x, and 1.5x is not reachable by moving
+work to the dies.** Perfect sharing of every routable projection still lands
+short, because 1.5x would need a 36.4 s full step against a best-possible 42.1.
+Reaching it would take a faster engine path, a cheaper GPU baseline, or work
+that is genuinely parallel rather than merely relocatable — at `cfgScale 1`
+there is no second branch to pipeline, which is what the CFG section below
+assumes.
+
+Against that ceiling the shipping route is at **1.176x**, having captured
+**69%** of the ideal linear saving (142 of 205.9 ms a block). The remaining
+64 ms a block is worth about 1.31x, and it is scheduling and seam cost rather
+than engine rate.
+
 ## The CFG overlap ceiling
 
 Classifier-free guidance is two independent forwards, and run back to back the
@@ -1489,18 +1526,26 @@ step, `H3_ANE_FC2_VERIFY=1`:
 | extra halvings | cliff margin | worst block | worst rel-RMS | spurious zeros |
 |---:|---:|---|---:|---:|
 | 0 | 2x | b45 at 1/512 | 1.548e-3 | 8.0e-6 |
+| **1** | **4x** | **b45 at 1/1024** | **1.205e-3** | 8.2e-6 |
 | 2 | 8x | b45 at 1/2048 | 1.808e-3 | 1.006e-5 |
 
 **No saturation.** Spurious zeros sit near 1e-5 and rise gently as the scale
 shrinks, which is fp16 rounding on near-zero outputs; saturation zeros outputs in
 bulk, not one in a hundred thousand.
 
-The accuracy is the worst in the route — 1.5e-3 against 7e-5 to 5e-4 for the
-other projections — and **it is not the scale's fault**. Four times more scale
-buys only 14%, so the error is not over-scaling underflow: `fc2` contracts over
-`k=14336`, by far the longest accumulation in the model, and that is what it
-costs in fp16. The larger margin is therefore kept, because it is nearly free in
-accuracy and the bounds come from one prompt.
+**The margin is non-monotonic in accuracy, and 4x is the optimum.** Both hazards
+are live at once: at 2x the partial sums run near the cliff, at 8x the operands
+run toward the denormals, and 4x is the only setting that is not paying one of
+them. It is strictly better than either neighbour — more accurate than 8x *and*
+more accurate than 2x while keeping twice its headroom — so it is the default.
+An earlier version of this section recorded 2 halvings as the default on the
+reading that extra margin was nearly free in accuracy. It is not: 8x costs 50%
+more error than 4x.
+
+What does not move is the floor. `fc2` contracts over `k=14336`, by far the
+longest accumulation in the model, and at every margin it remains the least
+accurate arithmetic in the route — 1.2e-3 against 7e-5 to 5e-4 for the other
+projections. That part is fp16 over a long `k`, not the scale.
 
 **It is worth 1.6%** — 24.48 s a step to 24.10, and 1.176x end to end with all
 four projections routed. That is a poor trade against being the least accurate
