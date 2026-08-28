@@ -8,9 +8,9 @@ import MLXFast
 import H3ANEBridge
 @testable import H3Attention
 
-/// `H3_ANE_ATTENTION_FORCE` bypasses the session calibration guard. These
-/// suites check arithmetic on shapes chosen to be small, which the guard
-/// correctly refuses as uneconomic; speed is measured by the render gate.
+/// These check arithmetic on shapes chosen to be small, which the calibration
+/// guard correctly refuses as uneconomic, so they set `forceRoute` themselves.
+/// Speed is measured by the render gate, not here.
 @Suite("ANE fused attention", .serialized, .enabled(if: h3_ane_is_available()))
 struct ANEAttentionTests {
     private func relRMS(_ reference: MLXArray, _ actual: MLXArray) -> Float {
@@ -49,6 +49,15 @@ struct ANEAttentionTests {
         let context = AttentionContext(
             blockIndex: 0, blockCount: 1, scheduleProgress: 0,
             sequenceLength: sequence, videoSpan: nil)
+
+        // This shape is deliberately uneconomic — the point is the arithmetic,
+        // not the speed — so the calibration guard would rightly refuse it.
+        // Set here rather than in the environment: a test that only passes
+        // under an exported variable is a test that fails in CI.
+        let saved = ANEAttentionBackend.forceRoute
+        ANEAttentionBackend.forceRoute = true
+        defer { ANEAttentionBackend.forceRoute = saved }
+
         let actual = try #require(ANEAttentionBackend().attend(
             queries: q, keys: k, values: v, scale: scale,
             mask: nil, context: context))
