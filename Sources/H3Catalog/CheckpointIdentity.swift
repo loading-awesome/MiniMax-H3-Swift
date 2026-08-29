@@ -65,6 +65,14 @@ package struct CheckpointIdentity: Sendable, Equatable {
     package let approximationDetail: String?
     package let sizeBytes: UInt64
     package let tensorCount: Int
+    /// A distilled checkpoint's own denoising steps, out of 1000, when it
+    /// declares them. Nil for the base model, which follows the flow schedule.
+    ///
+    /// These are a property of the weights, not a preference: a four-forward
+    /// distill is trained to jump between specific noise levels and cannot be
+    /// asked for twenty steps. The checkpoint is the only thing that knows,
+    /// which is why it travels here rather than in a flag.
+    package let distilledSteps: [Int]?
 
     /// Reads the header only — a few hundred kilobytes, not the 66 GB body.
     ///
@@ -136,10 +144,43 @@ package struct CheckpointIdentity: Sendable, Equatable {
         let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
         let size = (attrs?[.size] as? NSNumber)?.uint64Value ?? 0
 
+        let distilledSteps = meta["dmd_denoising_steps"]
+            .map { $0.split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) } }
+            .flatMap { $0.isEmpty ? nil : $0 }
+
         return CheckpointIdentity(url: url, kind: kind, vendor: vendor, partition: partition,
                                   quantisation: quant, isApproximate: approximate,
                                   approximationDetail: detail, sizeBytes: size,
-                                  tensorCount: header.tensors.count)
+                                  tensorCount: header.tensors.count,
+                                  distilledSteps: distilledSteps)
+    }
+
+    /// The ladder a distilled checkpoint will actually run, honouring an
+    /// override.
+    ///
+    /// The checkpoint's own `[999, 749, 500, 250]` is what the student was
+    /// trained for and stays the default. A denser ladder on the same base grid
+    /// is reachable without a rebuild, which is what this is for.
+    ///
+    /// It is worth saying what a denser ladder does *not* fix, because this
+    /// override was added while chasing the wrong cause. Six rungs appeared to
+    /// clean up robotic audio, and did — but only on a prompt that left the
+    /// speech underspecified. Name the language and give the prompt a line of
+    /// dialogue and four rungs are already clean, so the ladder was never the
+    /// lever. Named to mirror FastVideo's `FASTVIDEO_DMD_DENOISING_STEPS`.
+    package static func distilledSteps(for url: URL) -> [Int]? {
+        // The checkpoint decides *whether* there is a ladder; the override
+        // decides only what it is. Read the other way round, setting this
+        // variable would put a base model on a DMD ladder — four transformer
+        // forwards of weights trained for fifty — and return a video rather
+        // than an error.
+        guard let declared = (try? identify(url: url))?.distilledSteps else { return nil }
+        if let raw = ProcessInfo.processInfo.environment["H3_DMD_DENOISING_STEPS"] {
+            let steps = raw.split(separator: ",")
+                .compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+            if !steps.isEmpty { return steps }
+        }
+        return declared
     }
 
     /// Refuses a checkpoint that cannot be used safely for `mode`.

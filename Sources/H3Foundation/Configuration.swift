@@ -191,7 +191,14 @@ package struct H3Configuration: Codable, Sendable, Equatable {
         H3Configuration(
             checkpoints: .init(
                 root: "/path/to/MiniMax-H3",
+                // `turbo_` keys name the distilled checkpoint for
+                // `--profile turbo`, which is the default. A precision key
+                // names a dtype; the profile prefix names a different model,
+                // and the two must not be filed in the same namespace — a
+                // distill living under plain `bf16` is what made that key name
+                // a model rather than a width.
                 fl2va: ["bf16": "MiniMax-H3-FL2VA_bf16.safetensors",
+                        "turbo_bf16": "FastH3-4step-Dense_bf16.safetensors",
                         "int8": "MiniMax-H3-FL2VA_int8_convrot.safetensors",
                         "pruned_bf16": "MiniMax-H3-FL2VA-pruned_bf16.safetensors",
                         "pruned_int8": "MiniMax-H3-FL2VA-pruned_int8_convrot.safetensors"],

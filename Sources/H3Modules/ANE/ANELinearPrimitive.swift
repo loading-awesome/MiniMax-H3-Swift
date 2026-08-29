@@ -208,8 +208,25 @@ public enum ANELinearBackend {
 
     /// Which window this projection sits in. `qkv` gates attention; everything
     /// else in a block comes after it.
+    /// The video decoder's own share, which is not the DiT's.
+    ///
+    /// Both post-attention shares above assume a window to hide the engine in:
+    /// under query tiling, tile `i-1`'s chain has the GPU's attention on tile
+    /// `i` to overlap. The VAE decoder has no such window. Its 36 blocks are
+    /// strictly sequential, there is no second CFG branch, and the tiles were
+    /// folded into one batch to make the offer large enough to accept — so the
+    /// engine and the GPU race on the same GEMM and the balance is the racing
+    /// one, which sits higher than the DiT's because only `qkv` and `ff1` are
+    /// routable here.
+    ///
+    /// A plateau from 0.50 to 0.62 with a cliff past it; the sweep is in
+    /// docs/ANE.md. `H3_ANE_SHARE_VAE` re-runs it.
+    nonisolated(unsafe) static var vaeShare: Double =
+        envShare("H3_ANE_SHARE") ?? envShare("H3_ANE_SHARE_VAE") ?? 0.56
+
     static func share(for label: String) -> Double {
-        label == "qkv" ? share : postShare
+        if label.hasPrefix("vae ") { return vaeShare }
+        return label == "qkv" ? share : postShare
     }
 
     // MARK: - Shard plan
@@ -974,9 +991,35 @@ public enum ANELinearBackend {
             }
             return best
         }
-        let metal = best(2) { MLX.eval(MLX.matmul(x, weight.transposed())) }
+        // The activation is materialised before either side is timed.
+        //
+        // Without this the first Metal sample pays for computing `x` and the
+        // engine side, which runs second, never does — so the two sides are
+        // not timed on the same work. It matters most exactly where the
+        // verdict matters most: `x` for `attn out` is the attention output, so
+        // the side that goes first absorbs a whole block's attention.
+        MLX.eval(x)
+
+        // One untimed run of each side before sampling either.
+        //
+        // The engine's first call compiles two programs and allocates its
+        // surfaces, and Metal's first call builds a kernel. Neither is paid
+        // again for the rest of the render, so neither belongs in a sample
+        // that decides the whole render's schedule.
+        MLX.eval(MLX.matmul(x, weight.transposed()))
+        guard let warm = start(x: x, weight: weight, share: share, label: label)
+        else {
+            calibrationLock.lock(); routingVerdict[key] = false; calibrationLock.unlock()
+            return false
+        }
+        MLX.eval(Pending(warm).value())
+
+        // Three samples rather than two. With two, this did not decide the
+        // same way twice at one shape, and one unlucky sample switched off a
+        // projection worth having for the whole render.
+        let metal = best(3) { MLX.eval(MLX.matmul(x, weight.transposed())) }
         var routed = Double.infinity
-        for _ in 0 ..< 2 {
+        for _ in 0 ..< 3 {
             let began = Date()
             guard let body = start(x: x, weight: weight, share: share,
                                    label: label) else { routed = .infinity; break }

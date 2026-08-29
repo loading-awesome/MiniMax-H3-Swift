@@ -28,6 +28,42 @@ package struct FlowSchedule: Sendable {
     }
 }
 
+/// A distilled model's own denoising steps, which are not a schedule at all.
+///
+/// A DMD-distilled checkpoint is trained to jump between specific noise levels
+/// rather than to follow a curve, so its steps are a property of the weights.
+/// FastVideo's FastH3 ships them in `fastvideo_inference.json` as diffusers
+/// timesteps out of 1000 — `[999, 749, 500, 250]` for four transformer
+/// forwards — which are already-shifted sigmas and are used directly.
+///
+/// Reading them as base-grid `t` instead would give `[1.0, 0.973, 0.923, 0.80]`
+/// through `sigma(t)`, which never approaches zero and cannot be a four-step
+/// denoise. That is the check if a distilled render comes out as noise.
+package struct DistilledSchedule: Sendable {
+    package let sigmas: [Double]
+
+    /// - Parameter timesteps: the checkpoint's denoising steps, out of 1000.
+    ///   These are points on the **unshifted** grid, so the stream's shift is
+    ///   applied here exactly as `FlowSchedule` does for the base model.
+    ///
+    /// An earlier version used them as sigmas directly, on the reasoning that
+    /// `[1.0, 0.973, 0.923, 0.80]` "never approaches zero and cannot be a
+    /// four-step denoise". That reasoning was wrong, and this file says why one
+    /// line up: with shift 12 the schedule *is* back-loaded, 15 of 20 steps
+    /// covering 1.0 to 0.8 with the last leaping to zero. Staying high and then
+    /// dropping is the normal shape here, not a broken one.
+    package init(timesteps: [Int], shift: Double = H3Shift.video) {
+        precondition(!timesteps.isEmpty, "a distilled schedule needs at least one step")
+        let schedule = FlowSchedule(shift: shift)
+        self.sigmas = timesteps.map { schedule.sigma(t: Double($0) / 1000.0) } + [0.0]
+    }
+
+    /// FastH3 4-step, from `fastvideo_inference.json`.
+    package static let fastH3FourStep = DistilledSchedule(
+        timesteps: [999, 749, 500, 250])
+
+}
+
 /// Mapping one stream's sigma onto another stream's shifted schedule.
 ///
 /// The sampler only ever sees the **video** sigma. The audio stream runs on

@@ -101,9 +101,37 @@ let package = Package(
         // had for some time, so it could not be built by any documented means
         // and nothing noticed.
         .executableTarget(
+            name: "h3-bench-quant",
+            dependencies: [
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXRandom", package: "mlx-swift"),
+            ],
+            path: "Tools/FastH3", exclude: ["bench_vae_decode.swift", "decode_audio_latent.swift", "convert_fasth3.py", "runpod_capture.py", "solve_audio_rule.py", "__pycache__"],
+            sources: ["bench_quant_matmul.swift"]
+        ),
+        .executableTarget(
+            name: "h3-bench-vae",
+            dependencies: [
+                "H3Foundation", "H3Modules",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXRandom", package: "mlx-swift"),
+            ],
+            path: "Tools/FastH3", exclude: ["bench_quant_matmul.swift", "decode_audio_latent.swift", "convert_fasth3.py", "runpod_capture.py", "solve_audio_rule.py", "__pycache__"],
+            sources: ["bench_vae_decode.swift"]
+        ),
+        .executableTarget(
+            name: "h3-decode-audio",
+            dependencies: [
+                "H3Foundation", "H3Modules",
+                .product(name: "MLX", package: "mlx-swift"),
+            ],
+            path: "Tools/FastH3", exclude: ["bench_quant_matmul.swift", "bench_vae_decode.swift", "convert_fasth3.py", "runpod_capture.py", "solve_audio_rule.py", "__pycache__"],
+            sources: ["decode_audio_latent.swift"]
+        ),
+        .executableTarget(
             name: "h3-facecheck",
             dependencies: [.product(name: "ArgumentParser", package: "swift-argument-parser")],
-            path: "Tools", exclude: ["ANE", "LipSyncCheck.swift", "__pycache__", "anchor_check.py", "arm_compare.py", "audio_match.py", "coherence_check.py", "speech_check.py"], sources: ["FaceCheck.swift"]
+            path: "Tools", exclude: ["ANE", "FastH3", "ShapeVet", "LipSyncCheck.swift", "__pycache__", "anchor_check.py", "arm_compare.py", "audio_match.py", "coherence_check.py", "speech_check.py"], sources: ["FaceCheck.swift"]
         ),
         .executableTarget(
             name: "h3-lipsync",
@@ -111,7 +139,7 @@ let package = Package(
                 "H3Foundation", "H3Pipeline",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ],
-            path: "Tools", exclude: ["ANE", "FaceCheck.swift", "__pycache__", "anchor_check.py", "arm_compare.py", "audio_match.py", "coherence_check.py", "speech_check.py"], sources: ["LipSyncCheck.swift"]
+            path: "Tools", exclude: ["ANE", "FastH3", "ShapeVet", "FaceCheck.swift", "__pycache__", "anchor_check.py", "arm_compare.py", "audio_match.py", "coherence_check.py", "speech_check.py"], sources: ["LipSyncCheck.swift"]
         ),
         .testTarget(name: "H3FoundationTests", dependencies: ["H3Foundation"]),
         .testTarget(name: "H3CatalogTests", dependencies: ["H3Catalog"]),

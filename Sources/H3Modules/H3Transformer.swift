@@ -544,7 +544,8 @@ package struct H3Transformer {
                           stepCache: H3StepCache? = nil,
                           stepIndex: Int? = nil,
                           stepCount: Int? = nil,
-                          taps: inout Taps) throws -> (video: MLXArray, audio: MLXArray) {
+                          taps: inout Taps,
+                          scaleAudioVelocity: Bool = true) throws -> (video: MLXArray, audio: MLXArray) {
         let layout = try renderState?.layout ?? PackedLayout(textTokens: context.dim(1), geometry: geometry,
                                                              keyframes: keyframes, refs: refs)
         let plan = TimestepPlan(sigmaVideo: sigmaVideo, segments: layout.segments)
@@ -563,7 +564,7 @@ package struct H3Transformer {
                                               channels: config.videoLatentDim,
                                               patch: config.patchSize)
         let audio = H3Packing.unpackAudio(a)
-        return (-video, MLXArray(-plan.audioSlope) * audio)
+        return (-video, scaleAudioVelocity ? MLXArray(-plan.audioSlope) * audio : -audio)
     }
 
     /// Classifier-free guidance over one sampler step.
@@ -612,7 +613,8 @@ package struct H3Transformer {
                                negativeStepCache: H3StepCache? = nil,
                                stepIndex: Int? = nil,
                                stepCount: Int? = nil,
-                               taps: inout Taps) throws -> (video: MLXArray, audio: MLXArray) {
+                               taps: inout Taps,
+                                scaleAudioVelocity: Bool = true) throws -> (video: MLXArray, audio: MLXArray) {
         // scale 1.0 is the identity; skip the second pass rather than paying
         // 61 s to multiply by one.
         guard scale != 1.0 else {
@@ -623,7 +625,7 @@ package struct H3Transformer {
                                 condVideo: condVideo, condAudio: condAudio,
                                 renderState: renderState,
                                 stepCache: stepCache, stepIndex: stepIndex,
-                                stepCount: stepCount, taps: &taps)
+                                stepCount: stepCount, taps: &taps, scaleAudioVelocity: scaleAudioVelocity)
         }
 
         if ANELinearBackend.isEnabled && ANELinearBackend.cfgOverlapEnabled {
@@ -723,7 +725,8 @@ package struct H3Transformer {
     }
 
     func decodeVelocity(_ heads: (video: MLXArray, audio: MLXArray),
-                        geometry: LatentGeometry, plan: TimestepPlan)
+                        geometry: LatentGeometry, plan: TimestepPlan,
+                        scaleAudioVelocity: Bool = true)
         -> (video: MLXArray, audio: MLXArray) {
         let video = H3Packing.unpatchifyVideo(heads.video, t: geometry.latentT,
                                               h: geometry.latentH / config.patchSize[1],
@@ -731,7 +734,7 @@ package struct H3Transformer {
                                               channels: config.videoLatentDim,
                                               patch: config.patchSize)
         let audio = H3Packing.unpackAudio(heads.audio)
-        return (-video, MLXArray(-plan.audioSlope) * audio)
+        return (-video, scaleAudioVelocity ? MLXArray(-plan.audioSlope) * audio : -audio)
     }
 }
 

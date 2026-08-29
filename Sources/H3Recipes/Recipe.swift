@@ -53,14 +53,35 @@ package struct H3LadderRung: Sendable, Equatable {
     package let portrait: H3RecipeID
 }
 
-/// The recommended output sizes, as one table.
+/// The output-size ladder, derived rather than transcribed.
+///
+/// **This was upstream's recommended-size table and is no longer.** The 14
+/// rungs began as sizes someone else had measured, and were re-derived for the
+/// decoder's tile grid — see below. The names did not change, so a reader who
+/// remembers the old table would otherwise be right to assume these are still
+/// it. The other aspect families keep their single 768p entry precisely
+/// because deriving rungs for them would put invented sizes under names that
+/// do not say so.
 ///
 /// **Every rung is a multiple of 32 on both axes and none of them is exactly
 /// 16:9.** The VAE downsamples by 16 and the DiT patchifies by 2, so 32 is the
 /// grid a render has to land on; forcing 1.778 onto that grid is not possible
 /// at most sizes, and the ladder takes the nearest grid point instead. The
-/// spread is 1.727 (608x352) to 1.810 (1216x672). 864x480 is the closest at
-/// exactly 1.800, which is one more reason it is the shape the port verified.
+/// spread is 1.724 to 1.857.
+///
+/// **The rungs are chosen for the decoder's tile grid, not only for pixels.**
+/// The video VAE cuts fixed 256-pixel tiles with a 64-pixel minimum overlap, so
+/// the tile count steps rather than scales and a dimension just past a step
+/// pays for a whole row or column of tiles it barely uses. Each rung is the
+/// fewest-tile shape within 10% of its megapixel target and inside the aspect
+/// band above, subject to being strictly larger than the rung below it. The
+/// clearest case is 0.4 MP: 864x480 needed 15 tiles where 832x448 needs 8, so
+/// the rung moved and the decode halved for 4% fewer pixels.
+///
+/// **This retired 864x480, which was the verified shape.** Its parity gate and
+/// lip-sync runs do not transfer to 832x448, and `docs/SHAPES.md` records that
+/// the harness has to be re-run rather than pretending the verification moved
+/// with the name.
 ///
 /// **The ladder is a menu, not a promise about cost.** Attention is quadratic
 /// in packed sequence length, so the rungs do not cost what their megapixel
@@ -72,20 +93,20 @@ package struct H3LadderRung: Sendable, Equatable {
 /// argument the 2K entries are kept under.
 package enum H3Ladder {
     package static let rungs: [H3LadderRung] = [
-        .init(megapixels: 0.2,  width: 608,  height: 352,  landscape: .h3_16x9_0p2mp,  portrait: .h3_9x16_0p2mp),
-        .init(megapixels: 0.3,  width: 736,  height: 416,  landscape: .h3_16x9_0p3mp,  portrait: .h3_9x16_0p3mp),
-        .init(megapixels: 0.4,  width: 864,  height: 480,  landscape: .h3_16x9_0p4mp,  portrait: .h3_9x16_0p4mp),
-        .init(megapixels: 0.5,  width: 960,  height: 544,  landscape: .h3_16x9_0p5mp,  portrait: .h3_9x16_0p5mp),
-        .init(megapixels: 0.6,  width: 1056, height: 608,  landscape: .h3_16x9_0p6mp,  portrait: .h3_9x16_0p6mp),
-        .init(megapixels: 0.7,  width: 1152, height: 640,  landscape: .h3_16x9_0p7mp,  portrait: .h3_9x16_0p7mp),
-        .init(megapixels: 0.8,  width: 1216, height: 672,  landscape: .h3_16x9_0p8mp,  portrait: .h3_9x16_0p8mp),
-        .init(megapixels: 0.9,  width: 1280, height: 736,  landscape: .h3_16x9_0p9mp,  portrait: .h3_9x16_0p9mp),
-        .init(megapixels: 0.98, width: 1344, height: 768,  landscape: .h3_16x9_0p98mp, portrait: .h3_9x16_0p98mp),
-        .init(megapixels: 1.0,  width: 1376, height: 768,  landscape: .h3_16x9_1p0mp,  portrait: .h3_9x16_1p0mp),
-        .init(megapixels: 1.2,  width: 1504, height: 832,  landscape: .h3_16x9_1p2mp,  portrait: .h3_9x16_1p2mp),
-        .init(megapixels: 1.5,  width: 1664, height: 928,  landscape: .h3_16x9_1p5mp,  portrait: .h3_9x16_1p5mp),
-        .init(megapixels: 1.8,  width: 1824, height: 1024, landscape: .h3_16x9_1p8mp,  portrait: .h3_9x16_1p8mp),
-        .init(megapixels: 2.0,  width: 1920, height: 1088, landscape: .h3_16x9_2p0mp,  portrait: .h3_9x16_2p0mp),
+        .init(megapixels: 0.2,  width: 608,  height: 352,  landscape: .h3_16x9_0p2mp,    portrait: .h3_9x16_0p2mp),
+        .init(megapixels: 0.3,  width: 768,  height: 416,  landscape: .h3_16x9_0p3mp,    portrait: .h3_9x16_0p3mp),
+        .init(megapixels: 0.4,  width: 832,  height: 448,  landscape: .h3_16x9_0p4mp,    portrait: .h3_9x16_0p4mp),
+        .init(megapixels: 0.5,  width: 992,  height: 544,  landscape: .h3_16x9_0p5mp,    portrait: .h3_9x16_0p5mp),
+        .init(megapixels: 0.6,  width: 1024, height: 576,  landscape: .h3_16x9_0p6mp,    portrait: .h3_9x16_0p6mp),
+        .init(megapixels: 0.7,  width: 1184, height: 640,  landscape: .h3_16x9_0p7mp,    portrait: .h3_9x16_0p7mp),
+        .init(megapixels: 0.8,  width: 1216, height: 704,  landscape: .h3_16x9_0p8mp,    portrait: .h3_9x16_0p8mp),
+        .init(megapixels: 0.9,  width: 1344, height: 736,  landscape: .h3_16x9_0p9mp,    portrait: .h3_9x16_0p9mp),
+        .init(megapixels: 0.98, width: 1376, height: 768,  landscape: .h3_16x9_0p98mp,   portrait: .h3_9x16_0p98mp),
+        .init(megapixels: 1.0,  width: 1408, height: 768,  landscape: .h3_16x9_1p0mp,    portrait: .h3_9x16_1p0mp),
+        .init(megapixels: 1.2,  width: 1408, height: 800,  landscape: .h3_16x9_1p2mp,    portrait: .h3_9x16_1p2mp),
+        .init(megapixels: 1.5,  width: 1600, height: 928,  landscape: .h3_16x9_1p5mp,    portrait: .h3_9x16_1p5mp),
+        .init(megapixels: 1.8,  width: 1792, height: 1024, landscape: .h3_16x9_1p8mp,    portrait: .h3_9x16_1p8mp),
+        .init(megapixels: 2.0,  width: 1888, height: 1024, landscape: .h3_16x9_2p0mp,    portrait: .h3_9x16_2p0mp),
     ]
 
     /// The rung the port has actually verified end to end.
@@ -245,4 +266,51 @@ package struct H3RecipeRegistry {
         }
         return out
     }()
+}
+
+extension H3Ladder {
+    /// What an arbitrary shape costs to decode, and the rung that would cost
+    /// less for no meaningful loss of frame.
+    ///
+    /// **Advice, not a rule.** `--width`/`--height` exists for shapes the ladder
+    /// cannot express, and the most important of those is 864x480 — the shape
+    /// every golden and every measured tolerance uses, and no longer a rung.
+    /// Refusing it would be refusing the only verified configuration this port
+    /// has. So a wasteful shape is reported and rendered.
+    ///
+    /// A rung is only offered when it decodes in fewer tiles *and* keeps at
+    /// least 85% of the pixels, because "smaller is cheaper" is not advice. The
+    /// floor is 85 and not 90 because the case this exists for sits at 89.9%:
+    /// 832x448 against the 864x480 it replaced, 8 tiles against 15. A threshold
+    /// that misses its own motivating example is the wrong threshold.
+    package static func tileAdvice(width: Int, height: Int)
+        -> (tiles: Int, better: (width: Int, height: Int, tiles: Int, pixelRatio: Double)?) {
+        let mine = H3Tiling.tiles(width: width, height: height)
+        let portrait = height > width
+        let pixels = Double(width * height)
+
+        // A rung says nothing about another rung. Neighbours on the ladder sit
+        // close enough that the one below is often within the pixel floor and a
+        // tile cheaper — 2.0 MP would be told to be 1.8 MP, forever. A caller
+        // who named a rung has already made this trade; only a shape off the
+        // ladder has not.
+        let isRung = rungs.contains {
+            ($0.width, $0.height) == (width, height) || ($0.height, $0.width) == (width, height)
+        }
+        guard !isRung else { return (mine, nil) }
+
+        var best: (width: Int, height: Int, tiles: Int, pixelRatio: Double)?
+        for rung in rungs {
+            let (w, h) = portrait ? (rung.height, rung.width) : (rung.width, rung.height)
+            let t = H3Tiling.tiles(width: w, height: h)
+            guard t < mine else { continue }
+            let ratio = Double(w * h) / pixels
+            guard ratio >= 0.85 else { continue }
+            // Fewest tiles first, then the most pixels among those.
+            if best == nil || t < best!.tiles || (t == best!.tiles && ratio > best!.pixelRatio) {
+                best = (w, h, t, ratio)
+            }
+        }
+        return (mine, best)
+    }
 }

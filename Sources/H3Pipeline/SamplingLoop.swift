@@ -49,18 +49,35 @@ enum SamplingLoop {
                                            geometry.latentH, geometry.latentW])
         let noiseAudio = MLXRandom.normal([1, 32, 2, geometry.audioT])
 
+        // A distilled checkpoint carries its own denoising steps; the flow
+        // schedule does not apply to it. See `DistilledSchedule`.
         let schedule = FlowSchedule(shift: H3Shift.video)
-        let sigmas = schedule.sigmas(steps: request.steps)
+        let distilled = request.distilledSteps.map { DistilledSchedule(timesteps: $0) }
+        let sigmas = distilled?.sigmas ?? schedule.sigmas(steps: request.steps)
+        // The loop is bound to the schedule, not to `request.steps`: a
+        // distilled checkpoint decides its own count, and indexing a four-entry
+        // schedule with a twenty-step request runs off the end.
+        let steps = sigmas.count - 1
+        if let distilled {
+            log("  distilled schedule: \(steps) forwards at "
+                + distilled.sigmas.dropLast().map { String(format: "%.3f", $0) }
+                    .joined(separator: ", "))
+        }
 
         // One cache per conditioning stream. Under CFG the two forwards see
         // different conditioning, so their block-0 residuals are not comparable
         // and a shared cache would reuse across that gap.
-        let cache = request.cacheThreshold > 0
+        // The reference DMD loop has no cross-step cache, and a distilled
+        // ladder gives it nothing to work with anyway: consecutive DMD steps
+        // differ by ~0.64 against the 0.1 reuse threshold, so the probe never
+        // fires. Disabled outright rather than left inert -- on a 4-step
+        // ladder one silent reuse would skip a quarter of all denoising.
+        let cache = distilled == nil && request.cacheThreshold > 0
             ? H3StepCache(threshold: request.cacheThreshold,
                           maxConsecutiveSkips: RenderRequest.cacheMaxSkips,
                           branch: .conditional)
             : nil
-        let negativeCache = (request.cacheThreshold > 0 && request.cfgScale > 1.0)
+        let negativeCache = (distilled == nil && request.cacheThreshold > 0 && request.cfgScale > 1.0)
             ? H3StepCache(threshold: request.cacheThreshold,
                           maxConsecutiveSkips: RenderRequest.cacheMaxSkips,
                           branch: .unconditional)
@@ -98,12 +115,20 @@ enum SamplingLoop {
         let videoSampler = Sampler()
         let audioSampler = Sampler()
 
+        let capture = TrajectoryCapture(log: log)
+        if let capture {
+            capture.note("sigmas \(sigmas.map { String(format: "%.6f", $0) }.joined(separator: " "))")
+            capture.note("video_shape \(currentVideo.shape)  audio_shape \(currentAudio.shape)")
+            capture.write(currentVideo, "initial.video_noise")
+            capture.write(currentAudio, "initial.audio_noise")
+        }
+
         var stepSeconds: [Double] = []
-        for i in 0 ..< request.steps {
+        for i in 0 ..< steps {
             let stepBegan = Date()
             if cancellation?.isCancelled == true {
                 throw RenderCancelled(phase: .sampling,
-                                      detail: "after \(i) of \(request.steps) step(s)")
+                                      detail: "after \(i) of \(steps) step(s)")
             }
             let sigma = Float(sigmas[i])
             let sigmaNext = Float(sigmas[i + 1])
@@ -120,17 +145,103 @@ enum SamplingLoop {
                 condVideo: conditions.videoRows, condAudio: conditions.audioRows,
                 renderState: renderState, negativeRenderState: negativeRenderState,
                 stepCache: cache, negativeStepCache: negativeCache,
-                stepIndex: i, stepCount: request.steps, taps: &taps)
+                stepIndex: i, stepCount: steps, taps: &taps,
+                // The reference scheduler consumes the RAW per-stream output;
+                // the slope scaling exists for the ODE path, which integrates
+                // audio in video-sigma space. Scaling in bf16 and dividing it
+                // back out here was a multiply-round-divide the reference
+                // never performs -- ~0.4% multiplicative noise on every audio
+                // velocity, absent from every pipeline whose audio is clean.
+                scaleAudioVelocity: distilled == nil)
+
+            if let capture {
+                // Latents BEFORE the update and velocities as the model
+                // returned them: the pair that separates a sampler fault from
+                // a forward-pass fault at each rung.
+                eval(currentVideo, currentAudio, videoVelocity, audioVelocity)
+                capture.write(currentVideo, "step\(i).video_latent_in")
+                capture.write(currentAudio, "step\(i).audio_latent_in")
+                capture.write(videoVelocity, "step\(i).video_velocity")
+                capture.write(audioVelocity, "step\(i).audio_velocity")
+                capture.note("step \(i) sigma \(sigma) sigma_next \(sigmaNext)")
+            }
 
             let videoDenoised = currentVideo - videoVelocity * MLXArray(sigma)
             let audioDenoised = currentAudio - audioVelocity * MLXArray(sigma)
 
-            currentVideo = videoSampler.step(x: currentVideo, denoised: videoDenoised,
-                                             sigma: sigma, sigmaNext: sigmaNext,
-                                             prevSigma: prevSigma)
-            currentAudio = audioSampler.step(x: currentAudio, denoised: audioDenoised,
-                                             sigma: sigma, sigmaNext: sigmaNext,
-                                             prevSigma: prevSigma)
+            if distilled != nil {
+                // **A distilled checkpoint is not integrated, it is iterated.**
+                // DMD2's multi-step inference alternates denoising with noise
+                // *injection*, following consistency models: each step predicts
+                // x0 from scratch and is re-noised to the next level with fresh
+                // Gaussian noise. It is not a trajectory through an ODE.
+                //
+                // Running these four timesteps through `res_multistep` — a
+                // second-order integrator that also carries state between steps
+                // — produces a coherent-looking render that is incoherent to
+                // watch, which is how this was found.
+                //
+                // For flow matching, `x_sigma = (1 - sigma) * x0 + sigma * eps`,
+                // so re-noising to `sigmaNext` is that identity applied to the
+                // prediction.
+                // **The audio stream is not at the video's sigma.** It runs on
+                // shift 3 where video runs on 12, and the model returns its
+                // velocity already scaled by `d(sigma_a)/d(sigma_v)` so that
+                // integrating in video-sigma space is correct.
+                //
+                // The ODE path is immune to both facts: it only uses `denoised`
+                // to recover `(x - denoised)/sigma`, and the scaling cancels.
+                // Re-noising does not cancel it. Using the video sigma and the
+                // scaled velocity here treats a quantity that is not x0 as if
+                // it were, and re-noises it to the wrong level -- which comes
+                // out as garbled audio over a perfectly good picture.
+                let sigmaAudio = SigmaMap.shift(sigma, from: Float(H3Shift.video),
+                                                to: Float(H3Shift.audio))
+                let audioX0 = currentAudio - audioVelocity * MLXArray(sigmaAudio)
+
+                // **The reference DMD step is deterministic, and it carries the
+                // noise.** FastVideo's published mode (`dmd_stochastic_renoise`
+                // defaults false) advances each stream with its own scheduler:
+                //
+                //     x0   = x + sigma * raw          (per-stream sigma, raw output)
+                //     next = (s_next/s) * x + (1 - s_next/s) * x0
+                //
+                // which is algebraically `(1 - s_next) * x0 + s_next * eps` with
+                // the SAME eps the latent already carries -- DDIM-style, not a
+                // re-noise.
+                //
+                // This is confirmed against the reference's own tensors rather
+                // than by ear: `Tools/FastH3/solve_audio_rule.py` fits
+                // `x_next = a*x + b*v` over their dumps and recovers a = 1.0
+                // with b equal to each stream's own sigma gap, residual 3.6e-08.
+                // That matters because the ear was the original instrument and
+                // it was unreliable -- the robotic audio that motivated three
+                // rewrites of this branch turned out to be an underspecified
+                // prompt, so any variant judged "wrong by listening" was judged
+                // under a confound.
+                //
+                // The arithmetic still rules one alternative out on its own
+                // terms: velocity Euler in video-sigma space overshoots the
+                // audio ladder by 9% on the first rung and 150% on the last,
+                // because the slope at a rung's start is not the secant across
+                // a giant step. At sigmaNext == 0 the ratio is 0 and the step
+                // reduces to x0 exactly, so the last rung needs no branch.
+                let ratioVideo = sigmaNext / sigma
+                currentVideo = MLXArray(ratioVideo) * currentVideo
+                    + MLXArray(1 - ratioVideo) * videoDenoised
+                let sigmaAudioNext = SigmaMap.shift(sigmaNext, from: Float(H3Shift.video),
+                                                    to: Float(H3Shift.audio))
+                let ratioAudio = sigmaAudio > 0 ? sigmaAudioNext / sigmaAudio : 0
+                currentAudio = MLXArray(ratioAudio) * currentAudio
+                    + MLXArray(1 - ratioAudio) * audioX0
+            } else {
+                currentVideo = videoSampler.step(x: currentVideo, denoised: videoDenoised,
+                                                 sigma: sigma, sigmaNext: sigmaNext,
+                                                 prevSigma: prevSigma)
+                currentAudio = audioSampler.step(x: currentAudio, denoised: audioDenoised,
+                                                 sigma: sigma, sigmaNext: sigmaNext,
+                                                 prevSigma: prevSigma)
+            }
             // The clock stops **after** this eval, and that placement is the
             // whole reason the timings mean anything. MLX is lazy: the sampler
             // step above builds a graph and returns, so a clock stopped before
@@ -141,7 +252,12 @@ enum SamplingLoop {
             // somewhere else rather than saved it.
             eval(currentVideo, currentAudio)
             stepSeconds.append(Date().timeIntervalSince(stepBegan))
-            onStep(i + 1, request.steps)
+            onStep(i + 1, steps)
+        }
+
+        if let capture {
+            capture.write(currentVideo, "final.video_latent")
+            capture.write(currentAudio, "final.audio_latent")
         }
 
         // Both branches' traces, kept as separate rows rather than merged. Under

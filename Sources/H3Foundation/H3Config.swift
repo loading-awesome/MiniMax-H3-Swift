@@ -82,3 +82,103 @@ package enum H3Video {
     /// above is untested. 124 frames is about 5s at 24fps.
     package static let trainedFrameRange: ClosedRange<Int> = 124...362
 }
+
+/// Which model answers a render, and therefore how many steps it takes.
+///
+/// These are two different checkpoints, not two settings on one. `turbo` is a
+/// DMD-distilled student that jumps between four fixed noise levels — its step
+/// count is a property of its weights, not a preference, so `--steps` does not
+/// apply to it. `standard` is the base model following the flow schedule at
+/// whatever step count is asked for, which is where the step cache earns its
+/// keep: at four rungs warmup and cooldown already cover every step, and only a
+/// longer schedule leaves anything for it to skip.
+///
+/// They are addressed in the configuration by a key prefix on the same
+/// per-partition table the precision uses, so `turbo` at `bf16` reads
+/// `turbo_bf16`. A distilled checkpoint filed under a plain precision key would
+/// make `bf16` name a model rather than a dtype, which is exactly the confusion
+/// this enum exists to end.
+package enum H3RenderProfile: String, Sendable, CaseIterable, Codable {
+    case turbo
+    case standard
+
+    /// The configuration key this profile reads for a given precision.
+    package func checkpointKey(precision: String) -> String {
+        self == .turbo ? "turbo_\(precision)" : precision
+    }
+
+    /// The step count to use when the caller did not ask for one. A distilled
+    /// checkpoint overrides this from its own metadata; the base model does not.
+    package var defaultSteps: Int { self == .turbo ? 4 : 20 }
+
+    /// Whether this profile needs a checkpoint that carries its own ladder.
+    package var requiresDistilled: Bool { self == .turbo }
+
+    /// Refuses a checkpoint the profile cannot sample correctly.
+    ///
+    /// **Both directions are silent failures, which is why this is a refusal
+    /// rather than a warning.** A base model on the turbo path takes four
+    /// transformer forwards of weights trained for fifty. A distilled model on
+    /// the standard path has its step count overridden by its own metadata, so
+    /// `--steps 20` yields four and a receipt that agrees with itself while
+    /// disagreeing with the caller. Neither produces a wrong shape, an
+    /// exception, or anything else the pipeline would notice — only a worse
+    /// video, which is the class of fault this codebase exists to catch early.
+    ///
+    /// Called after the checkpoint header is read and before its 66 GB body is,
+    /// so the cost of being wrong is a second rather than a load.
+    package func validate(declaresDistilledSteps: Bool, checkpoint: String) throws {
+        guard declaresDistilledSteps != requiresDistilled else { return }
+        if requiresDistilled {
+            throw H3Error.invalidRequest(
+                rule: "--profile turbo needs a distilled checkpoint",
+                detail: "\(checkpoint) declares no denoising steps, so it is a base "
+                      + "model. Sampling it at four steps would return a video made "
+                      + "with a twentieth of the compute it was trained for.",
+                remedy: "render with --profile standard, or point the "
+                      + "'turbo_<precision>' entry at a distilled checkpoint")
+        }
+        throw H3Error.invalidRequest(
+            rule: "--profile standard needs a base checkpoint",
+            detail: "\(checkpoint) carries its own denoising steps, so it is a "
+                  + "distill and would ignore the requested step count.",
+            remedy: "render with --profile turbo, or point the '<precision>' entry "
+                  + "at a base checkpoint — `h3 doctor` names the file to move")
+    }
+}
+
+/// How the video decoder cuts a frame into tiles.
+///
+/// The rule lives here, below everything that needs it, because three places
+/// already had to know it: the decoder that does the cutting, the planner that
+/// prices a shape, and the ladder that is derived from it. A copy per caller is
+/// a rule that drifts, and this one is not obvious enough to re-derive
+/// correctly from memory — the tile count *steps*, so a frame one pixel past a
+/// boundary pays for a whole row or column it barely uses.
+package enum H3Tiling {
+    /// The decoder's fixed tile edge, in pixels.
+    package static let tileSize = 256
+    /// The smallest overlap the blender needs between neighbouring tiles.
+    package static let minimumOverlap = 64
+
+    /// Tiles along one axis, matching `VideoVAE.splitTiles`.
+    package static func tiles(length: Int) -> Int {
+        guard length > tileSize else { return 1 }
+        var n = Int((Double(length) / Double(tileSize)).rounded(.up))
+        while tileSize * n - minimumOverlap * (n - 1) - length < 0 { n += 1 }
+        return n
+    }
+
+    /// Tiles in the whole grid. Every one is a separate pass through the
+    /// decoder's 36 blocks, so this is the decode's cost in the only unit that
+    /// matters.
+    package static func tiles(width: Int, height: Int) -> Int {
+        tiles(length: width) * tiles(length: height)
+    }
+
+    /// The largest length a given tile count covers, which is where a dimension
+    /// should sit to pay for nothing it does not use.
+    package static func largestLength(tiles n: Int) -> Int {
+        tileSize + (tileSize - minimumOverlap) * (n - 1)
+    }
+}

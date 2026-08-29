@@ -7,6 +7,28 @@ import MLXNN
 import MLXFast
 import H3Foundation
 
+/// A linear over a `[batch, sequence, k]` activation, offered to the engine.
+///
+/// `ANELinearBackend` takes a 2-D activation and decides per shape whether the
+/// engine beats Metal — it races them once and caches the verdict — so the
+/// only thing this has to get right is making the offer worth taking. Folding
+/// the batch into the row count is what does that: one tile is 1800 rows,
+/// far too few to amortise an upload measured at tens of milliseconds, while a
+/// chunk's eight tiles together are 14,400. That is a multiple of 64 and sits
+/// beside the 15,731 at which the engine measured 3.87 TFLOP/s a die; the
+/// sequence-length cliffs in `ANELinearPrimitive` are why the multiple of 64
+/// is worth having rather than incidental.
+private func vaeLinear(_ x: MLXArray, _ weight: MLXArray, _ bias: MLXArray,
+                       label: String) -> MLXArray {
+    guard ANELinearBackend.isEnabled, x.ndim == 3 else {
+        return matmul(x, weight.T) + bias
+    }
+    let batch = x.dim(0), sequence = x.dim(1), k = x.dim(2)
+    let routed = ANELinearBackend.project(
+        x: x.reshaped([batch * sequence, k]), weight: weight, label: label)
+    return routed.reshaped([batch, sequence, weight.dim(0)]) + bias
+}
+
 struct VaeRMSNorm {
     let weight: MLXArray?
     let eps: Float
@@ -92,7 +114,7 @@ struct VaeAttention {
         let B = x.dim(0)
         let S = x.dim(1)
         
-        let qkv = matmul(x, toQkvWeight.T) + toQkvBias
+        let qkv = vaeLinear(x, toQkvWeight, toQkvBias, label: "vae qkv")
         let reshaped = qkv.reshaped([B, S, heads, 3 * dimHead])
         
         let query = reshaped[0..., 0..., 0..., 0 ..< dimHead]
@@ -137,7 +159,7 @@ struct VaeAttention {
         )
         
         let merged = out.transposed(0, 2, 1, 3).reshaped([B, S, heads * dimHead])
-        return matmul(merged, toOutWeight.T) + toOutBias
+        return vaeLinear(merged, toOutWeight, toOutBias, label: "vae attn out")
     }
 }
 
@@ -148,10 +170,14 @@ struct VaeFeedForward {
     let w2Bias: MLXArray
     
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        let h = matmul(x, w1Weight.T) + w1Bias
+        let h = vaeLinear(x, w1Weight, w1Bias, label: "vae ff1")
         let innerDim = h.dim(-1) / 2
         let gate = h[0..., 0..., 0 ..< innerDim]
         let up = h[0..., 0..., innerDim...]
+        // w2 stays on the GPU. Not saturation — it routes correctly — but
+        // contention: qkv and ff1 already keep both dies busy, and a third
+        // projection in the same sequential chain has no window to hide its
+        // upload in. Measured in docs/ANE.md.
         return matmul(silu(gate) * up, w2Weight.T) + w2Bias
     }
 }
@@ -361,18 +387,10 @@ package final class VideoVAE {
         if tileSize >= inputLen {
             return ([0], [inputLen], [])
         }
-        var N = Int(ceil(Double(inputLen) / Double(tileSize)))
-        var overlaps: [Int] = []
-        while true {
-            overlaps = Array(repeating: tileOverlapMin, count: N - 1)
-            let sumOverlaps = overlaps.reduce(0, +)
-            let remaining = tileSize * N - sumOverlaps - inputLen
-            if remaining < 0 {
-                N += 1
-            } else {
-                break
-            }
-        }
+        // The count comes from `H3Tiling`, which the planner and the ladder also
+        // read. The overlap distribution below is this function's own business.
+        let N = H3Tiling.tiles(length: inputLen)
+        var overlaps = Array(repeating: tileOverlapMin, count: N - 1)
         let remaining = tileSize * N - overlaps.reduce(0, +) - inputLen
         let remainingUnits = remaining / vaeRatio
         for i in 0 ..< remainingUnits {
@@ -434,30 +452,43 @@ package final class VideoVAE {
         return array[indices]
     }
     
-    package func tiledDecode(_ z: MLXArray) -> MLXArray {
+    /// The spatial slices one clip decodes into, every one cut to the same size.
+    package func tileSlices(_ z: MLXArray) -> [MLXArray] {
         let vaeRatio = 16
-        let height = z.dim(-2) * vaeRatio
-        let width = z.dim(-1) * vaeRatio
-        
-        let (yIdx, yLen, yOverlap) = splitTiles(inputLen: height)
-        let (xIdx, xLen, xOverlap) = splitTiles(inputLen: width)
-        
+        let (yIdx, yLen, _) = splitTiles(inputLen: z.dim(-2) * vaeRatio)
+        let (xIdx, xLen, _) = splitTiles(inputLen: z.dim(-1) * vaeRatio)
+        var slices: [MLXArray] = []
+        for (iPos, iLen) in zip(yIdx, yLen) {
+            let zi = iPos / vaeRatio, zl = iLen / vaeRatio
+            for (jPos, jLen) in zip(xIdx, xLen) {
+                let zj = jPos / vaeRatio, zw = jLen / vaeRatio
+                slices.append(z[0..., 0..., 0..., zi ..< (zi + zl), zj ..< (zj + zw)])
+            }
+        }
+        return slices
+    }
+
+    /// Reassemble one clip from its decoded tiles, blending the overlaps.
+    ///
+    /// Separated from the decode itself so the decode can be hoisted: every
+    /// tile of every temporal chunk is the same shape, so all of them go
+    /// through the transformer as one batch and come back here per clip. The
+    /// blending is unchanged and still runs tile by tile, because it depends
+    /// on neighbours in a fixed order.
+    package func assembleTiles(_ tiles: [MLXArray], height: Int, width: Int) -> MLXArray {
+        let (yIdx, _, yOverlap) = splitTiles(inputLen: height)
+        let (xIdx, _, xOverlap) = splitTiles(inputLen: width)
+
         var rowTensors: [MLXArray] = []
         var rowTails: [MLXArray] = []
         
-        for (i, (iPos, iLen)) in zip(yIdx, yLen).enumerated() {
-            let zi = iPos / vaeRatio
-            let zl = iLen / vaeRatio
+        for i in 0 ..< yIdx.count {
             var newTails: [MLXArray] = []
             var leftTail: MLXArray? = nil
             var rowTiles: [MLXArray] = []
             
-            for (j, (jPos, jLen)) in zip(xIdx, xLen).enumerated() {
-                let zj = jPos / vaeRatio
-                let zw = jLen / vaeRatio
-                
-                let zSlice = z[0..., 0..., 0..., zi ..< (zi + zl), zj ..< (zj + zw)]
-                var tile = decodePixels(zSlice)
+            for j in 0 ..< xIdx.count {
+                var tile = tiles[i * xIdx.count + j]
                 
                 if i < yIdx.count - 1 {
                     let overlapY = yOverlap[i]
@@ -498,7 +529,17 @@ package final class VideoVAE {
         
         return concatenated(rowTensors, axis: -2)
     }
-    
+
+    /// Decode one clip on its own. The batched path in `decodeTemporal` is what
+    /// production uses; this stays for the single-frame case and for callers
+    /// that have one clip to decode.
+    package func tiledDecode(_ z: MLXArray) -> MLXArray {
+        let slices = tileSlices(z)
+        let decoded = decodePixels(concatenated(slices, axis: 0))
+        return assembleTiles(decoded.split(parts: slices.count, axis: 0),
+                             height: z.dim(-2) * 16, width: z.dim(-1) * 16)
+    }
+
     package func decodeTemporalPadFrames(zLen: Int, padTokens: Int) -> Int {
         if padTokens <= 0 { return 0 }
         let clipLength = 17
@@ -601,12 +642,22 @@ package final class VideoVAE {
         
         var decOverlap: MLXArray? = nil
         
+        // One chunk's tiles decode as one batch, and that batch is deliberately
+        // not made wider.
+        //
+        // Batching is what lets the engine take the work at all: `project`
+        // needs a 2-D activation and declines a row count too small to
+        // amortise its upload, so one tile's 1800 rows are refused where one
+        // chunk's grid of 14,376 is taken. But wider is worse, twice over. The
+        // activation is uploaded transposed as `[k, s]`, so `s` becomes the
+        // IOSurface's width and the engine simply fails to build past roughly
+        // 80,000 — every projection then silently falls back to Metal. And
+        // even at a width that does build, it is slower. So the batch is
+        // exactly one chunk; the sweep behind that is in docs/ANE.md.
         for i in 0 ..< numChunks {
             let tStartIdx = i * tokensChunkSize
             let tEndIdx = tStartIdx + tokensChunkSize + tokenOverlap
-            let clipZ = z[0..., 0..., tStartIdx ..< tEndIdx, 0..., 0...]
-            
-            let clipDec = tiledDecode(clipZ)
+            let clipDec = tiledDecode(z[0..., 0..., tStartIdx ..< tEndIdx, 0..., 0...])
             
             for j in 0 ..< splitCount {
                 let fStartIdx = j * chunkDec

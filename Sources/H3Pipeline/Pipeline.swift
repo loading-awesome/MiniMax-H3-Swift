@@ -3,6 +3,7 @@
 
 import Foundation
 import MLX
+import H3Catalog
 import H3Foundation
 import H3Hardware
 import H3Attention
@@ -254,6 +255,22 @@ package enum PipelineRuntime {
                                       backend: selection.backend)
         timings.modelLoad = Date().timeIntervalSince(phase)
         reportMemory("after the DiT load", log: log)
+
+        // A distilled schedule is resolved in `RenderEngine.execute`, before the
+        // request is staged, so that the receipt and the estimate see the count
+        // that will actually run. Belt and braces: a caller reaching this
+        // directly still gets it, because the sampler must never guess.
+        var request = request
+        // A debugging escape: run a distilled checkpoint as if it were the base
+        // model, to separate a weight-conversion fault from a sampler fault.
+        let ignoreDistilled =
+            ProcessInfo.processInfo.environment["H3_IGNORE_DISTILLED"] == "1"
+        if ignoreDistilled { request.distilledSteps = nil }
+        if !ignoreDistilled, request.distilledSteps == nil,
+           let steps = CheckpointIdentity.distilledSteps(for: checkpoints.dit) {
+            request.distilledSteps = steps
+            request.steps = steps.count
+        }
 
         phase = Date()
         let sampled = try SamplingLoop.run(

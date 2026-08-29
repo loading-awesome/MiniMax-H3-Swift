@@ -91,8 +91,15 @@ struct Doctor: ParsableCommand {
                 if id.kind == .dit && id.vendor == nil { problems += 1 }
             case .failure(let e):
                 problems += 1
-                print("  \(role.padding(toLength: 24, withPad: " ", startingAt: 0))MISSING  \(path)")
-                _ = e
+                // Not every failure is absence. A file can be present and
+                // filed under the wrong key — wrong partition, or a base model
+                // where a distill was promised — and calling that "MISSING"
+                // sends the reader looking for a download they already have.
+                let label = role.padding(toLength: 24, withPad: " ", startingAt: 0)
+                let exists = FileManager.default.fileExists(atPath: path)
+                let reason = (e as? H3Error)?.errorDescription ?? String(describing: e)
+                print("  \(label)\(exists ? "WRONG" : "MISSING")  \(path)")
+                if exists { print("  \(String(repeating: " ", count: 24))\(reason)") }
             }
         }
 
@@ -135,6 +142,37 @@ struct Doctor: ParsableCommand {
             print("\nNo configuration fits this machine at \(tokens) packed tokens.")
             print("Activations scale with sequence length and attention is quadratic in it, so a")
             print("smaller checkpoint alone will not help — reduce resolution or duration too.")
+        }
+
+        // ---- profiles
+        //
+        // The inventory above proves the files exist and are what they claim.
+        // This answers the question a caller actually has, which is whether
+        // `--profile turbo` will run: it needs a `turbo_` entry at the selected
+        // precision, and a configuration written before the profiles existed
+        // has none. Reported per mode, because the two partitions are separately
+        // configured and ref2va is routinely missing the turbo half.
+        let selected = MemoryPlan.best(packedTokens: tokens, availableBytes: available,
+                                       allowApproximate: cfg.policy.allowApproximateWeights)?
+            .precision.rawValue
+        if let precision = selected {
+            print("\nprofiles at \(precision)")
+            for mode in [RenderMode.textToVideo, .reference] {
+                for profile in H3RenderProfile.allCases {
+                    let key = profile.checkpointKey(precision: precision)
+                    let table = mode.requiredPartition == .ref2va
+                        ? cfg.checkpoints.ref2va : cfg.checkpoints.fl2va
+                    let name = "\(mode.rawValue)/\(profile.rawValue)"
+                        .padding(toLength: 20, withPad: " ", startingAt: 0)
+                    if table[key] != nil {
+                        print("  \(name)\(profile.defaultSteps) steps, \(key)")
+                    } else {
+                        // Not a problem for the ref2va half of a text-to-video
+                        // setup, so it is stated rather than counted.
+                        print("  \(name)unavailable — no '\(key)' entry")
+                    }
+                }
+            }
         }
 
         print("")

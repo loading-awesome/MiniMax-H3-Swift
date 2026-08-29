@@ -4,10 +4,15 @@ Both ANE dies run alongside Metal during sampling. On an M3 Ultra at
 864x480x124, 20 steps, this is **1.22x end to end** and 1.28x on the steps that
 run the full stack.
 
-Opt in with `H3_ANE=experimental` for the linear projections and
-`H3_ANE_ATTENTION=1` plus `--attention ane` for attention. `H3_ANE_FC2=1` adds
-`fc2`, which is separate because its per-block scales are calibrated against one
-prompt at one shape.
+Opt in with `H3_ANE=experimental` for the linear projections. `H3_ANE_FC2=1`
+adds `fc2`, which is separate because its per-block scales are calibrated
+against one prompt at one shape. `H3_ANE_ATTENTION=1` plus `--attention ane`
+adds attention, and **is shape-dependent in sign**: it is the 1.042x below at
+864x480 over 20 steps and costs about 15 s at 448x832 on the four-step distill.
+Measure before enabling it.
+
+The video decode routes too, and needs no opt-in beyond `H3_ANE=experimental` —
+see "The video decoder" below.
 
 ## What runs where
 
@@ -22,6 +27,146 @@ crosses a device boundary — only Q/K/V and finished head outputs do.
     + qkv, attn out, fc1             24.48       46.28     1.158x
     + fc2                            24.10       44.99     1.176x
     + split-k 4                      23.17       43.26     1.223x
+
+## Every number here is one shape, including these
+
+The table above is 864x480x124 at 20 steps. Re-measured at 448x832x124 on the
+four-step distill, two of its conclusions invert. This section is what changed
+and how it was established, because the failure mode is not a wrong number — it
+is a right number quoted at the wrong shape.
+
+### Attention reverses sign
+
+    Metal attention   166.9  all four projections routed
+                      173.7  all four routed
+                      174.5  three routed
+                      188.1  two routed
+    ANE attention     184.6  all four routed
+                      185.5  all four routed
+                      186.6  all four routed
+
+Comparing like for like — runs where the calibration accepted the same four
+projections — ANE attention costs about 15 s here, 170.3 against 185.6. Leave
+`H3_ANE_ATTENTION` unset at this shape.
+
+The backend itself behaves correctly. It calibrates once and refuses:
+
+    calibrate S=13938 D=128 H=56: engine(8) 673 ms, gpu(48) 282 ms,
+    routed 673 vs unrouted 330 -> DECLINE
+
+Every later call is served from the refusal cache, and the two renders are
+bit-identical — PSNR inf, not merely close — so the attention arithmetic is
+provably untouched. **What a backend that computes nothing is costing has not
+been found.** Ruled out: the decline path (early guards and a dictionary
+lookup), the SDPA call itself (`SDPABackend.attend` and the fallback issue the
+same 4-D call on the same shapes), and schedule selection (nothing outside
+`AttentionBackend.swift` reads `isAvailable`).
+
+### The projections are worth 13.7%, not 4.3%
+
+Engine off, 193.3 s of sampling; engine on, 166.9-177. An earlier reading of
+4.3% came from comparing two ANE-*attention* runs against an engine-off run,
+which charged the attention regression to the projections.
+
+### One run of each proves nothing at this shape
+
+A first pass claimed the attention cost was 18.6 s, from a single pair, with the
+caveat about drift already on the record. Repeats put the Metal side across a
+21 s span that overlaps the ANE runs entirely. The conclusion survived at 15 s;
+the confidence did not. **Three runs minimum, and hold the routed set fixed
+when comparing** — it moves on its own, as the next section explains.
+
+## The routing calibration, and why it needed settling
+
+`routingBeatsMetal` races the engine against Metal once per shape and caches the
+verdict. At 448x832 it did not decide the same way twice: four otherwise
+identical renders accepted four projections, then four, then three, then two,
+and sampling tracked it — 166.9 and 173.7 s with four against 188.1 with two. A
+render's speed depended on how a millisecond race fell out during its first
+block.
+
+Two things made that race unrepresentative. It took `best(2)` of each side, so
+the activation was already materialised by the time the routed side ran and the
+wait that dominates in production — `start` calls `eval` on an activation whose
+input is the attention output — was never paid. And it raced one projection
+alone, with both dies idle, rather than against the others contending for them.
+
+Three changes settle it: materialise the activation before either side is
+timed, give each side one untimed run first (program compile, kernel build),
+and sample three times instead of two.
+
+    before  166.9  173.7  174.5  188.1   mean 175.8  spread 21.2
+    after   175.0  176.4  176.5  177.2   mean 176.3  spread  2.2
+
+**This buys predictability, not speed.** The mean does not move; what is gone is
+a render arriving 12 s slow for a reason no user could see. All four runs now
+route all four projections. It does not explain everything: the 166.9 s run
+routed all four as well, so the routing set accounts for the slow tail and not
+for that fast outlier, which remains unexplained.
+
+## The phase report cannot attribute attention
+
+`H3_ANE_PHASES=1` reports upload / wait / join per projection, and its upload
+column absorbs whatever the activation depends on, because `start` materialises
+and evals it. With ANE attention, `attn out` carries a 360 ms materialise; with
+Metal attention, that cost moves to `fc1` at 417 ms. It belongs to neither.
+**Whichever routed projection runs first after attention absorbs the wait for
+it**, so attention's cost is always billed to a projection. Read the column as
+"time until this projection's input existed", not as transfer cost.
+
+## The video decoder
+
+The VAE decoder routes `vae qkv` and `vae ff1`, worth 1.17x on the decode
+(31.80 s to 27.10 s at 448x832; 40.1 s to 33.5 s in a real render).
+
+Batching is what makes it possible rather than what makes it fast. `project`
+needs a 2-D activation and declines a row count too small to amortise its
+upload, so one tile's 1800 rows are refused where one chunk's grid of 14,376 is
+taken. Batching alone is worth 8% — a single tile already saturates the GPU.
+
+The batch is exactly one chunk, deliberately. The activation uploads transposed
+as `[k, s]`, so `s` becomes the IOSurface width and the engine fails to build
+past roughly 80,000 rows — every projection then falls back silently. Even
+widths that do build are slower: 1 chunk 27.28 s, 2 29.39, 3 29.95, 6 33.15.
+
+The decoder needs its own column share. Both post-attention shares below assume
+a window to hide the engine in — tile `i-1`'s chain overlapping the GPU's
+attention on tile `i` — and the decoder has none: 36 strictly sequential blocks,
+no second CFG branch, so the engine and the GPU race. Plateau 0.50 to 0.62 with
+a cliff past it, so `vaeShare` is 0.56; `H3_ANE_SHARE_VAE` sweeps it.
+
+Two projections stay on Metal. `vae attn out` loses its own race at every shape
+offered — 3.3 ms against 1.7 at 1797 rows, 11.7 against 7.4 at 14,376 — because
+n = 2048 is too narrow to pay for the crossing. `vae ff2` routes and still
+loses, 28.09 s against 27.11. Not saturation: against the same latent the pixels
+move from mean -0.290932 rms 0.585363 to mean -0.293184 rms 0.585261, which is
+fp16 drift and not the silent zeros the DiT's `fc2` scale table exists to
+prevent, so this checkpoint needs no such table. It loses because `qkv` and
+`ff1` already keep both dies busy and a third projection in the same sequential
+chain contends rather than adds. The flag that routed it has been removed;
+re-running the measurement means restoring the `vaeLinear` call in
+`VaeFeedForward`.
+
+## What the engine is not worth
+
+Recorded so it is not re-attempted.
+
+**Quantisation, anywhere.** At S ~= 14k every DiT GEMM is compute-bound and a
+quantised matmul is pure dequant overhead — 0.90x to 0.96x at 8-bit and 4-bit
+alike, measured by `Tools/FastH3/bench_quant_matmul.swift`. The VAE decoder sits
+in the same regime. The catalog's int8 files already save disk only: they
+dequantise at load (`MemoryPlan.isResidentQuantised`). The one shape where a
+quantised matmul wins is the text encoder's short forward, 1.07x at S = 300 —
+and text conditioning is a flat 16.1 s regardless of prompt length *or* output
+duration, so its cost is weights being wired into memory, not arithmetic.
+
+**More share tuning at guidance 1.0.** `aneCFGOverlap` is false with a single
+branch, so the engine races rather than overlaps, and tuning can only
+redistribute inside the 8 s the projections gain.
+
+**The rotary cache in the video decoder.** The same tile decoded three times
+runs 0.7051, 0.7067, 0.7081 s. The table is 172k elements against 8.7 TFLOPs of
+matmul; the whole per-call preamble is below noise. Written, measured, reverted.
 
 ## The constants, and why they are what they are
 
@@ -76,6 +221,10 @@ none of it should be assumed to transfer to another resolution or duration.
 upload split into its GPU materialise and its CPU memcpy, the wait on the
 engine, and the join. `H3_ANE_UTILISATION=1` adds the engine's own busy time.
 Run both on any new shape before trusting the figures here.
+
+Read `upload` as "time until this projection's input existed", not as transfer
+cost — see "The phase report cannot attribute attention" above, which is the
+trap this column sets.
 
 Measured on the arm above, per call:
 

@@ -78,8 +78,15 @@ package enum H3RenderPolicy {
 
     /// Every reason this configuration is worse than what has been verified.
     /// Empty means it is safe to run.
+    /// - Parameter distilledSteps: the checkpoint's own denoising steps, when
+    ///   it declares them. The twenty-step floor below was measured on the base
+    ///   model, where six steps gave 52 flash events; it says nothing about a
+    ///   checkpoint distilled to run in four. A distilled model cannot be asked
+    ///   for twenty steps either — its schedule is a property of its weights —
+    ///   so the floor does not apply and the count is not the caller's to pick.
     package static func check(width: Int, height: Int, frameCount: Int,
                              steps: Int, tokens: Int,
+                             distilledSteps: [Int]? = nil,
                              config: H3Config = H3Config()) -> [Violation] {
         var out: [Violation] = []
 
@@ -96,7 +103,7 @@ package enum H3RenderPolicy {
                 remedy: "ask for 5 s or more (5 s -> 124 frames, the verified shape)"))
         }
 
-        if steps < minSteps {
+        if distilledSteps == nil, steps < minSteps {
             out.append(Violation(
                 rule: "step count below the verified floor",
                 reason: "\(steps) steps is under \(minSteps). Measured: 6 steps produced 52 "

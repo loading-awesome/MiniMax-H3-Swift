@@ -26,14 +26,22 @@ struct RecipesCommand: ParsableCommand {
 
             The 16:9 sizes and their portrait transposes are a megapixel ladder
             snapped to the 32-pixel grid the VAE and patchify require — which is
-            why none of them is exactly 16:9. 864x480 is the closest at 1.800,
-            and is also the shape this port verified end to end.
+            why none of them is exactly 16:9 — and then chosen, within that
+            grid, for the video decoder's tile layout. The decoder cuts fixed
+            256-pixel tiles, so a size just past a tile boundary pays for a
+            whole row it barely uses: 0.4 MP is 832x448 and decodes in 8 tiles
+            where the 864x480 it replaced needed 15.
 
             Cost is not linear in pixels. Attention is quadratic in packed
-            sequence length, so the 2.0 MP rung is 5x the pixels of 864x480 and
-            about 12x its sampling time. Two rungs sit past the three-hour
-            refusal; they are listed rather than hidden so the cost is readable
-            before a render rather than after one.
+            sequence length, so the 2.0 MP rung is 5x the pixels of the 0.4 MP
+            rung and about 12x its sampling time. Two rungs sit past the
+            three-hour refusal; they are listed rather than hidden so the cost
+            is readable before a render rather than after one.
+
+            The `reference` marker is not `verified`. It names the rung the
+            others are priced against and where this port's measurements were
+            taken. 864x480 held the verification and is no longer a rung; it is
+            still reachable with --width 864 --height 480.
             """
     )
 

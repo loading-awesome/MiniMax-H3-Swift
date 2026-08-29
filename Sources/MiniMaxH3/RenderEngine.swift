@@ -9,6 +9,7 @@ import H3Foundation
 import H3Hardware
 import H3Catalog
 import H3Pipeline
+import H3Recipes
 
 /// Owns admission and lifecycle for the process's model runtime.
 public actor RenderEngine {
@@ -161,6 +162,19 @@ private enum RenderOperation {
                         events: AsyncStream<RenderEvent>.Continuation) async throws -> RenderResult {
         let logger = Logger(subsystem: "com.loading-awesome.MiniMaxH3", category: "render")
         let machine = Machine.detect()
+
+        // A distilled checkpoint decides its own denoising schedule, so resolve
+        // it here, before anything reads the request. `steps` is corrected to
+        // what will actually run: leaving the caller's number in place put a
+        // count on the receipt that no part of the render ever used, and made
+        // the time estimate five times pessimistic.
+        var request = request
+        if ProcessInfo.processInfo.environment["H3_IGNORE_DISTILLED"] != "1",
+           let steps = CheckpointIdentity.distilledSteps(for: models.dit.url) {
+            request.distilledSteps = steps
+            request.steps = steps.count
+        }
+
         let dimensions = try request.dimensions()
         var receipt = RenderReceipt(
             jobID: jobID,
@@ -193,6 +207,22 @@ private enum RenderOperation {
                     + "cache_threshold=\(request.cacheThreshold)"
                 receipt.warnings.append(warning)
                 events.yield(.warning(warning))
+            }
+            // Not an approximation and not a fault — the render is exact. It is
+            // on the receipt because the decode's cost is invisible in the
+            // sampling estimate beside it, and a reader comparing two receipts
+            // months apart should not have to re-derive why one decoded twice
+            // as fast at nearly the same size.
+            if let dims = try? request.dimensions() {
+                let advice = H3Ladder.tileAdvice(width: dims.width, height: dims.height)
+                if let better = advice.better {
+                    receipt.warnings.append(String(format:
+                        "off-ladder shape: %dx%d decodes in %d tiles; %dx%d needs %d "
+                        + "for %.0f%% of the pixels",
+                        dims.width, dims.height, advice.tiles,
+                        better.width, better.height, better.tiles,
+                        better.pixelRatio * 100))
+                }
             }
             if models.precision == .prunedBF16 || models.precision == .prunedInt8 {
                 let warning = "approximate checkpoint: \(models.precision.rawValue) replaces AdaLN with a low-rank curve"

@@ -57,8 +57,34 @@ package struct Catalog: Sendable {
         /// matches, the render succeeds, and the weights were never trained to
         /// consume reference blocks. A config that names an FL2VA file in the
         /// `ref2va` slot is now a reported problem, not an "ok".
+        /// Whether the file under a key is the *kind* of model that key
+        /// promises, which is a separate question from its partition.
+        ///
+        /// A `turbo_` key names a distilled checkpoint: one that carries its
+        /// own denoising steps and is sampled at four rungs. Put a base model
+        /// there and the render takes four steps of a model trained for fifty,
+        /// which produces a video rather than an error. Put a distill under a
+        /// plain precision key — which is how this configuration actually shipped
+        /// for a while — and `bf16` silently names a model instead of a width.
+        /// Both are the same failure the partition check exists for: the file
+        /// loads, the shapes match, and the result is wrong.
+        func distillMismatch(_ key: String, _ id: CheckpointIdentity) -> String? {
+            let wantsDistill = key.hasPrefix("turbo_")
+            let isDistill = id.distilledSteps != nil
+            if wantsDistill && !isDistill {
+                return "a turbo_ key needs a distilled checkpoint, and this one "
+                     + "declares no denoising steps"
+            }
+            if !wantsDistill && isDistill {
+                return "a distilled checkpoint under a plain precision key — file "
+                     + "it under 'turbo_\(key)' so the key names a dtype, not a model"
+            }
+            return nil
+        }
+
         func add(_ role: String, _ raw: String?,
-                 expect: CheckpointIdentity.Partition? = nil) {
+                 expect: CheckpointIdentity.Partition? = nil,
+                 ditKey: String? = nil) {
             guard let raw, !raw.isEmpty else { return }
             guard let url = config.resolve(raw) else { return }
             guard FileManager.default.fileExists(atPath: url.path) else {
@@ -74,13 +100,19 @@ package struct Catalog: Sendable {
                     mode: "the \(expect.rawValue) slot in this configuration"))))
                 return
             }
+            if case .success(let id) = result, let ditKey,
+               let why = distillMismatch(ditKey, id) {
+                rows.append((role, url.path,
+                             .failure(H3Error.unreadable(path: url.path, reason: why))))
+                return
+            }
             rows.append((role, url.path, result))
         }
         for (k, v) in config.checkpoints.fl2va.sorted(by: { $0.key < $1.key }) {
-            add("dit fl2va/\(k)", v, expect: .fl2va)
+            add("dit fl2va/\(k)", v, expect: .fl2va, ditKey: k)
         }
         for (k, v) in config.checkpoints.ref2va.sorted(by: { $0.key < $1.key }) {
-            add("dit ref2va/\(k)", v, expect: .ref2va)
+            add("dit ref2va/\(k)", v, expect: .ref2va, ditKey: k)
         }
         for (k, v) in config.checkpoints.textEncoder.sorted(by: { $0.key < $1.key }) {
             add("text-encoder/\(k)", v)
@@ -95,17 +127,25 @@ package struct Catalog: Sendable {
     /// `precision` names a key in the config's per-partition table, not a
     /// dtype: the caller has already been told by the memory planner which key
     /// fits, and the catalog's job is to find it and prove it is what it claims.
-    package func resolve(mode: RenderMode, precision: String) throws -> Resolution {
+    package func resolve(mode: RenderMode, precision: String,
+                         profile: H3RenderProfile = .standard) throws -> Resolution {
         let ditTable = mode.requiredPartition == .ref2va
             ? config.checkpoints.ref2va : config.checkpoints.fl2va
-        let role = "dit \(mode.requiredPartition.rawValue)/\(precision)"
+        let key = profile.checkpointKey(precision: precision)
+        let role = "dit \(mode.requiredPartition.rawValue)/\(key)"
 
-        guard let ditPath = ditTable[precision], let ditURL = config.resolve(ditPath) else {
+        guard let ditPath = ditTable[key], let ditURL = config.resolve(ditPath) else {
             let have = ditTable.keys.sorted().joined(separator: ", ")
+            // The turbo miss is worth its own sentence: the likely cause is a
+            // configuration that predates the profile split, where the distill
+            // was filed under a plain precision key.
+            let hint = profile == .turbo
+                ? " — a turbo render needs a distilled checkpoint at '\(key)'"
+                : ""
             throw H3Error.checkpointMissing(
                 role: role,
-                path: "no '\(precision)' entry for \(mode.requiredPartition.rawValue) "
-                    + "in the configuration (have: \(have.isEmpty ? "nothing" : have))")
+                path: "no '\(key)' entry for \(mode.requiredPartition.rawValue) "
+                    + "in the configuration (have: \(have.isEmpty ? "nothing" : have))\(hint)")
         }
         let dit = try identify(role, ditURL)
         try dit.validate(forMode: mode,
@@ -115,6 +155,8 @@ package struct Catalog: Sendable {
         // is that it exists at the requested precision — falling back a tier
         // silently would change the conditioning without changing the render's
         // description of itself.
+        // Precision, never the profile's key: the text encoder is shared, and a
+        // turbo render conditions on exactly the same weights a standard one does.
         let tePrecision = precision.hasPrefix("pruned") ? String(precision.dropFirst(7)) : precision
         guard let tePath = config.checkpoints.textEncoder[tePrecision],
               let teURL = config.resolve(tePath) else {

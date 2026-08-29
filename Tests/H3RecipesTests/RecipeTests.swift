@@ -38,22 +38,68 @@ struct RecipeTests {
         }
     }
 
-    @Test("the ladder is the recommended-size table, unedited")
+    @Test("the ladder is the derived table, unedited")
     func ladderMatchesTheTable() {
-        // Pinned literally, because the ladder's whole value is that it is a
-        // table someone else measured. A rung that drifted would still be on
-        // the 32-grid, still render, and no longer be a recommended size.
+        // Pinned literally. This used to be upstream's recommended-size table
+        // transcribed, and its value was that someone else had measured it.
+        // It is now derived for the decoder's tile grid, so the pin guards
+        // something different: a rung that drifted would still be on the
+        // 32-grid and still render, and would silently stop being tile-minimal.
+        // The invariants below are what the derivation actually promises; the
+        // literals are here so a change to it has to be deliberate.
         let expected: [(Double, Int, Int)] = [
-            (0.2, 608, 352), (0.3, 736, 416), (0.4, 864, 480), (0.5, 960, 544),
-            (0.6, 1056, 608), (0.7, 1152, 640), (0.8, 1216, 672), (0.9, 1280, 736),
-            (0.98, 1344, 768), (1.0, 1376, 768), (1.2, 1504, 832), (1.5, 1664, 928),
-            (1.8, 1824, 1024), (2.0, 1920, 1088),
+            (0.2, 608, 352), (0.3, 768, 416), (0.4, 832, 448), (0.5, 992, 544),
+            (0.6, 1024, 576), (0.7, 1184, 640), (0.8, 1216, 704), (0.9, 1344, 736),
+            (0.98, 1376, 768), (1.0, 1408, 768), (1.2, 1408, 800), (1.5, 1600, 928),
+            (1.8, 1792, 1024), (2.0, 1888, 1024),
         ]
         #expect(H3Ladder.rungs.count == expected.count)
         for (rung, want) in zip(H3Ladder.rungs, expected) {
             #expect(rung.megapixels == want.0)
             #expect(rung.width == want.1, "\(rung.landscape.rawValue) width")
             #expect(rung.height == want.2, "\(rung.landscape.rawValue) height")
+        }
+    }
+
+    @Test("the derivation's own invariants hold")
+    func ladderInvariants() {
+        /// The decoder cuts 256-pixel tiles with a 64-pixel minimum overlap,
+        /// so tile count steps rather than scales. Mirrors `VideoVAE.splitTiles`
+        /// for the count alone.
+        func tiles(_ length: Int) -> Int {
+            guard length > 256 else { return 1 }
+            var n = Int((Double(length) / 256).rounded(.up))
+            while 256 * n - 64 * (n - 1) - length < 0 { n += 1 }
+            return n
+        }
+
+        var previousPixels = 0
+        var previousTiles = 0
+        var seen = Set<String>()
+        for rung in H3Ladder.rungs {
+            let label = "\(rung.megapixels) MP"
+            // The grid the VAE's /16 and the patch's /2 both require. Prior to
+            // every other property here: a rung that fails it cannot render.
+            #expect(rung.width % 32 == 0, "\(label) width off the 32-grid")
+            #expect(rung.height % 32 == 0, "\(label) height off the 32-grid")
+
+            // A first derivation put 0.7 and 0.8 on one shape and 1.8 and 2.0
+            // on another. Two names for one size is a menu that lies.
+            #expect(seen.insert("\(rung.width)x\(rung.height)").inserted,
+                    "\(label) collides with another rung")
+
+            // Both ladders have to climb, or a bigger name costs less.
+            let pixels = rung.width * rung.height
+            #expect(pixels > previousPixels, "\(label) is not larger than the rung below")
+            let t = tiles(rung.width) * tiles(rung.height)
+            #expect(t >= previousTiles, "\(label) decodes in fewer tiles than a smaller rung")
+            previousPixels = pixels
+            previousTiles = t
+
+            // The band the derivation searched. Outside it the rung was chosen
+            // for something other than 16:9.
+            let aspect = Double(rung.width) / Double(rung.height)
+            #expect(aspect >= 1.70 && aspect <= 1.87, "\(label) aspect \(aspect)")
         }
     }
 
@@ -130,9 +176,9 @@ struct RecipeTests {
         // Exactly one entry can be the verified shape. Two would mean the
         // portrait transpose was being credited with the landscape shape's
         // measurements, which is the kind of thing a listing makes look true.
-        let verified = catalogue.rows.filter { $0.status == .verified }
-        #expect(verified.count == 1)
-        #expect(verified.first?.id == .h3_16x9_0p4mp)
+        let reference = catalogue.rows.filter { $0.status == .reference }
+        #expect(reference.count == 1)
+        #expect(reference.first?.id == .h3_16x9_0p4mp)
         for row in catalogue.rows where row.id.rawValue.contains("2k") {
             #expect(row.status == .upscaleTarget, "\(row.id.rawValue)")
         }
@@ -184,7 +230,7 @@ struct RecipeTests {
         let catalogue = H3RecipeCatalogue()
         let twoK = catalogue.rows(matching: "2k")
         #expect(twoK.count == 6)
-        #expect(!twoK.contains { $0.status == .verified })
+        #expect(!twoK.contains { $0.status == .reference })
         let report = catalogue.report(twoK)
         #expect(report.contains("x"))
         #expect(!report.contains("  -  "))

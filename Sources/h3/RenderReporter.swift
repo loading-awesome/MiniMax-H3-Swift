@@ -3,6 +3,7 @@
 
 import Foundation
 import MiniMaxH3
+import H3Recipes
 
 /// What a render looks like from the outside.
 ///
@@ -74,6 +75,24 @@ struct RenderReporter {
                                    request.cfgScale))
         }
         row("estimate", "about \(duration(estimateSeconds)) of sampling")
+
+        // The decode's cost is tiles, not pixels, and it does not follow the
+        // sampling estimate above: the count steps, so two shapes a few pixels
+        // apart can decode in 8 tiles and 15. Printed for every render so the
+        // unit is familiar before it is ever used to argue for a different one.
+        let advice = H3Ladder.tileAdvice(width: width, height: height)
+        row("decode", "\(advice.tiles) tiles")
+        if let better = advice.better {
+            // Advice, not a refusal — see `H3Ladder.tileAdvice`. Nothing here
+            // stops the render, and 864x480 has to keep working.
+            print("")
+            print(String(format:
+                "  note: %dx%d decodes in %d tiles. %dx%d needs %d for %.0f%% of the "
+                + "pixels —\n        about %.2fx less decode. `h3 recipes` lists the rungs.",
+                width, height, advice.tiles,
+                better.width, better.height, better.tiles, better.pixelRatio * 100,
+                Double(advice.tiles) / Double(better.tiles)))
+        }
         print("")
     }
 
