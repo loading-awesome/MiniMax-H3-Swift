@@ -26,31 +26,54 @@ crosses a device boundary — only Q/K/V and finished head outputs do.
 ## Attention is a win at one shape and a loss at another
 
 The 1.042x above is 864x480x124 at 20 steps. At 448x832x124 on the four-step
-distilled checkpoint it reverses, and by more than it ever won:
+distilled checkpoint it reverses. Sampling seconds, and the projections each
+run's calibration accepted:
 
-    engine off, Metal attention        sampling 193.3 s   total 247.6 s
-    engine on,  Metal attention        sampling 166.9 s   total 205.7 s
-    engine on,  ANE attention          sampling 185.5 s   total 236.2 s
+    Metal attention   166.9  all four routed
+                      173.7  all four routed
+                      174.5  three routed
+                      188.1  two routed
+    ANE attention     184.6  all four routed
+                      185.5  all four routed
+                      186.6  all four routed
 
-So the projections are worth 13.7% here, and turning attention on gives 18.6 s
-of that back. Leave `H3_ANE_ATTENTION` unset at this shape.
+Compared like for like -- runs where all four projections routed -- ANE
+attention costs about 15 s, 170.3 against 185.6. Leave `H3_ANE_ATTENTION`
+unset at this shape.
+
+**One run of each does not establish this**, and a first pass here claimed
+18.6 s from a single pair before the repeats existed. The Metal runs span 21 s
+and overlap the ANE runs; only the ANE side is tight, at 2 s across three runs.
 
 The backend is not doing anything wrong. It calibrates once and refuses:
 
     calibrate S=13938 D=128 H=56: engine(8) 673 ms, gpu(48) 282 ms,
     routed 673 vs unrouted 330 -> DECLINE
 
-Every later call hits the refusal cache, which is why the two renders above are
-bit-identical -- PSNR inf, not merely close. **A backend that computes nothing
-still costs 18.6 s, and that is a defect rather than a tuning result.** Whatever
-selecting a backend changes about the schedule, it is not the attention
-arithmetic, because the arithmetic is provably unchanged. That is the next thing
-to find.
+Every later call hits the refusal cache, and the two renders are bit-identical
+-- PSNR inf, not merely close -- so the attention arithmetic is provably
+untouched. What a backend that computes nothing is costing is still unknown.
 
-The general lesson is the one this file already states about every other
-number: these are one shape each. `H3_ANE_ATTENTION_TRACE=1` says what the
-backend decided, and it is worth asking before assuming a setting that helped
-once still helps.
+## The routing calibration is a coin flip worth about 18 s
+
+`routingBeatsMetal` races the engine against Metal once per shape and caches
+the verdict, and at this shape it does not decide the same way twice. Across
+four otherwise identical Metal-attention renders it accepted four projections,
+then four, then three, then two -- and the sampling phase tracked it: 166.9 and
+173.7 s with four, 188.1 s with two.
+
+So a render's speed depends on how a millisecond-scale race fell out during its
+first block. Two things make that race unrepresentative of production. It runs
+`best(2)` of each side, so by the routed timing the activation is already
+materialised, and the wait that dominates in production -- `start` calls
+`eval` on an activation whose input is the attention output -- has already been
+paid. And it races one projection alone, where the dies are idle, rather than
+against the other projections competing for them.
+
+The phase report shows the same effect from the other side: with ANE attention
+`attn out` carries a 360 ms materialise, and with Metal attention that cost
+moves to `fc1` at 417 ms. It is not a property of either projection. Whichever
+routed projection runs first after attention absorbs the wait for it.
 
 ## The constants, and why they are what they are
 
