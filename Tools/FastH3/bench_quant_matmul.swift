@@ -42,11 +42,13 @@ for (name, s, k, n) in cases {
     var line = String(format: "%@ %7.1f ms", name, dense * 1e3)
     var ratios = ""
     for bits in [8, 4] {
+        // `biases` is optional in newer MLX; eval only what exists rather than
+        // letting the optional coerce to Any and quietly evaluate nothing.
         let (wq, scales, biases) = MLX.quantized(w, groupSize: 64, bits: bits)
-        eval(wq, scales, biases)
+        eval([wq, scales] + (biases.map { [$0] } ?? []))
         let q = best(3) {
-            quantizedMatmul(x, wq, scales: scales, biases: biases,
-                            transpose: true, groupSize: 64, bits: bits)
+            quantizedMM(x, wq, scales: scales, biases: biases,
+                        transpose: true, groupSize: 64, bits: bits)
         }
         line += String(format: " %7.1f", q * 1e3)
         ratios += String(format: "   %.2fx", dense / q)

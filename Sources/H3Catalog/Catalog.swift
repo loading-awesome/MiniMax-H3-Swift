@@ -57,8 +57,34 @@ package struct Catalog: Sendable {
         /// matches, the render succeeds, and the weights were never trained to
         /// consume reference blocks. A config that names an FL2VA file in the
         /// `ref2va` slot is now a reported problem, not an "ok".
+        /// Whether the file under a key is the *kind* of model that key
+        /// promises, which is a separate question from its partition.
+        ///
+        /// A `turbo_` key names a distilled checkpoint: one that carries its
+        /// own denoising steps and is sampled at four rungs. Put a base model
+        /// there and the render takes four steps of a model trained for fifty,
+        /// which produces a video rather than an error. Put a distill under a
+        /// plain precision key — which is how this configuration actually shipped
+        /// for a while — and `bf16` silently names a model instead of a width.
+        /// Both are the same failure the partition check exists for: the file
+        /// loads, the shapes match, and the result is wrong.
+        func distillMismatch(_ key: String, _ id: CheckpointIdentity) -> String? {
+            let wantsDistill = key.hasPrefix("turbo_")
+            let isDistill = id.distilledSteps != nil
+            if wantsDistill && !isDistill {
+                return "a turbo_ key needs a distilled checkpoint, and this one "
+                     + "declares no denoising steps"
+            }
+            if !wantsDistill && isDistill {
+                return "a distilled checkpoint under a plain precision key — file "
+                     + "it under 'turbo_\(key)' so the key names a dtype, not a model"
+            }
+            return nil
+        }
+
         func add(_ role: String, _ raw: String?,
-                 expect: CheckpointIdentity.Partition? = nil) {
+                 expect: CheckpointIdentity.Partition? = nil,
+                 ditKey: String? = nil) {
             guard let raw, !raw.isEmpty else { return }
             guard let url = config.resolve(raw) else { return }
             guard FileManager.default.fileExists(atPath: url.path) else {
@@ -74,13 +100,19 @@ package struct Catalog: Sendable {
                     mode: "the \(expect.rawValue) slot in this configuration"))))
                 return
             }
+            if case .success(let id) = result, let ditKey,
+               let why = distillMismatch(ditKey, id) {
+                rows.append((role, url.path,
+                             .failure(H3Error.unreadable(path: url.path, reason: why))))
+                return
+            }
             rows.append((role, url.path, result))
         }
         for (k, v) in config.checkpoints.fl2va.sorted(by: { $0.key < $1.key }) {
-            add("dit fl2va/\(k)", v, expect: .fl2va)
+            add("dit fl2va/\(k)", v, expect: .fl2va, ditKey: k)
         }
         for (k, v) in config.checkpoints.ref2va.sorted(by: { $0.key < $1.key }) {
-            add("dit ref2va/\(k)", v, expect: .ref2va)
+            add("dit ref2va/\(k)", v, expect: .ref2va, ditKey: k)
         }
         for (k, v) in config.checkpoints.textEncoder.sorted(by: { $0.key < $1.key }) {
             add("text-encoder/\(k)", v)
