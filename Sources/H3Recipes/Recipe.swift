@@ -267,3 +267,50 @@ package struct H3RecipeRegistry {
         return out
     }()
 }
+
+extension H3Ladder {
+    /// What an arbitrary shape costs to decode, and the rung that would cost
+    /// less for no meaningful loss of frame.
+    ///
+    /// **Advice, not a rule.** `--width`/`--height` exists for shapes the ladder
+    /// cannot express, and the most important of those is 864x480 — the shape
+    /// every golden and every measured tolerance uses, and no longer a rung.
+    /// Refusing it would be refusing the only verified configuration this port
+    /// has. So a wasteful shape is reported and rendered.
+    ///
+    /// A rung is only offered when it decodes in fewer tiles *and* keeps at
+    /// least 85% of the pixels, because "smaller is cheaper" is not advice. The
+    /// floor is 85 and not 90 because the case this exists for sits at 89.9%:
+    /// 832x448 against the 864x480 it replaced, 8 tiles against 15. A threshold
+    /// that misses its own motivating example is the wrong threshold.
+    package static func tileAdvice(width: Int, height: Int)
+        -> (tiles: Int, better: (width: Int, height: Int, tiles: Int, pixelRatio: Double)?) {
+        let mine = H3Tiling.tiles(width: width, height: height)
+        let portrait = height > width
+        let pixels = Double(width * height)
+
+        // A rung says nothing about another rung. Neighbours on the ladder sit
+        // close enough that the one below is often within the pixel floor and a
+        // tile cheaper — 2.0 MP would be told to be 1.8 MP, forever. A caller
+        // who named a rung has already made this trade; only a shape off the
+        // ladder has not.
+        let isRung = rungs.contains {
+            ($0.width, $0.height) == (width, height) || ($0.height, $0.width) == (width, height)
+        }
+        guard !isRung else { return (mine, nil) }
+
+        var best: (width: Int, height: Int, tiles: Int, pixelRatio: Double)?
+        for rung in rungs {
+            let (w, h) = portrait ? (rung.height, rung.width) : (rung.width, rung.height)
+            let t = H3Tiling.tiles(width: w, height: h)
+            guard t < mine else { continue }
+            let ratio = Double(w * h) / pixels
+            guard ratio >= 0.85 else { continue }
+            // Fewest tiles first, then the most pixels among those.
+            if best == nil || t < best!.tiles || (t == best!.tiles && ratio > best!.pixelRatio) {
+                best = (w, h, t, ratio)
+            }
+        }
+        return (mine, best)
+    }
+}

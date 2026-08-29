@@ -387,18 +387,10 @@ package final class VideoVAE {
         if tileSize >= inputLen {
             return ([0], [inputLen], [])
         }
-        var N = Int(ceil(Double(inputLen) / Double(tileSize)))
-        var overlaps: [Int] = []
-        while true {
-            overlaps = Array(repeating: tileOverlapMin, count: N - 1)
-            let sumOverlaps = overlaps.reduce(0, +)
-            let remaining = tileSize * N - sumOverlaps - inputLen
-            if remaining < 0 {
-                N += 1
-            } else {
-                break
-            }
-        }
+        // The count comes from `H3Tiling`, which the planner and the ladder also
+        // read. The overlap distribution below is this function's own business.
+        let N = H3Tiling.tiles(length: inputLen)
+        var overlaps = Array(repeating: tileOverlapMin, count: N - 1)
         let remaining = tileSize * N - overlaps.reduce(0, +) - inputLen
         let remainingUnits = remaining / vaeRatio
         for i in 0 ..< remainingUnits {

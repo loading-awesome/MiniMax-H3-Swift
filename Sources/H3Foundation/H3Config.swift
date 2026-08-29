@@ -146,3 +146,39 @@ package enum H3RenderProfile: String, Sendable, CaseIterable, Codable {
                   + "at a base checkpoint — `h3 doctor` names the file to move")
     }
 }
+
+/// How the video decoder cuts a frame into tiles.
+///
+/// The rule lives here, below everything that needs it, because three places
+/// already had to know it: the decoder that does the cutting, the planner that
+/// prices a shape, and the ladder that is derived from it. A copy per caller is
+/// a rule that drifts, and this one is not obvious enough to re-derive
+/// correctly from memory — the tile count *steps*, so a frame one pixel past a
+/// boundary pays for a whole row or column it barely uses.
+package enum H3Tiling {
+    /// The decoder's fixed tile edge, in pixels.
+    package static let tileSize = 256
+    /// The smallest overlap the blender needs between neighbouring tiles.
+    package static let minimumOverlap = 64
+
+    /// Tiles along one axis, matching `VideoVAE.splitTiles`.
+    package static func tiles(length: Int) -> Int {
+        guard length > tileSize else { return 1 }
+        var n = Int((Double(length) / Double(tileSize)).rounded(.up))
+        while tileSize * n - minimumOverlap * (n - 1) - length < 0 { n += 1 }
+        return n
+    }
+
+    /// Tiles in the whole grid. Every one is a separate pass through the
+    /// decoder's 36 blocks, so this is the decode's cost in the only unit that
+    /// matters.
+    package static func tiles(width: Int, height: Int) -> Int {
+        tiles(length: width) * tiles(length: height)
+    }
+
+    /// The largest length a given tile count covers, which is where a dimension
+    /// should sit to pay for nothing it does not use.
+    package static func largestLength(tiles n: Int) -> Int {
+        tileSize + (tileSize - minimumOverlap) * (n - 1)
+    }
+}
