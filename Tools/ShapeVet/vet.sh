@@ -48,7 +48,7 @@ render() {  # $1=ckpt $2=tag $3=w $4=h $5=prompt  -> echoes seconds
   echo $?
 }
 
-echo "shape,prompt,tokens,arm,exit,total_s,step_s,ane_route"
+echo "shape,prompt,S,arm,exit,total,step_mean,step1,ane_route"
 for spec in "352 608" "416 736" "480 864"; do
   W=${spec%% *}; H=${spec##* }
   for key in calm motion speech texture; do
@@ -60,11 +60,11 @@ for spec in "352 608" "416 736" "480 864"; do
       tot=$(tr '\r' '\n' < $OUT/$TAG.log | grep -o "done in [0-9hms ]*" | tail -1)
       st=$(tr '\r' '\n' < $OUT/$TAG.log | grep "per step" | awk '{print $3}')
       route=$(grep -c "calibrate.*-> route" $OUT/$TAG.log)
-      tok=$(python3 -c "
-import json,glob
-try: print(json.load(open('$OUT/$TAG.h3-bench.json'))['identity'].get('packedTokens','?'))
-except Exception: print('?')")
-      echo "${W}x${H},$key,$tok,$arm,$rc,${tot#done in },$st,$route"
+      # S is what the ANE compiles against, and it moves with prompt length --
+      # 8155 and 8170 compile in ~50 s while 8167, between them, takes 250.
+      tok=$(grep -o "calibrate S=[0-9]*" $OUT/$TAG.log | head -1 | cut -d= -f2)
+      step1=$(tr '\r' '\n' < $OUT/$TAG.log | grep -E "sampling  ." | head -1 | grep -o "[0-9.]* s/step")
+      echo "${W}x${H},$key,S=$tok,$arm,$rc,${tot#done in },$st,${step1% s/step},$route"
       ffmpeg -hide_banner -loglevel error -i $OUT/$TAG.mp4 \
         -vf "select='not(mod(n\,24))',scale=200:-1,tile=5x1" -frames:v 1 \
         $OUT/frames/$TAG.png -y 2>/dev/null
@@ -73,9 +73,16 @@ except Exception: print('?')")
     python3 $REPO/Tools/coherence_check.py \
       $OUT/${W}x${H}-${key}-base.mp4 $OUT/${W}x${H}-${key}-dist.mp4 \
       > $OUT/coherence-${W}x${H}-${key}.txt 2>&1
+    # Both arms. Running this only on the distill made a shape failure look
+    # like a distill failure: at 352x608 the base fails lip-sync too, so the
+    # rung is unsuitable for speech whatever model renders it.
     if [[ $key == speech ]]; then
-      $REPO/.build/release/h3-lipsync $OUT/${W}x${H}-speech-dist.mp4 \
-        > $OUT/lipsync-${W}x${H}.txt 2>&1
+      for arm in base dist; do
+        $REPO/.build/release/h3-lipsync $OUT/${W}x${H}-speech-${arm}.mp4 \
+          > $OUT/lipsync-${W}x${H}-${arm}.txt 2>&1
+        $REPO/.build/release/h3-facecheck $OUT/${W}x${H}-speech-${arm}.mp4 \
+          > $OUT/facecheck-${W}x${H}-${arm}.txt 2>&1
+      done
     fi
   done
 done
