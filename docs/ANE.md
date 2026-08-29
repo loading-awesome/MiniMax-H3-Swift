@@ -23,6 +23,35 @@ crosses a device boundary — only Q/K/V and finished head outputs do.
     + fc2                            24.10       44.99     1.176x
     + split-k 4                      23.17       43.26     1.223x
 
+## Attention is a win at one shape and a loss at another
+
+The 1.042x above is 864x480x124 at 20 steps. At 448x832x124 on the four-step
+distilled checkpoint it reverses, and by more than it ever won:
+
+    engine off, Metal attention        sampling 193.3 s   total 247.6 s
+    engine on,  Metal attention        sampling 166.9 s   total 205.7 s
+    engine on,  ANE attention          sampling 185.5 s   total 236.2 s
+
+So the projections are worth 13.7% here, and turning attention on gives 18.6 s
+of that back. Leave `H3_ANE_ATTENTION` unset at this shape.
+
+The backend is not doing anything wrong. It calibrates once and refuses:
+
+    calibrate S=13938 D=128 H=56: engine(8) 673 ms, gpu(48) 282 ms,
+    routed 673 vs unrouted 330 -> DECLINE
+
+Every later call hits the refusal cache, which is why the two renders above are
+bit-identical -- PSNR inf, not merely close. **A backend that computes nothing
+still costs 18.6 s, and that is a defect rather than a tuning result.** Whatever
+selecting a backend changes about the schedule, it is not the attention
+arithmetic, because the arithmetic is provably unchanged. That is the next thing
+to find.
+
+The general lesson is the one this file already states about every other
+number: these are one shape each. `H3_ANE_ATTENTION_TRACE=1` says what the
+backend decided, and it is worth asking before assuming a setting that helped
+once still helps.
+
 ## The constants, and why they are what they are
 
 Swept jointly, because they interact and sweeping them separately once produced
