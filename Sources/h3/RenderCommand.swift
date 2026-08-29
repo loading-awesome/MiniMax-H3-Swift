@@ -168,6 +168,14 @@ struct RenderCommand: AsyncParsableCommand {
         let resolution = try Catalog(config: cfg).resolve(mode: request.mode,
                                                           precision: precision,
                                                           profile: profile)
+
+        // The catalog proved the file is the right partition and readable. This
+        // proves it is the right *kind* for the profile, which is a different
+        // question and one whose failures are silent — see
+        // `H3RenderProfile.validate`. Header-only, so it costs a second rather
+        // than a 66 GB load.
+        try profile.validate(declaresDistilledSteps: resolution.dit.distilledSteps != nil,
+                             checkpoint: resolution.dit.url.lastPathComponent)
         guard let tokenizer = resolution.tokenizerDirectory else {
             throw H3Error.checkpointMissing(
                 role: "tokenizer",

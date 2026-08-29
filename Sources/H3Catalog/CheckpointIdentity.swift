@@ -169,12 +169,18 @@ package struct CheckpointIdentity: Sendable, Equatable {
     /// dialogue and four rungs are already clean, so the ladder was never the
     /// lever. Named to mirror FastVideo's `FASTVIDEO_DMD_DENOISING_STEPS`.
     package static func distilledSteps(for url: URL) -> [Int]? {
+        // The checkpoint decides *whether* there is a ladder; the override
+        // decides only what it is. Read the other way round, setting this
+        // variable would put a base model on a DMD ladder — four transformer
+        // forwards of weights trained for fifty — and return a video rather
+        // than an error.
+        guard let declared = (try? identify(url: url))?.distilledSteps else { return nil }
         if let raw = ProcessInfo.processInfo.environment["H3_DMD_DENOISING_STEPS"] {
             let steps = raw.split(separator: ",")
                 .compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
             if !steps.isEmpty { return steps }
         }
-        return (try? identify(url: url))?.distilledSteps
+        return declared
     }
 
     /// Refuses a checkpoint that cannot be used safely for `mode`.

@@ -110,4 +110,39 @@ package enum H3RenderProfile: String, Sendable, CaseIterable, Codable {
     /// The step count to use when the caller did not ask for one. A distilled
     /// checkpoint overrides this from its own metadata; the base model does not.
     package var defaultSteps: Int { self == .turbo ? 4 : 20 }
+
+    /// Whether this profile needs a checkpoint that carries its own ladder.
+    package var requiresDistilled: Bool { self == .turbo }
+
+    /// Refuses a checkpoint the profile cannot sample correctly.
+    ///
+    /// **Both directions are silent failures, which is why this is a refusal
+    /// rather than a warning.** A base model on the turbo path takes four
+    /// transformer forwards of weights trained for fifty. A distilled model on
+    /// the standard path has its step count overridden by its own metadata, so
+    /// `--steps 20` yields four and a receipt that agrees with itself while
+    /// disagreeing with the caller. Neither produces a wrong shape, an
+    /// exception, or anything else the pipeline would notice — only a worse
+    /// video, which is the class of fault this codebase exists to catch early.
+    ///
+    /// Called after the checkpoint header is read and before its 66 GB body is,
+    /// so the cost of being wrong is a second rather than a load.
+    package func validate(declaresDistilledSteps: Bool, checkpoint: String) throws {
+        guard declaresDistilledSteps != requiresDistilled else { return }
+        if requiresDistilled {
+            throw H3Error.invalidRequest(
+                rule: "--profile turbo needs a distilled checkpoint",
+                detail: "\(checkpoint) declares no denoising steps, so it is a base "
+                      + "model. Sampling it at four steps would return a video made "
+                      + "with a twentieth of the compute it was trained for.",
+                remedy: "render with --profile standard, or point the "
+                      + "'turbo_<precision>' entry at a distilled checkpoint")
+        }
+        throw H3Error.invalidRequest(
+            rule: "--profile standard needs a base checkpoint",
+            detail: "\(checkpoint) carries its own denoising steps, so it is a "
+                  + "distill and would ignore the requested step count.",
+            remedy: "render with --profile turbo, or point the '<precision>' entry "
+                  + "at a base checkpoint — `h3 doctor` names the file to move")
+    }
 }
