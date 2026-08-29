@@ -9,6 +9,7 @@ import H3Catalog
 import H3Recipes
 
 extension H3RecipeID: ExpressibleByArgument {}
+extension H3RenderProfile: ExpressibleByArgument {}
 extension RenderRequest.AspectRatio: ExpressibleByArgument {}
 extension RenderRequest.ResolutionTier: ExpressibleByArgument {}
 extension RenderRequest.QualityProfile: ExpressibleByArgument {}
@@ -41,8 +42,14 @@ struct RenderCommand: AsyncParsableCommand {
     @Option(help: "duration in seconds, 4 to 15")
     var seconds: Int = 5
 
-    @Option(help: "sampling steps")
-    var steps: Int = 20
+    @Option(help: "turbo (4-step distill) or standard (base model, 20 steps)")
+    var profile: H3RenderProfile = .turbo
+
+    /// Optional so the profile can set it. A turbo checkpoint overrides this
+    /// from its own metadata regardless, so a caller passing `--steps 20` to a
+    /// distilled render gets four and a receipt that says four.
+    @Option(help: "sampling steps; ignored by --profile turbo, which uses its own ladder")
+    var steps: Int?
 
     @Option(help: "random seed")
     var seed: Int = 0
@@ -53,7 +60,7 @@ struct RenderCommand: AsyncParsableCommand {
     @Option(help: "explicit height, a multiple of 32")
     var height: Int?
 
-    @Option(help: "a registered recipe, e.g. h3_16x9_0p4mp (864x480, the verified shape)")
+    @Option(help: "a registered recipe, e.g. h3_16x9_0p4mp (832x448); see `h3 recipes`")
     var recipe: H3RecipeID?
 
     @Option(help: "16:9, 9:16, 21:9, 4:3, 3:4 or 1:1")
@@ -133,7 +140,8 @@ struct RenderCommand: AsyncParsableCommand {
             videoOutput: URL(fileURLWithPath: out),
             audioOutput: outAudio.map(URL.init(fileURLWithPath:)),
             negativePrompt: negativePrompt,
-            seconds: seconds, steps: steps, seed: UInt64(max(0, seed)),
+            seconds: seconds, steps: steps ?? profile.defaultSteps,
+            seed: UInt64(max(0, seed)),
             width: width, height: height, recipe: recipe,
             aspectRatio: aspectRatio, resolution: resolution,
             firstFrame: firstFrame.map(URL.init(fileURLWithPath:)),
@@ -158,7 +166,8 @@ struct RenderCommand: AsyncParsableCommand {
         // asked for that mode's checkpoint and refuses a mismatch rather than
         // rendering with weights that were never trained for it.
         let resolution = try Catalog(config: cfg).resolve(mode: request.mode,
-                                                          precision: precision)
+                                                          precision: precision,
+                                                          profile: profile)
         guard let tokenizer = resolution.tokenizerDirectory else {
             throw H3Error.checkpointMissing(
                 role: "tokenizer",

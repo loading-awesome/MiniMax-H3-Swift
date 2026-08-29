@@ -59,8 +59,21 @@ package struct H3LadderRung: Sendable, Equatable {
 /// 16:9.** The VAE downsamples by 16 and the DiT patchifies by 2, so 32 is the
 /// grid a render has to land on; forcing 1.778 onto that grid is not possible
 /// at most sizes, and the ladder takes the nearest grid point instead. The
-/// spread is 1.727 (608x352) to 1.810 (1216x672). 864x480 is the closest at
-/// exactly 1.800, which is one more reason it is the shape the port verified.
+/// spread is 1.724 to 1.857.
+///
+/// **The rungs are chosen for the decoder's tile grid, not only for pixels.**
+/// The video VAE cuts fixed 256-pixel tiles with a 64-pixel minimum overlap, so
+/// the tile count steps rather than scales and a dimension just past a step
+/// pays for a whole row or column of tiles it barely uses. Each rung is the
+/// fewest-tile shape within 10% of its megapixel target and inside the aspect
+/// band above, subject to being strictly larger than the rung below it. The
+/// clearest case is 0.4 MP: 864x480 needed 15 tiles where 832x448 needs 8, so
+/// the rung moved and the decode halved for 4% fewer pixels.
+///
+/// **This retired 864x480, which was the verified shape.** Its parity gate and
+/// lip-sync runs do not transfer to 832x448, and `docs/SHAPES.md` records that
+/// the harness has to be re-run rather than pretending the verification moved
+/// with the name.
 ///
 /// **The ladder is a menu, not a promise about cost.** Attention is quadratic
 /// in packed sequence length, so the rungs do not cost what their megapixel
@@ -72,20 +85,20 @@ package struct H3LadderRung: Sendable, Equatable {
 /// argument the 2K entries are kept under.
 package enum H3Ladder {
     package static let rungs: [H3LadderRung] = [
-        .init(megapixels: 0.2,  width: 608,  height: 352,  landscape: .h3_16x9_0p2mp,  portrait: .h3_9x16_0p2mp),
-        .init(megapixels: 0.3,  width: 736,  height: 416,  landscape: .h3_16x9_0p3mp,  portrait: .h3_9x16_0p3mp),
-        .init(megapixels: 0.4,  width: 864,  height: 480,  landscape: .h3_16x9_0p4mp,  portrait: .h3_9x16_0p4mp),
-        .init(megapixels: 0.5,  width: 960,  height: 544,  landscape: .h3_16x9_0p5mp,  portrait: .h3_9x16_0p5mp),
-        .init(megapixels: 0.6,  width: 1056, height: 608,  landscape: .h3_16x9_0p6mp,  portrait: .h3_9x16_0p6mp),
-        .init(megapixels: 0.7,  width: 1152, height: 640,  landscape: .h3_16x9_0p7mp,  portrait: .h3_9x16_0p7mp),
-        .init(megapixels: 0.8,  width: 1216, height: 672,  landscape: .h3_16x9_0p8mp,  portrait: .h3_9x16_0p8mp),
-        .init(megapixels: 0.9,  width: 1280, height: 736,  landscape: .h3_16x9_0p9mp,  portrait: .h3_9x16_0p9mp),
-        .init(megapixels: 0.98, width: 1344, height: 768,  landscape: .h3_16x9_0p98mp, portrait: .h3_9x16_0p98mp),
-        .init(megapixels: 1.0,  width: 1376, height: 768,  landscape: .h3_16x9_1p0mp,  portrait: .h3_9x16_1p0mp),
-        .init(megapixels: 1.2,  width: 1504, height: 832,  landscape: .h3_16x9_1p2mp,  portrait: .h3_9x16_1p2mp),
-        .init(megapixels: 1.5,  width: 1664, height: 928,  landscape: .h3_16x9_1p5mp,  portrait: .h3_9x16_1p5mp),
-        .init(megapixels: 1.8,  width: 1824, height: 1024, landscape: .h3_16x9_1p8mp,  portrait: .h3_9x16_1p8mp),
-        .init(megapixels: 2.0,  width: 1920, height: 1088, landscape: .h3_16x9_2p0mp,  portrait: .h3_9x16_2p0mp),
+        .init(megapixels: 0.2,  width: 608,  height: 352,  landscape: .h3_16x9_0p2mp,    portrait: .h3_9x16_0p2mp),
+        .init(megapixels: 0.3,  width: 768,  height: 416,  landscape: .h3_16x9_0p3mp,    portrait: .h3_9x16_0p3mp),
+        .init(megapixels: 0.4,  width: 832,  height: 448,  landscape: .h3_16x9_0p4mp,    portrait: .h3_9x16_0p4mp),
+        .init(megapixels: 0.5,  width: 992,  height: 544,  landscape: .h3_16x9_0p5mp,    portrait: .h3_9x16_0p5mp),
+        .init(megapixels: 0.6,  width: 1024, height: 576,  landscape: .h3_16x9_0p6mp,    portrait: .h3_9x16_0p6mp),
+        .init(megapixels: 0.7,  width: 1184, height: 640,  landscape: .h3_16x9_0p7mp,    portrait: .h3_9x16_0p7mp),
+        .init(megapixels: 0.8,  width: 1216, height: 704,  landscape: .h3_16x9_0p8mp,    portrait: .h3_9x16_0p8mp),
+        .init(megapixels: 0.9,  width: 1344, height: 736,  landscape: .h3_16x9_0p9mp,    portrait: .h3_9x16_0p9mp),
+        .init(megapixels: 0.98, width: 1376, height: 768,  landscape: .h3_16x9_0p98mp,   portrait: .h3_9x16_0p98mp),
+        .init(megapixels: 1.0,  width: 1408, height: 768,  landscape: .h3_16x9_1p0mp,    portrait: .h3_9x16_1p0mp),
+        .init(megapixels: 1.2,  width: 1408, height: 800,  landscape: .h3_16x9_1p2mp,    portrait: .h3_9x16_1p2mp),
+        .init(megapixels: 1.5,  width: 1600, height: 928,  landscape: .h3_16x9_1p5mp,    portrait: .h3_9x16_1p5mp),
+        .init(megapixels: 1.8,  width: 1792, height: 1024, landscape: .h3_16x9_1p8mp,    portrait: .h3_9x16_1p8mp),
+        .init(megapixels: 2.0,  width: 1888, height: 1024, landscape: .h3_16x9_2p0mp,    portrait: .h3_9x16_2p0mp),
     ]
 
     /// The rung the port has actually verified end to end.

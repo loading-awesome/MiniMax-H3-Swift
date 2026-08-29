@@ -20,9 +20,17 @@ import H3Foundation
 package struct H3RecipeCatalogue: Sendable {
 
     package enum Status: Sendable {
-        /// Verified end to end: the parity-gated shape, and the one proven to
-        /// render an intelligible talking head.
-        case verified
+        /// The rung everything else is priced against, and the shape this
+        /// port's ANE and decode measurements were taken at.
+        ///
+        /// **Not the same as verified.** 864x480 held that claim — parity gate
+        /// and lip-sync, both arms — and it is no longer a rung: the ladder is
+        /// now chosen for the decoder's tile grid, which moved 0.4 MP to
+        /// 832x448 and halved its decode. No current rung has been through
+        /// `Tools/ShapeVet/vet.sh`. `H3RenderPolicy.verified*` still records
+        /// what was measured, and it is still reachable with explicit
+        /// `--width`/`--height`.
+        case reference
         /// A size the DiT samples directly, inside the render-time ceiling.
         case baseRender
         /// Sampleable, but past `maxEstimatedSeconds` at this duration and step
@@ -34,7 +42,7 @@ package struct H3RecipeCatalogue: Sendable {
 
         package var label: String {
             switch self {
-            case .verified: return "verified"
+            case .reference: return "reference"
             case .baseRender: return "ok"
             case .overCeiling: return "over ceiling"
             case .upscaleTarget: return "no route"
@@ -85,9 +93,8 @@ package struct H3RecipeCatalogue: Sendable {
                 status = .upscaleTarget
             } else if estimate > H3RenderPolicy.maxEstimatedSeconds {
                 status = .overCeiling
-            } else if recipe.targetWidth == H3RenderPolicy.verifiedWidth,
-                      recipe.targetHeight == H3RenderPolicy.verifiedHeight {
-                status = .verified
+            } else if id == .h3_16x9_0p4mp || id == .h3_9x16_0p4mp {
+                status = .reference
             } else {
                 status = .baseRender
             }
@@ -169,7 +176,7 @@ package struct H3RecipeCatalogue: Sendable {
         // The largest *sampleable* size, not the largest registered one: the
         // 2K entries are bigger and unreachable, and illustrating what cost
         // does with a size nobody can render teaches the wrong lesson.
-        if let base = self.rows.first(where: { $0.status == .verified }),
+        if let base = self.rows.first(where: { $0.status == .reference }),
            let top = self.rows
                .filter({ $0.status != .upscaleTarget })
                .max(by: { $0.width * $0.height < $1.width * $1.height }) {
@@ -185,14 +192,14 @@ package struct H3RecipeCatalogue: Sendable {
 
         out += "  " + Self.pad("recipe", 16) + Self.pad("size", 11)
              + Self.padLeft("aspect", 6) + Self.padLeft("tokens", 9)
-             + Self.padLeft("sampling", 10) + Self.padLeft("vs 864", 8)
+             + Self.padLeft("sampling", 10) + Self.padLeft("vs 0p4", 8)
              + "   status\n"
 
         // The baseline comes from the whole catalogue, not from the subset
-        // being printed: `--aspect 2k` filters out the verified row, and a
+        // being printed: `--aspect 2k` filters out the reference row, and a
         // relative column that emptied itself the moment you narrowed the
         // listing would drop the comparison exactly where it is most wanted.
-        let verified = self.rows.first { $0.status == .verified }?.estimateSeconds
+        let reference = self.rows.first { $0.status == .reference }?.estimateSeconds
         var previousGroup: String?
         for r in rows {
             // A blank line between families, so 28 ladder rows do not read as
@@ -201,7 +208,7 @@ package struct H3RecipeCatalogue: Sendable {
             if let p = previousGroup, p != group { out += "\n" }
             previousGroup = group
 
-            let relative = verified.map { String(format: "%.2fx", r.estimateSeconds / $0) } ?? "-"
+            let relative = reference.map { String(format: "%.2fx", r.estimateSeconds / $0) } ?? "-"
             out += "  " + Self.pad(r.id.rawValue, 16)
                  + Self.pad("\(r.width)x\(r.height)", 11)
                  + Self.padLeft(String(format: "%.3f", r.aspect), 6)
@@ -212,10 +219,11 @@ package struct H3RecipeCatalogue: Sendable {
         }
 
         out += "\n"
-        if rows.contains(where: { $0.status == .verified }) {
-            out += "verified      864x480 is the parity-gated shape and the only one with a "
-                 + "measured tolerance\n              behind it. Every speed figure in this "
-                 + "project is quoted against it.\n"
+        if rows.contains(where: { $0.status == .reference }) {
+            out += "reference     the rung every other is priced against, and where this "
+                 + "port's ANE and\n              decode numbers were measured. NOT verified: "
+                 + "864x480 held that, and the\n              ladder no longer contains it. "
+                 + "No rung has been through Tools/ShapeVet.\n"
         }
         if rows.contains(where: { $0.status == .overCeiling }) {
             out += String(format:

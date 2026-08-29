@@ -95,17 +95,25 @@ package struct Catalog: Sendable {
     /// `precision` names a key in the config's per-partition table, not a
     /// dtype: the caller has already been told by the memory planner which key
     /// fits, and the catalog's job is to find it and prove it is what it claims.
-    package func resolve(mode: RenderMode, precision: String) throws -> Resolution {
+    package func resolve(mode: RenderMode, precision: String,
+                         profile: H3RenderProfile = .standard) throws -> Resolution {
         let ditTable = mode.requiredPartition == .ref2va
             ? config.checkpoints.ref2va : config.checkpoints.fl2va
-        let role = "dit \(mode.requiredPartition.rawValue)/\(precision)"
+        let key = profile.checkpointKey(precision: precision)
+        let role = "dit \(mode.requiredPartition.rawValue)/\(key)"
 
-        guard let ditPath = ditTable[precision], let ditURL = config.resolve(ditPath) else {
+        guard let ditPath = ditTable[key], let ditURL = config.resolve(ditPath) else {
             let have = ditTable.keys.sorted().joined(separator: ", ")
+            // The turbo miss is worth its own sentence: the likely cause is a
+            // configuration that predates the profile split, where the distill
+            // was filed under a plain precision key.
+            let hint = profile == .turbo
+                ? " — a turbo render needs a distilled checkpoint at '\(key)'"
+                : ""
             throw H3Error.checkpointMissing(
                 role: role,
-                path: "no '\(precision)' entry for \(mode.requiredPartition.rawValue) "
-                    + "in the configuration (have: \(have.isEmpty ? "nothing" : have))")
+                path: "no '\(key)' entry for \(mode.requiredPartition.rawValue) "
+                    + "in the configuration (have: \(have.isEmpty ? "nothing" : have))\(hint)")
         }
         let dit = try identify(role, ditURL)
         try dit.validate(forMode: mode,
@@ -115,6 +123,8 @@ package struct Catalog: Sendable {
         // is that it exists at the requested precision — falling back a tier
         // silently would change the conditioning without changing the render's
         // description of itself.
+        // Precision, never the profile's key: the text encoder is shared, and a
+        // turbo render conditions on exactly the same weights a standard one does.
         let tePrecision = precision.hasPrefix("pruned") ? String(precision.dropFirst(7)) : precision
         guard let tePath = config.checkpoints.textEncoder[tePrecision],
               let teURL = config.resolve(tePath) else {

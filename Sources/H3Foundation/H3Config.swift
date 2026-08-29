@@ -82,3 +82,32 @@ package enum H3Video {
     /// above is untested. 124 frames is about 5s at 24fps.
     package static let trainedFrameRange: ClosedRange<Int> = 124...362
 }
+
+/// Which model answers a render, and therefore how many steps it takes.
+///
+/// These are two different checkpoints, not two settings on one. `turbo` is a
+/// DMD-distilled student that jumps between four fixed noise levels — its step
+/// count is a property of its weights, not a preference, so `--steps` does not
+/// apply to it. `standard` is the base model following the flow schedule at
+/// whatever step count is asked for, which is where the step cache earns its
+/// keep: at four rungs warmup and cooldown already cover every step, and only a
+/// longer schedule leaves anything for it to skip.
+///
+/// They are addressed in the configuration by a key prefix on the same
+/// per-partition table the precision uses, so `turbo` at `bf16` reads
+/// `turbo_bf16`. A distilled checkpoint filed under a plain precision key would
+/// make `bf16` name a model rather than a dtype, which is exactly the confusion
+/// this enum exists to end.
+package enum H3RenderProfile: String, Sendable, CaseIterable, Codable {
+    case turbo
+    case standard
+
+    /// The configuration key this profile reads for a given precision.
+    package func checkpointKey(precision: String) -> String {
+        self == .turbo ? "turbo_\(precision)" : precision
+    }
+
+    /// The step count to use when the caller did not ask for one. A distilled
+    /// checkpoint overrides this from its own metadata; the base model does not.
+    package var defaultSteps: Int { self == .turbo ? 4 : 20 }
+}

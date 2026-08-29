@@ -80,6 +80,32 @@ each tile's own dimensions, so every tile decodes as a complete image spanning
 **Check this before picking a rung.** It is independent of the DiT's token
 count, so a shape can be cheap to sample and expensive to decode.
 
+## The ladder is chosen for tiles, not only for pixels
+
+Each megapixel rung is the fewest-tile shape within 10% of its target, inside an
+aspect band of 1.70 to 1.87, and strictly larger than the rung below it. Both
+axes stay multiples of 32, so the VAE's /16 and the DiT's /2 patch both divide
+without remainder -- that constraint is prior to everything else here.
+
+    mp    was          tiles      now          tiles   decode
+    0.4   864x480      15         832x448       8      1.88x
+    0.6   1056x608     18         1024x576     15      1.20x
+    0.9   1280x736     28         1216x704     24      1.17x
+    1.2   1504x832     32         1408x800     28      1.14x
+    1.5   1664x928     45         1600x928     40      1.12x
+    1.8   1824x1024    50         1792x1024    45      1.11x
+    2.0   1920x1088    60         1888x1024    50      1.20x
+
+Four rungs were already tile-minimal and moved only to keep the ladder strictly
+increasing. Two properties are worth stating because a naive re-derivation
+breaks them: rungs must not collide (a first pass put 0.7 and 0.8 on the same
+shape, and 1.8 and 2.0 on another), and tile counts must not go backwards as
+megapixels rise.
+
+**Decode is about 15% of a render, so these are 1.5-4% end to end.** The larger
+effect is that tile-minimal shapes carry 4-10% fewer pixels, which cuts sampling
+quadratically -- but that is partly just a smaller frame, not a free win.
+
 ## Duration is the expensive axis
 
 `H3Video.trainedFrameRange` is `124...362` -- at 24 fps, 5.2 s to 15.1 s, with
@@ -106,9 +132,17 @@ only sampling pays the quadratic.
 | rung | tokens | ANE | distill gain | calm | motion | speech | texture |
 |---|---:|---|---:|---|---|---|---|
 | 352x608 | 8,147 | routes | 1.34-1.78x | ok | ok | **fails, both arms** | ok |
-| 448x832 | 13,938 | routes | not run | — | — | — | — |
+| 448x832 | 13,882 | routes | not run | — | — | — | — |
 
-448x832 has **not** been through `vet.sh`. It is listed because it is the shape
-the ANE and decode measurements in `docs/ANE.md` were taken at, and because many
-four-step speech renders were judged good by eye and ear there — which is not
-what the columns above mean. Running the harness on it is outstanding work.
+**No current rung is verified, and that is a regression the ladder chose.**
+864x480 held the verification — parity gate and lip-sync on both arms — and the
+ladder no longer contains it: rungs are now picked for the decoder's tile grid,
+which moved 0.4 MP to 832x448 for 1.88x the decode speed. Verification does not
+travel with a name, so `h3 recipes` calls that rung `reference` rather than
+`verified`, and `H3RenderPolicy.verified*` still records 864x480 as what was
+actually measured. It stays reachable with explicit `--width 864 --height 480`.
+
+448x832 is listed because it is where the ANE and decode measurements in
+`docs/ANE.md` were taken, and because four-step speech renders were judged good
+by eye and ear there — which is not what the columns above mean. Running
+`vet.sh` on it is the outstanding work.
