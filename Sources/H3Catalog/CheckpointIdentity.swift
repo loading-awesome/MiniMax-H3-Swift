@@ -155,6 +155,24 @@ package struct CheckpointIdentity: Sendable, Equatable {
                                   distilledSteps: distilledSteps)
     }
 
+    /// The ladder a distilled checkpoint will actually run, honouring an
+    /// override.
+    ///
+    /// The checkpoint's own `[999, 749, 500, 250]` is what the student was
+    /// trained for and stays the default. But a denser ladder on the same base
+    /// grid measurably cleans up the audio — six rungs recovers nearly all of
+    /// it, eight adds nothing further — so the count has to be reachable
+    /// without a rebuild. Named to mirror FastVideo's own
+    /// `FASTVIDEO_DMD_DENOISING_STEPS`, which does the same job on their side.
+    package static func distilledSteps(for url: URL) -> [Int]? {
+        if let raw = ProcessInfo.processInfo.environment["H3_DMD_DENOISING_STEPS"] {
+            let steps = raw.split(separator: ",")
+                .compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+            if !steps.isEmpty { return steps }
+        }
+        return (try? identify(url: url))?.distilledSteps
+    }
+
     /// Refuses a checkpoint that cannot be used safely for `mode`.
     ///
     /// Two independent refusals, both of which the experimental tree lacked:

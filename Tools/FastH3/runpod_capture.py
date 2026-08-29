@@ -32,13 +32,17 @@ from pathlib import Path
 import torch
 from safetensors.torch import save_file
 
-MODEL = "FastVideo/FastVideo-FastH3-4-step-Preview-v1-Dense-DataFree"
+# Point at the already-downloaded snapshot. Passing the repo id makes the
+# pipeline re-resolve from the Hub even when every file is local, and that
+# round trip failed with an xet writer error. --model overrides it.
+MODEL = "/workspace/fasth3-dense"
 PROMPT = ("a woman with freckles talking directly to camera in a sunlit kitchen, "
           "explaining a recipe, natural hand gestures")
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="/workspace/capture")
+    ap.add_argument("--model", default=MODEL, help="local snapshot dir or repo id")
     ap.add_argument("--offload", action="store_true", help="H100-80GB: layerwise offload")
     args = ap.parse_args()
     out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
@@ -91,7 +95,7 @@ def main():
     kwargs = dict(num_gpus=1)
     if args.offload:
         kwargs["dit_layerwise_offload"] = True
-    gen = VideoGenerator.from_pretrained(MODEL, **kwargs)
+    gen = VideoGenerator.from_pretrained(args.model, **kwargs)
     request = GenerationRequest(
         prompt=PROMPT,
         sampling=SamplingConfig(
@@ -101,14 +105,27 @@ def main():
     )
     gen.generate(request)
 
+    # The final audio latent also goes out as .npy: it is the single most
+    # decisive artifact, and decoding it through OUR audio VAE needs no torch
+    # on the receiving side. If it sounds clean, our loop is the fault; if it
+    # is equally off, the checkpoint's four-step audio is the ceiling.
+    import numpy as np
+    for key in ("final.audio_latent", "final.video_latent"):
+        if key in tensors:
+            np.save(str(out / f"{key}.npy"), tensors[key].numpy())
+
     save_file(tensors, str(out / "trajectory.safetensors"),
-              metadata={"model": MODEL, "prompt": PROMPT, "seed": "7",
+              metadata={"model": args.model, "prompt": PROMPT, "seed": "7",
                         "commit": "48a047c05ff4138f20cfa33351499c6ec5945f5d"})
     manifest = {k: list(v.shape) for k, v in tensors.items()}
     (out / "manifest.json").write_text(json.dumps(manifest, indent=1))
     with tarfile.open(out / "capture.tar", "w") as tar:
-        for f in ("trajectory.safetensors", "manifest.json", "reference.mp4"):
-            tar.add(out / f, arcname=f)
+        for f in ("trajectory.safetensors", "manifest.json",
+                  "final.audio_latent.npy", "final.video_latent.npy"):
+            if (out / f).exists():
+                tar.add(out / f, arcname=f)
+        for mp4 in sorted(out.glob("*.mp4")):
+            tar.add(mp4, arcname=mp4.name)
     print(f"capture complete: {out}/capture.tar")
     print(json.dumps(manifest, indent=1)[:1500])
 

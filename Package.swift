@@ -101,6 +101,14 @@ let package = Package(
         // had for some time, so it could not be built by any documented means
         // and nothing noticed.
         .executableTarget(
+            name: "h3-decode-audio",
+            dependencies: [
+                "H3Foundation", "H3Modules",
+                .product(name: "MLX", package: "mlx-swift"),
+            ],
+            path: "Tools/FastH3", sources: ["decode_audio_latent.swift"]
+        ),
+        .executableTarget(
             name: "h3-facecheck",
             dependencies: [.product(name: "ArgumentParser", package: "swift-argument-parser")],
             path: "Tools", exclude: ["ANE", "LipSyncCheck.swift", "__pycache__", "anchor_check.py", "arm_compare.py", "audio_match.py", "coherence_check.py", "speech_check.py"], sources: ["FaceCheck.swift"]

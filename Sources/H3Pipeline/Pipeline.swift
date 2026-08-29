@@ -267,7 +267,7 @@ package enum PipelineRuntime {
             ProcessInfo.processInfo.environment["H3_IGNORE_DISTILLED"] == "1"
         if ignoreDistilled { request.distilledSteps = nil }
         if !ignoreDistilled, request.distilledSteps == nil,
-           let steps = (try? CheckpointIdentity.identify(url: checkpoints.dit))?.distilledSteps {
+           let steps = CheckpointIdentity.distilledSteps(for: checkpoints.dit) {
             request.distilledSteps = steps
             request.steps = steps.count
         }

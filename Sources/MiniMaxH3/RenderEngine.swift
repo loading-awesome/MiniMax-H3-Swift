@@ -169,7 +169,7 @@ private enum RenderOperation {
         // the time estimate five times pessimistic.
         var request = request
         if ProcessInfo.processInfo.environment["H3_IGNORE_DISTILLED"] != "1",
-           let steps = (try? CheckpointIdentity.identify(url: models.dit.url))?.distilledSteps {
+           let steps = CheckpointIdentity.distilledSteps(for: models.dit.url) {
             request.distilledSteps = steps
             request.steps = steps.count
         }

@@ -115,6 +115,14 @@ enum SamplingLoop {
         let videoSampler = Sampler()
         let audioSampler = Sampler()
 
+        let capture = TrajectoryCapture(log: log)
+        if let capture {
+            capture.note("sigmas \(sigmas.map { String(format: "%.6f", $0) }.joined(separator: " "))")
+            capture.note("video_shape \(currentVideo.shape)  audio_shape \(currentAudio.shape)")
+            capture.write(currentVideo, "initial.video_noise")
+            capture.write(currentAudio, "initial.audio_noise")
+        }
+
         var stepSeconds: [Double] = []
         for i in 0 ..< steps {
             let stepBegan = Date()
@@ -145,6 +153,18 @@ enum SamplingLoop {
                 // never performs -- ~0.4% multiplicative noise on every audio
                 // velocity, absent from every pipeline whose audio is clean.
                 scaleAudioVelocity: distilled == nil)
+
+            if let capture {
+                // Latents BEFORE the update and velocities as the model
+                // returned them: the pair that separates a sampler fault from
+                // a forward-pass fault at each rung.
+                eval(currentVideo, currentAudio, videoVelocity, audioVelocity)
+                capture.write(currentVideo, "step\(i).video_latent_in")
+                capture.write(currentAudio, "step\(i).audio_latent_in")
+                capture.write(videoVelocity, "step\(i).video_velocity")
+                capture.write(audioVelocity, "step\(i).audio_velocity")
+                capture.note("step \(i) sigma \(sigma) sigma_next \(sigmaNext)")
+            }
 
             let videoDenoised = currentVideo - videoVelocity * MLXArray(sigma)
             let audioDenoised = currentAudio - audioVelocity * MLXArray(sigma)
@@ -224,6 +244,11 @@ enum SamplingLoop {
             eval(currentVideo, currentAudio)
             stepSeconds.append(Date().timeIntervalSince(stepBegan))
             onStep(i + 1, steps)
+        }
+
+        if let capture {
+            capture.write(currentVideo, "final.video_latent")
+            capture.write(currentAudio, "final.audio_latent")
         }
 
         // Both branches' traces, kept as separate rows rather than merged. Under
