@@ -996,9 +996,39 @@ public enum ANELinearBackend {
             }
             return best
         }
-        let metal = best(2) { MLX.eval(MLX.matmul(x, weight.transposed())) }
+        // The activation is materialised before either side is timed.
+        //
+        // Without this the first Metal sample pays for computing `x` and the
+        // engine side, which runs second, never does — so the two sides are
+        // not timed on the same work. It matters most exactly where the
+        // verdict matters most: `x` for `attn out` is the attention output, so
+        // the side that goes first absorbs a whole block's attention.
+        MLX.eval(x)
+
+        // One untimed run of each side before sampling either.
+        //
+        // The engine's first call compiles two programs and allocates its
+        // surfaces, and Metal's first call builds a kernel. Neither is paid
+        // again for the rest of the render, so neither belongs in a sample
+        // that decides the whole render's schedule.
+        MLX.eval(MLX.matmul(x, weight.transposed()))
+        guard let warm = start(x: x, weight: weight, share: share, label: label)
+        else {
+            calibrationLock.lock(); routingVerdict[key] = false; calibrationLock.unlock()
+            return false
+        }
+        MLX.eval(Pending(warm).value())
+
+        // Three samples rather than two.
+        //
+        // At 448x832 the two-sample version did not decide the same way twice:
+        // four otherwise identical renders routed four projections, then four,
+        // then three, then two, and the sampling phase tracked it — 166.9 s
+        // and 173.7 with four against 188.1 with two. One unlucky sample was
+        // switching off a projection worth having for the whole render.
+        let metal = best(3) { MLX.eval(MLX.matmul(x, weight.transposed())) }
         var routed = Double.infinity
-        for _ in 0 ..< 2 {
+        for _ in 0 ..< 3 {
             let began = Date()
             guard let body = start(x: x, weight: weight, share: share,
                                    label: label) else { routed = .infinity; break }

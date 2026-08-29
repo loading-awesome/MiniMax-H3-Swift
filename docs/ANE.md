@@ -54,7 +54,7 @@ Every later call hits the refusal cache, and the two renders are bit-identical
 -- PSNR inf, not merely close -- so the attention arithmetic is provably
 untouched. What a backend that computes nothing is costing is still unknown.
 
-## The routing calibration is a coin flip worth about 18 s
+## The routing calibration was a coin flip, and is now settled
 
 `routingBeatsMetal` races the engine against Metal once per shape and caches
 the verdict, and at this shape it does not decide the same way twice. Across
@@ -69,6 +69,24 @@ materialised, and the wait that dominates in production -- `start` calls
 `eval` on an activation whose input is the attention output -- has already been
 paid. And it races one projection alone, where the dies are idle, rather than
 against the other projections competing for them.
+
+Three changes settle it. The activation is materialised before either side is
+timed, so both are timed on the same work. Each side gets one untimed run
+first, so program compilation and kernel build stay out of the samples. And
+the sample count went from two to three.
+
+Four renders after, against four before:
+
+    before  166.9  173.7  174.5  188.1   mean 175.8  spread 21.2
+    after   175.0  176.4  176.5  177.2   mean 176.3  spread  2.2
+
+**This buys predictability, not speed.** The mean is unchanged; what is gone is
+a render arriving 12 s slow because a millisecond race fell the wrong way. All
+four runs now route all four projections.
+
+It does not explain everything. The 166.9 s run routed all four projections
+too, so the routing set accounts for the slow tail and not for that fast
+outlier, which remains unexplained.
 
 The phase report shows the same effect from the other side: with ANE attention
 `attn out` carries a 360 ms materialise, and with Metal attention that cost
