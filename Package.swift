@@ -101,6 +101,15 @@ let package = Package(
         // had for some time, so it could not be built by any documented means
         // and nothing noticed.
         .executableTarget(
+            name: "h3-bench-vae",
+            dependencies: [
+                "H3Foundation", "H3Modules",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXRandom", package: "mlx-swift"),
+            ],
+            path: "Tools/FastH3", sources: ["bench_vae_decode.swift"]
+        ),
+        .executableTarget(
             name: "h3-decode-audio",
             dependencies: [
                 "H3Foundation", "H3Modules",
