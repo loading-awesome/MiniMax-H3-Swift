@@ -60,11 +60,17 @@ struct RenderCommand: AsyncParsableCommand {
     @Option(help: "explicit height, a multiple of 32")
     var height: Int?
 
+    @Option(help: "a ladder rung: 0.2 … 2.0, with --aspect-ratio deciding which way up")
+    var megapixels: Double?
+
     @Option(help: "a registered recipe, e.g. h3_16x9_0p4mp (832x448); see `h3 recipes`")
     var recipe: H3RecipeID?
 
+    /// Optional so a recipe that already fixes the orientation can tell a
+    /// caller who also asked for one that they disagree, instead of silently
+    /// keeping the recipe's.
     @Option(help: "16:9, 9:16, 21:9, 4:3, 3:4 or 1:1")
-    var aspectRatio: RenderRequest.AspectRatio = .r16x9
+    var aspectRatio: RenderRequest.AspectRatio?
 
     @Option(help: "768p, or 2k which is an upscale target rather than a render size")
     var resolution: RenderRequest.ResolutionTier = .p768
@@ -142,8 +148,8 @@ struct RenderCommand: AsyncParsableCommand {
             negativePrompt: negativePrompt,
             seconds: seconds, steps: steps ?? profile.defaultSteps,
             seed: UInt64(max(0, seed)),
-            width: width, height: height, recipe: recipe,
-            aspectRatio: aspectRatio, resolution: resolution,
+            width: width, height: height, megapixels: megapixels, recipe: recipe,
+            aspectRatio: aspectRatio ?? .r16x9, resolution: resolution,
             firstFrame: firstFrame.map(URL.init(fileURLWithPath:)),
             lastFrame: lastFrame.map(URL.init(fileURLWithPath:)),
             keyframes: try keyframes.map(RenderRequest.Keyframe.init(spec:)),
@@ -160,6 +166,24 @@ struct RenderCommand: AsyncParsableCommand {
             attentionBackend: attention ?? cfg.attention.backend,
             allowSuboptimal: allowSuboptimal,
             overwriteOutput: overwrite)
+        // A recipe names both size and orientation. An --aspect-ratio beside one
+        // that disagrees was previously ignored in silence, which is how a
+        // caller asks for portrait and gets landscape.
+        if let id = recipe, let asked = aspectRatio {
+            let isPortrait = id.rawValue.contains("9x16") || id.rawValue.contains("3_4")
+                || id.rawValue.contains("9_16")
+            let wants = asked == .r9x16 || asked == .r3x4
+            if isPortrait != wants {
+                throw H3Error.invalidRequest(
+                    rule: "conflicting orientation",
+                    detail: "recipe \(id.rawValue) is "
+                          + "\(isPortrait ? "portrait" : "landscape") and --aspect-ratio "
+                          + "\(asked.rawValue) is \(wants ? "portrait" : "landscape")",
+                    remedy: "drop --aspect-ratio, or swap the recipe for its transpose — "
+                          + "or use --megapixels, which takes the orientation from "
+                          + "--aspect-ratio.")
+            }
+        }
         try request.validate()
 
         // Which partition is needed follows from the mode, so the catalog is

@@ -158,8 +158,12 @@ struct RenderRequestTests {
     @Test("dimensions come from whichever source was given, in the stated order")
     func dimensionPrecedence() throws {
         #expect(try Self.base { $0.width = 864; $0.height = 480 }.dimensions() == (864, 480))
-        #expect(try Self.base().dimensions() == (1344, 768))
-        #expect(try Self.base { $0.aspectRatio = .r9x16 }.dimensions() == (768, 1344))
+        // The 16:9 fallback is the ladder's 0.98 rung rather than a size of its
+        // own, so that --aspect-ratio and --recipe cannot disagree about what
+        // 768p means. It moved with the ladder when that was re-derived for the
+        // decoder's tile grid; `MegapixelShapeTests` pins the tie itself.
+        #expect(try Self.base().dimensions() == (1376, 768))
+        #expect(try Self.base { $0.aspectRatio = .r9x16 }.dimensions() == (768, 1376))
         #expect(try Self.base { $0.aspectRatio = .r1x1 }.dimensions() == (768, 768))
     }
 

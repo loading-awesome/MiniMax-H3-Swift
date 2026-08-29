@@ -147,6 +147,16 @@ public struct RenderRequest: Sendable {
     /// off the ladder rather than for the one size that most needed it.
     public var width: Int?
     public var height: Int?
+    /// A rung of the megapixel ladder, chosen with `aspectRatio` deciding the
+    /// orientation.
+    ///
+    /// The ladder ids already carry both — `h3_9x16_0p4mp` is 0.4 MP portrait —
+    /// but only for a caller who knows the naming. This is the same choice
+    /// spelled the way it is usually thought about: how big, and which way up.
+    /// Resolves to exactly the rung `recipe` would have named, so the two
+    /// cannot describe different shapes.
+    public var megapixels: Double?
+
     public var recipe: H3RecipeID?
     public var aspectRatio: AspectRatio
     public var resolution: ResolutionTier
@@ -264,6 +274,7 @@ public struct RenderRequest: Sendable {
                 seed: UInt64 = 0,
                 width: Int? = nil,
                 height: Int? = nil,
+                megapixels: Double? = nil,
                 recipe: H3RecipeID? = nil,
                 aspectRatio: AspectRatio = .r16x9,
                 resolution: ResolutionTier = .p768,
@@ -289,6 +300,7 @@ public struct RenderRequest: Sendable {
         self.seed = seed
         self.width = width
         self.height = height
+        self.megapixels = megapixels
         self.recipe = recipe
         self.aspectRatio = aspectRatio
         self.resolution = resolution
@@ -400,6 +412,36 @@ public struct RenderRequest: Sendable {
     public var usesApproximateSampling: Bool { cacheThreshold > 0 }
 
     /// Pixel dimensions, from whichever source was given.
+    /// The ladder rung for a megapixel target and an orientation.
+    ///
+    /// Refuses rather than rounds. The rungs are 0.2 apart at the bottom and
+    /// 0.2 to 0.3 apart at the top, so a silent nearest-match would hand back a
+    /// shape the caller did not ask for and could not see they had not got.
+    static func ladderShape(_ mp: Double,
+                            _ aspect: AspectRatio) throws -> (width: Int, height: Int) {
+        let portrait: Bool
+        switch aspect {
+        case .r16x9: portrait = false
+        case .r9x16: portrait = true
+        default:
+            throw H3Error.invalidRequest(
+                rule: "no ladder for this aspect ratio",
+                detail: "the megapixel ladder is 16:9 and its transpose. "
+                      + "\(aspect.rawValue) has a single 768p size and no rungs.",
+                remedy: "use --aspect-ratio 16:9 or 9:16 with --megapixels, or drop "
+                      + "--megapixels and take the 768p size for this ratio.")
+        }
+        guard let rung = H3Ladder.rungs.first(where: { $0.megapixels == mp }) else {
+            let have = H3Ladder.rungs.map { String(format: "%g", $0.megapixels) }
+                .joined(separator: ", ")
+            throw H3Error.invalidRequest(
+                rule: "no such megapixel rung",
+                detail: "the ladder has no \(String(format: "%g", mp)) MP rung",
+                remedy: "pick one of: \(have) — or run `h3 recipes` for their sizes and costs.")
+        }
+        return portrait ? (rung.height, rung.width) : (rung.width, rung.height)
+    }
+
     public func dimensions() throws -> (width: Int, height: Int) {
         if let id = recipe {
             guard let rec = H3RecipeRegistry.all[id] else {
@@ -410,13 +452,20 @@ public struct RenderRequest: Sendable {
             return (rec.targetWidth, rec.targetHeight)
         }
         if let w = width, let h = height { return (w, h) }
+        if let mp = megapixels { return try Self.ladderShape(mp, aspectRatio) }
         // The 768p landscape and portrait sizes here are the ladder's 0.98 MP
         // rung, so `--aspect-ratio` and `--recipe` cannot disagree about what
-        // 768p means. The other four ratios have no ladder and only this.
+        // 768p means. **That is an invariant, not a coincidence**: when the
+        // ladder was re-derived for the decoder's tile grid the 0.98 rung moved
+        // from 1344x768 to 1376x768 and this was left behind, so for a while
+        // the default shape was one no rung named. The other four ratios have
+        // no ladder and only this.
         let is2k = resolution == .k2
+        let p768 = H3Ladder.rungs.first { $0.megapixels == 0.98 }
+        let landscape = p768.map { ($0.width, $0.height) } ?? (1376, 768)
         switch aspectRatio {
-        case .r16x9: return is2k ? (2560, 1440) : (1344, 768)
-        case .r9x16: return is2k ? (1440, 2560) : (768, 1344)
+        case .r16x9: return is2k ? (2560, 1440) : landscape
+        case .r9x16: return is2k ? (1440, 2560) : (landscape.1, landscape.0)
         case .r21x9: return is2k ? (3360, 1440) : (1792, 768)
         case .r4x3:  return is2k ? (1920, 1440) : (1024, 768)
         case .r3x4:  return is2k ? (1440, 1920) : (768, 1024)
@@ -445,6 +494,29 @@ public struct RenderRequest: Sendable {
     /// Every problem with this request, thrown as one error rather than one per
     /// run. Cheap — no file is opened and no model is loaded.
     public func validate() throws {
+        // Every size input that is not the winning one has to be either absent
+        // or in agreement. Precedence is recipe, then width/height, then
+        // megapixels, then the aspect fallback — and a loser that disagrees is
+        // a caller who asked for a shape and got another without being told.
+        if let mp = megapixels {
+            let asked = try Self.ladderShape(mp, aspectRatio)
+            if let id = recipe, let rec = H3RecipeRegistry.all[id],
+               (rec.targetWidth, rec.targetHeight) != asked {
+                throw H3Error.invalidRequest(
+                    rule: "conflicting shape",
+                    detail: "--megapixels \(String(format: "%g", mp)) is "
+                          + "\(asked.width)x\(asked.height); recipe \(id.rawValue) is "
+                          + "\(rec.targetWidth)x\(rec.targetHeight)",
+                    remedy: "give one or the other — they name the same ladder.")
+            }
+            if let w = width, let h = height, (w, h) != asked {
+                throw H3Error.invalidRequest(
+                    rule: "conflicting shape",
+                    detail: "--megapixels \(String(format: "%g", mp)) is "
+                          + "\(asked.width)x\(asked.height); width and height ask for \(w)x\(h)",
+                    remedy: "give one or the other.")
+            }
+        }
         if (width == nil) != (height == nil) {
             throw H3Error.invalidRequest(
                 rule: "incomplete dimensions", detail: "width and height come as a pair",
