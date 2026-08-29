@@ -248,8 +248,10 @@ Useful `render` options:
 | | |
 |---|---|
 | `--out-audio out.wav` | also write the audio on its own |
+| `--profile turbo` | the four-step distill, ~4 min at 0.4 MP. `standard` is the base model at 20 steps |
+| `--recipe h3_16x9_0p4mp` | a named size; `h3 recipes` prices the menu |
 | `--seconds 4…15` | duration. Use 5 or more; 4 lands under the model's trained floor |
-| `--steps 20` | 20 is the verified value. **More is nearly free** — see below |
+| `--steps 20` | `standard` only — a turbo checkpoint takes its rungs from its own weights |
 | `--seed 7` | same seed, machine and version → the same video |
 | `--width` / `--height` | exact size, multiples of 32 |
 | `--aspect-ratio 16:9` | or `9:16`, `21:9`, `4:3`, `3:4`, `1:1` |

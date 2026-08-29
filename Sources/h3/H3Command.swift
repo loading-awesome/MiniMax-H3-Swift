@@ -33,8 +33,10 @@ struct H3: AsyncParsableCommand {
 
               h3 render --prompt "a red kite over a beach at sunset" --out kite.mp4
 
-            That is 5 seconds at 1344x768, and on an M3 Ultra it takes about
-            forty minutes. `h3 render --help` lists every option, and
+            That is 5 seconds at the default recipe on the four-step turbo
+            profile, which takes about four minutes on an M3 Ultra. Pass
+            `--profile standard` for the base model at 20 steps, which is
+            slower and is what the quality claims are made about. `h3 render --help` lists every option, and
             `h3 render --dry-run` prints the plan and the time estimate without
             loading a checkpoint — but note that a dry run costs a shape, it
             does not prove one will run. It returns before the engine starts,

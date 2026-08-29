@@ -93,7 +93,10 @@ package struct H3RecipeCatalogue: Sendable {
                 status = .upscaleTarget
             } else if estimate > H3RenderPolicy.maxEstimatedSeconds {
                 status = .overCeiling
-            } else if id == .h3_16x9_0p4mp || id == .h3_9x16_0p4mp {
+            } else if id == .h3_16x9_0p4mp {
+                // Landscape only. The portrait transpose has the same token
+                // count and none of the measurements, and crediting it with
+                // them is a bug this catalogue has already had once.
                 status = .reference
             } else {
                 status = .baseRender

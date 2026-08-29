@@ -46,6 +46,11 @@ simultaneously the parity-gated shape (225 gating taps inside the CUDA-measured
 class) and the shape proven to render a face detectable in 124/124 frames with
 its dialogue transcribed correctly. Nothing else has both properties.
 
+**It is no longer a recipe.** The ladder was re-derived for the decoder's tile
+grid and 0.4 MP is now 832x448, so the verified shape is reachable only with an
+explicit `--width 864 --height 480`. Verification does not travel with a name,
+and no current rung has been through `Tools/ShapeVet/vet.sh`.
+
 The banner prints a cost estimate — packed tokens, estimated sampling minutes,
 and the multiple of the verified config. It is computed from the DiT's actual
 FLOP count divided by the throughput a GEMM benchmark measured on this machine, and it

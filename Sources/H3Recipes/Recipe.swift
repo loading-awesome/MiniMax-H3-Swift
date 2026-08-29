@@ -53,7 +53,15 @@ package struct H3LadderRung: Sendable, Equatable {
     package let portrait: H3RecipeID
 }
 
-/// The recommended output sizes, as one table.
+/// The output-size ladder, derived rather than transcribed.
+///
+/// **This was upstream's recommended-size table and is no longer.** The 14
+/// rungs began as sizes someone else had measured, and were re-derived for the
+/// decoder's tile grid — see below. The names did not change, so a reader who
+/// remembers the old table would otherwise be right to assume these are still
+/// it. The other aspect families keep their single 768p entry precisely
+/// because deriving rungs for them would put invented sizes under names that
+/// do not say so.
 ///
 /// **Every rung is a multiple of 32 on both axes and none of them is exactly
 /// 16:9.** The VAE downsamples by 16 and the DiT patchifies by 2, so 32 is the
