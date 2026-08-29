@@ -143,7 +143,9 @@ move from mean -0.290932 rms 0.585363 to mean -0.293184 rms 0.585261, which is
 fp16 drift and not the silent zeros the DiT's `fc2` scale table exists to
 prevent, so this checkpoint needs no such table. It loses because `qkv` and
 `ff1` already keep both dies busy and a third projection in the same sequential
-chain contends rather than adds. `H3_ANE_VAE_FF2` re-runs the measurement.
+chain contends rather than adds. The flag that routed it has been removed;
+re-running the measurement means restoring the `vaeLinear` call in
+`VaeFeedForward`.
 
 ## What the engine is not worth
 

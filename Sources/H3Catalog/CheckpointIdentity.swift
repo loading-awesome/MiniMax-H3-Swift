@@ -159,11 +159,15 @@ package struct CheckpointIdentity: Sendable, Equatable {
     /// override.
     ///
     /// The checkpoint's own `[999, 749, 500, 250]` is what the student was
-    /// trained for and stays the default. But a denser ladder on the same base
-    /// grid measurably cleans up the audio — six rungs recovers nearly all of
-    /// it, eight adds nothing further — so the count has to be reachable
-    /// without a rebuild. Named to mirror FastVideo's own
-    /// `FASTVIDEO_DMD_DENOISING_STEPS`, which does the same job on their side.
+    /// trained for and stays the default. A denser ladder on the same base grid
+    /// is reachable without a rebuild, which is what this is for.
+    ///
+    /// It is worth saying what a denser ladder does *not* fix, because this
+    /// override was added while chasing the wrong cause. Six rungs appeared to
+    /// clean up robotic audio, and did — but only on a prompt that left the
+    /// speech underspecified. Name the language and give the prompt a line of
+    /// dialogue and four rungs are already clean, so the ladder was never the
+    /// lever. Named to mirror FastVideo's `FASTVIDEO_DMD_DENOISING_STEPS`.
     package static func distilledSteps(for url: URL) -> [Int]? {
         if let raw = ProcessInfo.processInfo.environment["H3_DMD_DENOISING_STEPS"] {
             let steps = raw.split(separator: ",")

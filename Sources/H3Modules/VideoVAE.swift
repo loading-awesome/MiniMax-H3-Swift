@@ -164,10 +164,6 @@ struct VaeAttention {
 }
 
 struct VaeFeedForward {
-    /// Opt-in, because the failure mode is silent zeros rather than an error.
-    static let routeW2 =
-        ProcessInfo.processInfo.environment["H3_ANE_VAE_FF2"] == "1"
-
     let w1Weight: MLXArray
     let w1Bias: MLXArray
     let w2Weight: MLXArray
@@ -178,28 +174,11 @@ struct VaeFeedForward {
         let innerDim = h.dim(-1) / 2
         let gate = h[0..., 0..., 0 ..< innerDim]
         let up = h[0..., 0..., innerDim...]
-        // w2 stays on the GPU, and not for the reason expected.
-        //
-        // The hazard that keeps the DiT's fc2 behind a generated per-block
-        // scale table is saturation: k = 8192 drives interior partials past an
-        // fp16 cliff that returns zero silently. That does not happen here.
-        // Routed against the identical latent, the decode's pixels move from
-        // mean -0.290932 rms 0.585363 to mean -0.293184 rms 0.585261 — the
-        // drift of fp16 arithmetic, not the collapse of silent zeros, so this
-        // checkpoint needs no scale table.
-        //
-        // It loses on time instead: 28.09 s against 27.11 s. Calibration
-        // accepts it, because it races one projection against Metal in
-        // isolation, and in isolation it wins. In the block it does not: qkv
-        // and ff1 already keep both dies busy, and a third projection in the
-        // same sequential chain contends for them rather than adding to them.
-        // There is no window to hide the extra upload in.
-        //
-        // The flag stays so the measurement can be repeated on another shape,
-        // where the balance may differ.
-        let inner = silu(gate) * up
-        guard VaeFeedForward.routeW2 else { return matmul(inner, w2Weight.T) + w2Bias }
-        return vaeLinear(inner, w2Weight, w2Bias, label: "vae ff2")
+        // w2 stays on the GPU. Not saturation — it routes correctly — but
+        // contention: qkv and ff1 already keep both dies busy, and a third
+        // projection in the same sequential chain has no window to hide its
+        // upload in. Measured in docs/ANE.md.
+        return matmul(silu(gate) * up, w2Weight.T) + w2Bias
     }
 }
 
@@ -681,12 +660,8 @@ package final class VideoVAE {
         // activation is uploaded transposed as `[k, s]`, so `s` becomes the
         // IOSurface's width and the engine simply fails to build past roughly
         // 80,000 — every projection then silently falls back to Metal. And
-        // even at a width that does build, it is slower. Measured on
-        // 448x832x124, chunks per batch against decode seconds:
-        //
-        //     1  27.28    2  29.39    3  29.95 (engine declines)    6  33.15
-        //
-        // So the batch is exactly one chunk.
+        // even at a width that does build, it is slower. So the batch is
+        // exactly one chunk; the sweep behind that is in docs/ANE.md.
         for i in 0 ..< numChunks {
             let tStartIdx = i * tokensChunkSize
             let tEndIdx = tStartIdx + tokensChunkSize + tokenOverlap

@@ -219,13 +219,8 @@ public enum ANELinearBackend {
     /// one, which sits higher than the DiT's because only `qkv` and `ff1` are
     /// routable here.
     ///
-    /// Measured 2026-08-29, 448x832x124, decode seconds against share:
-    ///
-    ///     0.29  30.68    0.50  28.61    0.70  29.23
-    ///     0.40  29.06    0.62  28.10    0.80  30.50
-    ///
-    /// A plateau from 0.50 to 0.62 with a cliff past it, against 31.79 with the
-    /// engine off. `H3_ANE_SHARE_VAE` sweeps it.
+    /// A plateau from 0.50 to 0.62 with a cliff past it; the sweep is in
+    /// docs/ANE.md. `H3_ANE_SHARE_VAE` re-runs it.
     nonisolated(unsafe) static var vaeShare: Double =
         envShare("H3_ANE_SHARE") ?? envShare("H3_ANE_SHARE_VAE") ?? 0.56
 
@@ -1019,13 +1014,9 @@ public enum ANELinearBackend {
         }
         MLX.eval(Pending(warm).value())
 
-        // Three samples rather than two.
-        //
-        // At 448x832 the two-sample version did not decide the same way twice:
-        // four otherwise identical renders routed four projections, then four,
-        // then three, then two, and the sampling phase tracked it — 166.9 s
-        // and 173.7 with four against 188.1 with two. One unlucky sample was
-        // switching off a projection worth having for the whole render.
+        // Three samples rather than two. With two, this did not decide the
+        // same way twice at one shape, and one unlucky sample switched off a
+        // projection worth having for the whole render.
         let metal = best(3) { MLX.eval(MLX.matmul(x, weight.transposed())) }
         var routed = Double.infinity
         for _ in 0 ..< 3 {

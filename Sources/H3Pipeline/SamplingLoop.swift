@@ -208,14 +208,23 @@ enum SamplingLoop {
                 //
                 // which is algebraically `(1 - s_next) * x0 + s_next * eps` with
                 // the SAME eps the latent already carries -- DDIM-style, not a
-                // re-noise. Three faithful-looking alternatives all produced
-                // robotic audio: fresh noise per stream (upstream's optional
-                // branch), fresh noise at the video sigma, and velocity Euler in
-                // video-sigma space -- the last overshoots the audio ladder by
-                // 9% on the first rung and 150% on the final one, because the
-                // slope at a rung's start is not the secant across a giant step.
-                // Video tolerates all of them; audio is the stream that hears
-                // the difference. At sigmaNext == 0 the ratio is 0 and the step
+                // re-noise.
+                //
+                // This is confirmed against the reference's own tensors rather
+                // than by ear: `Tools/FastH3/solve_audio_rule.py` fits
+                // `x_next = a*x + b*v` over their dumps and recovers a = 1.0
+                // with b equal to each stream's own sigma gap, residual 3.6e-08.
+                // That matters because the ear was the original instrument and
+                // it was unreliable -- the robotic audio that motivated three
+                // rewrites of this branch turned out to be an underspecified
+                // prompt, so any variant judged "wrong by listening" was judged
+                // under a confound.
+                //
+                // The arithmetic still rules one alternative out on its own
+                // terms: velocity Euler in video-sigma space overshoots the
+                // audio ladder by 9% on the first rung and 150% on the last,
+                // because the slope at a rung's start is not the secant across
+                // a giant step. At sigmaNext == 0 the ratio is 0 and the step
                 // reduces to x0 exactly, so the last rung needs no branch.
                 let ratioVideo = sigmaNext / sigma
                 currentVideo = MLXArray(ratioVideo) * currentVideo
