@@ -124,6 +124,16 @@ public struct RenderRequest: Sendable {
     public var negativePrompt: String?
     public var seconds: Int
     public var steps: Int
+
+    /// A distilled checkpoint's own denoising steps, out of 1000, taken from
+    /// its metadata. Nil for the base model, which follows the flow schedule
+    /// for `steps`.
+    ///
+    /// This travels on the request because the checkpoint is the only thing
+    /// that knows it: a four-forward distill is trained to jump between
+    /// specific noise levels, so its schedule is a property of the weights and
+    /// not a number the caller may choose.
+    public var distilledSteps: [Int]? = nil
     public var seed: UInt64
 
     // MARK: shape
@@ -586,7 +596,8 @@ public struct RenderRequest: Sendable {
         let (w, h) = (try? dimensions()) ?? (0, 0)
         return H3RenderPolicy.check(width: w, height: h, frameCount: geometry.frameCount,
                                     steps: steps,
-                                    tokens: geometry.videoTokens + geometry.audioTokens)
+                                    tokens: geometry.videoTokens + geometry.audioTokens,
+                                    distilledSteps: distilledSteps)
             .map { PolicyViolation(rule: $0.rule, reason: $0.reason, remedy: $0.remedy) }
     }
 }

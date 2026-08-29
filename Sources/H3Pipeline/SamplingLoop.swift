@@ -49,8 +49,20 @@ enum SamplingLoop {
                                            geometry.latentH, geometry.latentW])
         let noiseAudio = MLXRandom.normal([1, 32, 2, geometry.audioT])
 
+        // A distilled checkpoint carries its own denoising steps; the flow
+        // schedule does not apply to it. See `DistilledSchedule`.
         let schedule = FlowSchedule(shift: H3Shift.video)
-        let sigmas = schedule.sigmas(steps: request.steps)
+        let distilled = request.distilledSteps.map { DistilledSchedule(timesteps: $0) }
+        let sigmas = distilled?.sigmas ?? schedule.sigmas(steps: request.steps)
+        // The loop is bound to the schedule, not to `request.steps`: a
+        // distilled checkpoint decides its own count, and indexing a four-entry
+        // schedule with a twenty-step request runs off the end.
+        let steps = sigmas.count - 1
+        if let distilled {
+            log("  distilled schedule: \(steps) forwards at "
+                + distilled.sigmas.dropLast().map { String(format: "%.3f", $0) }
+                    .joined(separator: ", "))
+        }
 
         // One cache per conditioning stream. Under CFG the two forwards see
         // different conditioning, so their block-0 residuals are not comparable
@@ -99,11 +111,11 @@ enum SamplingLoop {
         let audioSampler = Sampler()
 
         var stepSeconds: [Double] = []
-        for i in 0 ..< request.steps {
+        for i in 0 ..< steps {
             let stepBegan = Date()
             if cancellation?.isCancelled == true {
                 throw RenderCancelled(phase: .sampling,
-                                      detail: "after \(i) of \(request.steps) step(s)")
+                                      detail: "after \(i) of \(steps) step(s)")
             }
             let sigma = Float(sigmas[i])
             let sigmaNext = Float(sigmas[i + 1])
@@ -120,17 +132,43 @@ enum SamplingLoop {
                 condVideo: conditions.videoRows, condAudio: conditions.audioRows,
                 renderState: renderState, negativeRenderState: negativeRenderState,
                 stepCache: cache, negativeStepCache: negativeCache,
-                stepIndex: i, stepCount: request.steps, taps: &taps)
+                stepIndex: i, stepCount: steps, taps: &taps)
 
             let videoDenoised = currentVideo - videoVelocity * MLXArray(sigma)
             let audioDenoised = currentAudio - audioVelocity * MLXArray(sigma)
 
-            currentVideo = videoSampler.step(x: currentVideo, denoised: videoDenoised,
-                                             sigma: sigma, sigmaNext: sigmaNext,
-                                             prevSigma: prevSigma)
-            currentAudio = audioSampler.step(x: currentAudio, denoised: audioDenoised,
-                                             sigma: sigma, sigmaNext: sigmaNext,
-                                             prevSigma: prevSigma)
+            if distilled != nil {
+                // **A distilled checkpoint is not integrated, it is iterated.**
+                // DMD2's multi-step inference alternates denoising with noise
+                // *injection*, following consistency models: each step predicts
+                // x0 from scratch and is re-noised to the next level with fresh
+                // Gaussian noise. It is not a trajectory through an ODE.
+                //
+                // Running these four timesteps through `res_multistep` — a
+                // second-order integrator that also carries state between steps
+                // — produces a coherent-looking render that is incoherent to
+                // watch, which is how this was found.
+                //
+                // For flow matching, `x_sigma = (1 - sigma) * x0 + sigma * eps`,
+                // so re-noising to `sigmaNext` is that identity applied to the
+                // prediction.
+                if sigmaNext > 0 {
+                    currentVideo = videoDenoised * (1 - sigmaNext)
+                        + MLXRandom.normal(currentVideo.shape) * sigmaNext
+                    currentAudio = audioDenoised * (1 - sigmaNext)
+                        + MLXRandom.normal(currentAudio.shape) * sigmaNext
+                } else {
+                    currentVideo = videoDenoised
+                    currentAudio = audioDenoised
+                }
+            } else {
+                currentVideo = videoSampler.step(x: currentVideo, denoised: videoDenoised,
+                                                 sigma: sigma, sigmaNext: sigmaNext,
+                                                 prevSigma: prevSigma)
+                currentAudio = audioSampler.step(x: currentAudio, denoised: audioDenoised,
+                                                 sigma: sigma, sigmaNext: sigmaNext,
+                                                 prevSigma: prevSigma)
+            }
             // The clock stops **after** this eval, and that placement is the
             // whole reason the timings mean anything. MLX is lazy: the sampler
             // step above builds a graph and returns, so a clock stopped before
@@ -141,7 +179,7 @@ enum SamplingLoop {
             // somewhere else rather than saved it.
             eval(currentVideo, currentAudio)
             stepSeconds.append(Date().timeIntervalSince(stepBegan))
-            onStep(i + 1, request.steps)
+            onStep(i + 1, steps)
         }
 
         // Both branches' traces, kept as separate rows rather than merged. Under

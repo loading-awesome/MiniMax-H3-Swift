@@ -65,6 +65,14 @@ package struct CheckpointIdentity: Sendable, Equatable {
     package let approximationDetail: String?
     package let sizeBytes: UInt64
     package let tensorCount: Int
+    /// A distilled checkpoint's own denoising steps, out of 1000, when it
+    /// declares them. Nil for the base model, which follows the flow schedule.
+    ///
+    /// These are a property of the weights, not a preference: a four-forward
+    /// distill is trained to jump between specific noise levels and cannot be
+    /// asked for twenty steps. The checkpoint is the only thing that knows,
+    /// which is why it travels here rather than in a flag.
+    package let distilledSteps: [Int]?
 
     /// Reads the header only — a few hundred kilobytes, not the 66 GB body.
     ///
@@ -136,10 +144,15 @@ package struct CheckpointIdentity: Sendable, Equatable {
         let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
         let size = (attrs?[.size] as? NSNumber)?.uint64Value ?? 0
 
+        let distilledSteps = meta["dmd_denoising_steps"]
+            .map { $0.split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) } }
+            .flatMap { $0.isEmpty ? nil : $0 }
+
         return CheckpointIdentity(url: url, kind: kind, vendor: vendor, partition: partition,
                                   quantisation: quant, isApproximate: approximate,
                                   approximationDetail: detail, sizeBytes: size,
-                                  tensorCount: header.tensors.count)
+                                  tensorCount: header.tensors.count,
+                                  distilledSteps: distilledSteps)
     }
 
     /// Refuses a checkpoint that cannot be used safely for `mode`.

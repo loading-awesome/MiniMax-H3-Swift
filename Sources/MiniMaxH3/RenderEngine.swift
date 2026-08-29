@@ -161,6 +161,19 @@ private enum RenderOperation {
                         events: AsyncStream<RenderEvent>.Continuation) async throws -> RenderResult {
         let logger = Logger(subsystem: "com.loading-awesome.MiniMaxH3", category: "render")
         let machine = Machine.detect()
+
+        // A distilled checkpoint decides its own denoising schedule, so resolve
+        // it here, before anything reads the request. `steps` is corrected to
+        // what will actually run: leaving the caller's number in place put a
+        // count on the receipt that no part of the render ever used, and made
+        // the time estimate five times pessimistic.
+        var request = request
+        if ProcessInfo.processInfo.environment["H3_IGNORE_DISTILLED"] != "1",
+           let steps = (try? CheckpointIdentity.identify(url: models.dit.url))?.distilledSteps {
+            request.distilledSteps = steps
+            request.steps = steps.count
+        }
+
         let dimensions = try request.dimensions()
         var receipt = RenderReceipt(
             jobID: jobID,
