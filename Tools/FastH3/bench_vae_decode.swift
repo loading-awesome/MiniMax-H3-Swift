@@ -19,6 +19,7 @@ let path = CommandLine.arguments.count > 1
     ? CommandLine.arguments[1]
     : "/Volumes/scratch_disk/models/MiniMax-H3/MiniMax-H3-video_vae_fp16.safetensors"
 
+MLXRandom.seed(0)
 let vae = try VideoVAE(url: URL(fileURLWithPath: path))
 print("loaded \(path)")
 
@@ -31,15 +32,17 @@ func tile(_ batch: Int) -> MLXArray {
 // Warm up: first call pays for graph build and weight residency.
 _ = seconds { vae.decodePixels(tile(1)) }
 
+let quick = ProcessInfo.processInfo.environment["H3_BENCH_QUICK"] == "1"
+
 // Same shape three times: with the table cached, any difference between the
 // first and later calls is what the per-call preamble actually costs.
-for r in 0 ..< 3 {
+for r in 0 ..< (quick ? 0 : 3) {
     let z = tile(1)
     eval(z)
     print(String(format: "repeat %d  %.4f s", r, seconds { vae.decodePixels(z) }))
 }
 
-for batch in [1, 5, 15, 30, 90] {
+for batch in (quick ? [] : [1, 5, 15, 30, 90]) {
     let z = tile(batch)
     eval(z)
     let t = seconds { vae.decodePixels(z) }
@@ -52,12 +55,20 @@ for batch in [1, 5, 15, 30, 90] {
 // minimum overlap mean the tile count steps, not scales: 480 needs three
 // tiles where 448 needs two, and 864 needs five where 832 needs four. A frame
 // sitting just past both cliffs pays for almost twice the decode it needs.
-for (w, h) in [(480, 864), (448, 832), (448, 768), (512, 896)] {
+for (w, h) in (quick ? [(480, 864), (448, 832)]
+                             : [(480, 864), (448, 832), (448, 768), (512, 896)]) {
     let z = MLXRandom.normal([1, 24, 31, h / 16, w / 16]).asType(.bfloat16)
     eval(z)
     let t = seconds { vae.decode(z) }
     let (_, yl, _) = vae.splitTiles(inputLen: h)
     let (_, xl, _) = vae.splitTiles(inputLen: w)
-    print(String(format: "%d x %d  %d x %d = %2d tiles  decode %6.2f s",
-                 w, h, xl.count, yl.count, xl.count * yl.count, t))
+    let out = vae.decode(z)
+    eval(out)
+    let mean = out.mean().item(Float.self)
+    let rms = sqrt((out * out).mean()).item(Float.self)
+    print(String(format: "%d x %d  %d x %d = %2d tiles  decode %6.2f s  mean %+.6f  rms %.6f",
+                 w, h, xl.count, yl.count, xl.count * yl.count, t, mean, rms))
 }
+
+print("routed:   \(ANELinearBackend.routedProjections)")
+print("declined: \(ANELinearBackend.declinedProjections)")

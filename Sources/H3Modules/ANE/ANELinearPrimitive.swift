@@ -208,8 +208,30 @@ public enum ANELinearBackend {
 
     /// Which window this projection sits in. `qkv` gates attention; everything
     /// else in a block comes after it.
+    /// The video decoder's own share, which is not the DiT's.
+    ///
+    /// Both post-attention shares above assume a window to hide the engine in:
+    /// under query tiling, tile `i-1`'s chain has the GPU's attention on tile
+    /// `i` to overlap. The VAE decoder has no such window. Its 36 blocks are
+    /// strictly sequential, there is no second CFG branch, and the tiles were
+    /// folded into one batch to make the offer large enough to accept — so the
+    /// engine and the GPU race on the same GEMM and the balance is the racing
+    /// one, which sits higher than the DiT's because only `qkv` and `ff1` are
+    /// routable here.
+    ///
+    /// Measured 2026-08-29, 448x832x124, decode seconds against share:
+    ///
+    ///     0.29  30.68    0.50  28.61    0.70  29.23
+    ///     0.40  29.06    0.62  28.10    0.80  30.50
+    ///
+    /// A plateau from 0.50 to 0.62 with a cliff past it, against 31.79 with the
+    /// engine off. `H3_ANE_SHARE_VAE` sweeps it.
+    nonisolated(unsafe) static var vaeShare: Double =
+        envShare("H3_ANE_SHARE") ?? envShare("H3_ANE_SHARE_VAE") ?? 0.56
+
     static func share(for label: String) -> Double {
-        label == "qkv" ? share : postShare
+        if label.hasPrefix("vae ") { return vaeShare }
+        return label == "qkv" ? share : postShare
     }
 
     // MARK: - Shard plan
